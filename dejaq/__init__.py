@@ -6,7 +6,7 @@ from typing import Any
 
 @dataclasses.dataclass
 class FrameInfo:
-    ''' A class to store metadata about a frame in a FIFO queue.'''
+    ''' A class to store metadata about a data frame in a FIFO queue.'''
     nbytes: int
     head: int
     tail: int
