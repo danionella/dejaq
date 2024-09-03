@@ -20,6 +20,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v2
+    - name: Sleep for 2 mins
+      run: sleep 120s
+      shell: bash
     - name: Set up Python
       uses: actions/setup-python@v2
       with:
