@@ -5,16 +5,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dejaq"
 version = "0.0.1"
-description = "Déjà Q: A fast multiprocessing queue for Python"
+description = "Déjà Queue: A fast multiprocessing queue for Python"
 authors = [
     { name = "jlab.berlin" },
     { name = "Benjamin Judkewitz"}
 ]
-license = { text = "MIT" }
-requires-python = ">=3.9"
+license = {text = "MIT"}
+requires-python = ">=3.7"
+keywords = ["multiprocessing", "queue", "shared_memory"]
+readme = "README.md"
 
 [project.urls]
-"Homepage" = "https://github.com/danionella/dejaq"
+Homepage = "https://github.com/danionella/dejaq"
 
 [tool.setuptools.packages.find]
 include = ["dejaq", "dejaq.*"]
