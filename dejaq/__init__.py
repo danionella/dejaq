@@ -93,8 +93,8 @@ class ByteFIFO:
         """
         with self.get_lock:
             frame_info = self.queue.get(**kwargs)
-            head = frame_info["head"]
-            tail = frame_info["tail"]
+            head = frame_info.head
+            tail = frame_info.tail
             assert head == self.head.value, f"head: {head}, self.head: {self.head.value}"
             if head <= tail:
                 array_bytes = self.view[head:tail]
@@ -103,10 +103,10 @@ class ByteFIFO:
             if copy or ((copy is None) and (callback is None)):
                 array_bytes = array_bytes.copy()
             if callback is not None:
-                return_value = callback(array_bytes, frame_info["meta"])
+                return_value = callback(array_bytes, frame_info.meta)
             else:
-                return_value = array_bytes, frame_info["meta"]
-            self.head.value = (head + frame_info["nbytes"]) % self.buffer_size
+                return_value = array_bytes, frame_info.meta
+            self.head.value = (head + frame_info.nbytes) % self.buffer_size
 
         with self.head_changed:
             self.head_changed.notify()
@@ -241,9 +241,7 @@ class DejaQueue(ByteFIFO):
             for buf in buffers:
                 self._write_buffer(buf.raw())
 
-            frame_info = dict(
-                nbytes=nbytes_total, head=head, tail=self.tail.value, meta=dict(buffer_lengths=buffer_lengths)
-            )
+            frame_info = FrameInfo(nbytes=nbytes_total, head=head, tail=self.tail.value, meta=buffer_lengths)
         self.queue.put(frame_info)
 
     def get(self, **kwargs):
@@ -255,8 +253,7 @@ class DejaQueue(ByteFIFO):
         Returns:
             obj: The object that was put into the queue.
         """
-        def callback(array_bytes, meta):
-            buffer_lengths = meta['buffer_lengths']
+        def callback(array_bytes, buffer_lengths):
             buffers = []
             offset = 0
             for length in buffer_lengths:
