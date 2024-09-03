@@ -143,7 +143,6 @@ class ByteFIFO:
     def close(self):
         """ Closes the queue.
         """
-        self.queue.close()
         self.closed.value = True
 
     def join(self):
@@ -273,3 +272,64 @@ class DejaQueue(ByteFIFO):
         obj = super().get(copy=False, callback=callback, **kwargs)
         return obj
         
+
+
+class lazymap:
+    ''' Returns an Iterable, functionally related to map (except that outputs are calculated by a pool of processes).
+    
+    Args:
+        fcn (callable): function that is being mapped. Signature: fcn(item, **kwargs)
+        it (iterable): iterable that maps over the function, providing items as arguments
+        num_workers (int): number of workers (default: 1)
+        buffer_size (int): size of the queue buffer (default: 10e6 bytes)
+        **kwargs: optional, being passed to fcn
+
+    Returns: 
+        (iterable): an iterable that returns the results of fcn(item) for each item in it
+    '''
+
+    def __init__(self, fcn, it, num_workers=1, buffer_size=10e6, **kwargs):
+        self.it = it
+        self.in_queue = DejaQueue(buffer_size)
+        self.out_queue = DejaQueue(buffer_size)
+        self.k = mp.Value("l", 0)
+        self.k_changed = mp.Condition()
+        self.num_workers = num_workers
+        self.workers = [mp.Process(target=self._worker_fcn, args=(pid, fcn), kwargs=kwargs) for pid in range(num_workers)]
+        [w.start() for w in self.workers]
+        self.generator = self.lazymap_generator(it, num_workers)
+
+    def __len__(self):
+        return len(self.it)
+
+    def __iter__(self):
+        return self.generator
+    
+    def _worker_fcn(self, pid, fcn, **kwargs):
+        while not self.in_queue.done:
+            item = self.in_queue.get()
+            if item is None: break
+            res = fcn(item, **kwargs)
+            with self.k_changed:
+                self.k_changed.wait_for(lambda: self.k.value % self.num_workers == pid)
+                self.out_queue.put(res)
+                self.k.value += 1
+                self.k_changed.notify_all()
+
+    def lazymap_generator(self, it, num_workers):
+        it = iter(it)
+        [self.in_queue.put(next(it)) for i in range(num_workers)]
+        k = -1
+        for k, item in enumerate(it):
+            res = self.out_queue.get()
+            self.in_queue.put(item)
+            yield res
+        for k in range(k + 1, k + 1 + num_workers):
+            yield self.out_queue.get()
+        self.close()
+
+    def close(self):
+        [self.in_queue.put(None) for w in self.workers]
+        [w.join() for w in self.workers]
+        self.out_queue = None
+        self.in_queue = None
