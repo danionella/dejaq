@@ -1,9 +1,10 @@
-{% set name = "arrayfifo" %}
-{% set data = load_setup_py_data(setup_file='../setup.py', from_recipe_dir=True) %}
+{% set data = load_file_data("../pyproject.toml", from_recipe_dir=True) %}
+{% set environment = load_file_data("../environment.yml", from_recipe_dir=True) %}
+{% set name = data['project']['name'] %}
 
 package:
   name: {{ name|lower }}
-  version: {{ data.get('version') }}
+  version: {{ data["project"]["version"] }}
 
 source:
   url: https://files.pythonhosted.org/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ data.get('version') }}.tar.gz
@@ -15,24 +16,28 @@ build:
 
 requirements:
   host:
-    - pip
-    - python >=3.7
+    {% for dep in environment["dependencies"] %}
+    - {{ dep.lower() }}
+    {% endfor %}
   run:
-    - numpy
-    - python >=3.7
+    {% for dep in environment["dependencies"] %}
+    - {{ dep.lower() }}
+    {% endfor %}
 
 test:
   imports:
-    - arrayfifo
+    - {{ name }}
   commands:
     - pip check
   requires:
-    - pip
+    {% for dep in environment["dependencies"] %}
+    - {{ dep.lower() }}
+    {% endfor %}
 
 about:
-  home: {{ data['url'] }}
-  license: {{ data['license'] }}
-  summary: {{ data['description'] }}
+  home: {{ data['project.urls']['Homepage'] }}
+  license: {{ data['project']['license'] }}
+  summary: {{ data['project']['description'] }}
 
 extra:
   recipe-maintainers:
