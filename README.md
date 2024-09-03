@@ -5,11 +5,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![GitHub last commit](https://img.shields.io/github/last-commit/danionella/dejaq)
 
-# DéjàQueue
+# Déjà Queue
 
-A fast drop-in replacement for `multiprocessing.Queue` taking advantage of a [shared memory](https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Array) ring buffer and [pickle protocol 5 with out-of-band data](https://peps.python.org/pep-0574/). As with other queues in Python, data is transmitted via `put` and `get` calls.
+A fast drop-in replacement for `multiprocessing.Queue` taking advantage of a [shared memory](https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Array) ring buffer and [pickle protocol 5 out-of-band data](https://peps.python.org/pep-0574/) to minimize copies. As with other queues in Python, data is transmitted via `put` and `get` calls.
 
-DejaQueue supports any type of picklable Python object, including numpy arrays or nested dictionaries with mixed content. It uses locks to support more than one producer and comsumer process.
+`dejaq.DejaQueue` supports any type of picklable Python object, including numpy arrays or nested dictionaries with mixed content. It uses locks to support more than one producer and comsumer process.
 
 Auto-generated API documentation: https://danionella.github.io/dejaq
 
@@ -17,7 +17,7 @@ Auto-generated API documentation: https://danionella.github.io/dejaq
 ```python
 import numpy as np
 from multiprocessing import Process
-from dqjaq import DejaQueue
+from dejaq import DejaQueue
 
 def produce(queue):
     for i in range(20):

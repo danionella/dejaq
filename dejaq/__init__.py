@@ -6,6 +6,7 @@ from typing import Any
 
 @dataclasses.dataclass
 class FrameInfo:
+    ''' A class to store metadata about a frame in a FIFO queue.'''
     nbytes: int
     head: int
     tail: int
@@ -207,7 +208,7 @@ class ArrayFIFO(ByteFIFO):
         return array, meta
 
 class DejaQueue(ByteFIFO):
-    """ A fast queue for Python objects. The queue is implemented as a ring buffer in shared memory.
+    """ A fast queue for arbitrary (picklable) Python objects. The queue is implemented as a ring buffer in shared memory.
 
     Args:
         buffer_size (int): The size of the buffer in bytes.
