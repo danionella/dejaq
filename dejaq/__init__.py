@@ -161,6 +161,14 @@ class ByteFIFO:
         ''' Returns True if the queue is empty and closed.'''
         return self.queue.empty() and self.closed.value
 
+    def __getstate__(self):
+        state = {k:v for k,v in self.__dict__.items() if k != '_view'}
+        state['_view'] = None
+        return state
+    
+    def __setstate__(self, state):
+        self.__dict__ = state
+        
 
 class ArrayFIFO(ByteFIFO):
     """ A fast queue for numpy arrays. The queue is implemented as a ring buffer in shared memory.
