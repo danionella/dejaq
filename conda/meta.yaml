@@ -1,0 +1,39 @@
+{% set name = "arrayfifo" %}
+{% set data = load_setup_py_data(setup_file='../setup.py', from_recipe_dir=True) %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ data.get('version') }}
+
+source:
+  url: https://files.pythonhosted.org/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ data.get('version') }}.tar.gz
+  
+build:
+  number: 0
+  noarch: python
+  script: {{ PYTHON }} -m pip install . -vv
+
+requirements:
+  host:
+    - pip
+    - python >=3.7
+  run:
+    - numpy
+    - python >=3.7
+
+test:
+  imports:
+    - arrayfifo
+  commands:
+    - pip check
+  requires:
+    - pip
+
+about:
+  home: {{ data['url'] }}
+  license: {{ data['license'] }}
+  summary: {{ data['description'] }}
+
+extra:
+  recipe-maintainers:
+    - benju
