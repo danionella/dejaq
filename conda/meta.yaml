@@ -36,7 +36,7 @@ test:
 
 about:
   home: {{ data['project.urls']['Homepage'] }}
-  license: MIT
+  license: {{ data['project']['license'] }}
   summary: {{ data['project']['description'] }}
 
 extra:
