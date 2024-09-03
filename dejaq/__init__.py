@@ -333,3 +333,33 @@ class lazymap:
         [w.join() for w in self.workers]
         self.out_queue = None
         self.in_queue = None
+
+
+class Parallel:
+    ''' Returns a function that maps over an iterable using multiple workers. Can be used as a decorator.
+
+    Args:
+        fcn (callable): function that is being mapped. Signature: fcn(item, **kwargs)
+        num_workers (int): number of workers (default: 1)
+        buffer_size (int): size of the queue buffer (default: 10e6 bytes)
+
+    Returns:
+        (callable): a function that maps over an iterable using multiple processes
+    '''
+
+    def __init__(self, fcn, num_workers=1, buffer_size=10e6):
+        self.fcn = fcn
+        self.num_workers = num_workers
+        self.buffer_size = buffer_size
+    
+    def __call__(self, it, **kwargs):
+        ''' Maps over an iterable using multiple workers.
+        
+        Args:
+            it (iterable): iterable providing items as arguments for a function
+            **kwargs: optional, being passed to fcn
+            
+        Returns:    
+            (iterable): an iterable that returns the results of fcn(item, **kwargs) for each item in it
+        '''
+        return lazymap(self.fcn, it, self.num_workers, self.buffer_size, **kwargs)
