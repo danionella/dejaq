@@ -158,6 +158,7 @@ class ByteFIFO:
 
     @property
     def done(self):
+        ''' Returns True if the queue is empty and closed.'''
         return self.queue.empty() and self.closed.value
 
 
@@ -170,11 +171,12 @@ class ArrayFIFO(ByteFIFO):
 
     def put(self, array, meta=None, timeout=None):
         """
-        Puts a byte array into the queue.
+        Puts a numpy array into the queue.
 
         Args:
             array (numpy.ndarray): The byte array to be put into the queue.
-            meta (Any, optional): Additional metadata associated with the byte array.
+            meta (Any, optional): Additional custom metadata (will be sent through a regular slow Queue).
+            timeout (float, optional): The maximum time to wait for available space in the queue.
 
         Raises:
             AssertionError: If the size of the byte array exceeds the buffer size.
@@ -186,7 +188,7 @@ class ArrayFIFO(ByteFIFO):
 
     def get(self, callback=None, copy=None, **kwargs):
         """
-        Gets a byte array from the queue.
+        Gets a numpy array from the queue.
 
         Args:
             callback (Callable, optional): A callback function to be called with the byte array (pre-copy, potentially unsafe!) and metadata.
@@ -194,7 +196,7 @@ class ArrayFIFO(ByteFIFO):
             **kwargs: Additional keyword arguments to be passed to the queue's get method.
 
         Returns:
-            tuple: A tuple containing the byte array and any metadata provided with put.
+            tuple: A tuple containing the numpy array and any metadata provided with put.
         """
         def callback_wrapper(array_bytes, meta):
             array = np.frombuffer(array_bytes, dtype=meta['dtype']).reshape(meta['shape'])
@@ -215,11 +217,11 @@ class DejaQueue(ByteFIFO):
     """
 
     def put(self, obj, timeout=None):
-        """ Puts a byte array into the queue.
+        """ Puts a Python object into the queue.
 
         Args:
-            array (numpy.ndarray): The byte array to be put into the queue.
-            meta (Any, optional): Additional metadata associated with the byte array.
+            obj (Any): The byte array to be put into the queue.
+            timeout (float, optional): The maximum time to wait for available space in the queue.
         """
         buffers = []
         pkl = pickle.dumps(obj, buffer_callback=buffers.append, protocol=pickle.HIGHEST_PROTOCOL)

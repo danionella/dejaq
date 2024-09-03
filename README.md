@@ -7,7 +7,7 @@
 
 # Déjà Queue
 
-A fast drop-in replacement for `multiprocessing.Queue` taking advantage of a [shared memory](https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Array) ring buffer and [pickle protocol 5 out-of-band data](https://peps.python.org/pep-0574/) to minimize copies. As with other queues in Python, data is transmitted via `put` and `get` calls.
+A fast drop-in replacement for `multiprocessing.Queue` taking advantage of a [shared memory](https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Array) ring buffer and [pickle protocol 5 out-of-band data](https://peps.python.org/pep-0574/) to minimize copies.
 
 `dejaq.DejaQueue` supports any type of picklable Python object, including numpy arrays or nested dictionaries with mixed content. It uses locks to support more than one producer and comsumer process.
 
