@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dejaq"
-version = "0.0.4"
+version = "0.0.5"
 description = "Déjà Queue – A fast multiprocessing queue for Python"
 authors = [
     { name = "jlab.berlin" },
