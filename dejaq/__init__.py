@@ -250,7 +250,7 @@ class DejaQueue(ByteFIFO):
                 self._write_buffer(buf.raw())
 
             frame_info = FrameInfo(nbytes=nbytes_total, head=head, tail=self.tail.value, meta=buffer_lengths)
-        self.queue.put(frame_info)
+            self.queue.put(frame_info)
 
     def get(self, **kwargs):
         """ Gets an item from the queue.
@@ -272,3 +272,4 @@ class DejaQueue(ByteFIFO):
 
         obj = super().get(copy=False, callback=callback, **kwargs)
         return obj
+        
