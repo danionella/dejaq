@@ -1,5 +1,5 @@
 
-![Python Version](https://img.shields.io/badge/python-3.7+-blue)
+![Python Version](https://img.shields.io/badge/python-3.8+-blue)
 [![PyPI - Version](https://img.shields.io/pypi/v/dejaq)](https://pypi.org/project/dejaq/)
 [![Conda Version](https://img.shields.io/conda/v/danionella/dejaq)](https://anaconda.org/danionella/dejaq)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
