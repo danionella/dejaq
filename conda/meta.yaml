@@ -35,7 +35,7 @@ test:
     {% endfor %}
 
 about:
-  home: {{ data['project.urls']['Homepage'] }}
+  home: {{ data['project']['urls']['Homepage'] }}
   license: {{ data['project']['license'] }}
   summary: {{ data['project']['description'] }}
 
