@@ -13,6 +13,13 @@ The speed of `DejaQueue` enables efficient inter-job communication in data proce
 
 Auto-generated API documentation: https://danionella.github.io/dejaq
 
+## Installation
+- `conda install danionella::dejaq `
+
+- or, if you prefer pip: `pip install dejaq`
+
+- for development, clone this repository, navigate to the root directory and type `pip install -e .`
+
 ## Examples
 ### `dejaq.DejaQueue`
 ```python
