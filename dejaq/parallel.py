@@ -63,6 +63,8 @@ class lazymap:
         ''' 
         [self._in_queue.put(None) for _ in self._workers]
         [w.join() for w in self._workers]
+        self._out_queue.close()
+        self._in_queue.close()
         while not self._out_queue.done:
             sleep(0.01)
         self._out_queue = None
@@ -93,12 +95,16 @@ class lazymap:
             return out
 
 
+
 def Parallel(n_workers=1, buffer_bytes=10e6):
     ''' A wrapper to make a class or callablle a parallel worker. Can be used as a decorator.
 
     Args:
         n_workers (int): number of workers (default: 1)
         buffer_bytes (int): size of the queue buffer (default: 10e6 bytes)
+
+    Returns:
+
     '''
     def decorator(cls):
         if isinstance(cls, type):
@@ -110,7 +116,6 @@ def Parallel(n_workers=1, buffer_bytes=10e6):
         else: 
             raise ValueError(f'Invalid type {type(cls)}')
     return decorator
-
 
 class WorkerWrapper:
     ''' A helper class used by the Parallel decorator to wrap a class to make it a parallel worker.
