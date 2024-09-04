@@ -9,7 +9,7 @@
 
 A drop-in replacement for `multiprocessing.Queue`. Faster, because it takes advantage of a shared memory ring buffer (rather than slow pipes) and [pickle protocol 5 out-of-band data](https://peps.python.org/pep-0574/) to minimize copies. `DejaQueue` supports any type of [picklable](https://docs.python.org/3/library/pickle.html#what-can-be-pickled-and-unpickled) Python object, including numpy arrays or nested dictionaries with mixed content.
 
-The speed of `DejaQueue` enables efficient inter-job communication in data processing pipelines, which can be implemented with `dejaq.Parallel`.
+The speed of `DejaQueue` enables efficient inter-job communication in data processing pipelines, which can be implemented in a few lines of code with [`dejaq.Parallel`](#dejaqparallel).
 
 Auto-generated API documentation: https://danionella.github.io/dejaq
 
@@ -115,7 +115,7 @@ stage3 = Consumer(1000)(stage2)
 result = stage3.compute()
 
 # or:
-result = Consumer(1000)(Processor(10.0)(Producer(0.5)(input_iterable)))
+result = Consumer(1000)(Processor(10.0)(Producer(0.5)(input_iterable))).compute()
 ```
 
 # See also
