@@ -4,14 +4,6 @@ import pickle
 import dataclasses
 from typing import Any
 
-@dataclasses.dataclass
-class FrameInfo:
-    ''' A class to store metadata about a data frame in a FIFO queue.'''
-    nbytes: int
-    head: int
-    tail: int
-    meta: Any  # any picklable object
-
 class ByteFIFO:
     """ A FIFO buffer (queue) for bytes. The queue is implemented as a ring buffer in shared memory.
     """
@@ -170,7 +162,7 @@ class ByteFIFO:
         
 
 class ArrayFIFO(ByteFIFO):
-    """ A fast queue for numpy arrays. The queue is implemented as a ring buffer in shared memory.
+    """ A fast queue for numpy arrays. 
 
     Args:
         buffer_bytes (int): The size of the buffer in bytes
@@ -217,7 +209,7 @@ class ArrayFIFO(ByteFIFO):
         return array, meta
 
 class DejaQueue(ByteFIFO):
-    """ A fast queue for arbitrary (picklable) Python objects. The queue is implemented as a ring buffer in shared memory.
+    """ A fast queue for arbitrary (picklable) Python objects.
 
     Args:
         buffer_bytes (int): The size of the buffer in bytes.
@@ -271,3 +263,12 @@ class DejaQueue(ByteFIFO):
 
         obj = super().get(copy=False, callback=callback, **kwargs)
         return obj
+    
+    
+@dataclasses.dataclass
+class FrameInfo:
+    ''' A class to store metadata about a data frame in a FIFO queue.'''
+    nbytes: int
+    head: int
+    tail: int
+    meta: Any  # any picklable object
