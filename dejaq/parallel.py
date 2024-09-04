@@ -65,10 +65,11 @@ class lazymap:
         self.in_queue = None
 
     def compute(self, progress=True, ndarray=True, **kwargs):
-        ''' Computes the results of the lazymap and returns them as a list.
+        ''' Computes the results of the lazymap and returns them as a list or ndarray
 
         Args:
             progress (bool): whether to show a tqdm progress bar (default: True)
+            ndarray (bool): whether to try to return the results as a numpy array (default: True)
             **kwargs: optional, being passed to tqqdm
 
         Returns:
