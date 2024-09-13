@@ -39,7 +39,7 @@ def consume(queue, pid):
         array, meta = queue.get()
         print(f'consumer {pid} consumed {type(array)} {array.shape} {array.dtype}; meta: {meta}; hash: {hash(array.tobytes())}\n')
 
-queue = DejaQueue(bytes=10e6)
+queue = DejaQueue(buffer_bytes=10e6)
 producer = Process(target=produce, args=(queue,))
 consumers = [Process(target=consume, args=(queue, pid)) for pid in range(3)]
 for c in consumers:
