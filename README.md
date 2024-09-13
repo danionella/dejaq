@@ -9,11 +9,12 @@
 
 A fast alternative to `multiprocessing.Queue`. Faster, because it takes advantage of a shared memory ring buffer (rather than slow pipes) and [pickle protocol 5 out-of-band data](https://peps.python.org/pep-0574/) to minimize copies. [`dejaq.DejaQueue`](#dejaqdejaqueue) supports any type of [picklable](https://docs.python.org/3/library/pickle.html#what-can-be-pickled-and-unpickled) Python object, including numpy arrays or nested dictionaries with mixed content.
 
-The speed of `DejaQueue` enables efficient inter-job communication in data processing pipelines, which can be implemented in a few lines of code with [`dejaq.Parallel`](#dejaqparallel).
+<img src="https://github.com/user-attachments/assets/69dae69d-c4c6-47b5-b5cd-d63536a84826" width="100%">
+
+The speed advantege of `DejaQueue` becomes substantial for items of > 1 MB size. It enables efficient inter-job communication in big-data processing pipelines, which can be implemented in a few lines of code with [`dejaq.Parallel`](#dejaqparallel).
 
 Auto-generated (minimal) API documentation: https://danionella.github.io/dejaq
 
-<img src="https://github.com/user-attachments/assets/31d7dbd3-4f8c-4dad-8fea-7b4cb5bb7577" width="50%">
 
 ## Installation
 - `conda install danionella::dejaq `
