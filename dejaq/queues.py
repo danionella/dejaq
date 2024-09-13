@@ -8,7 +8,7 @@ class ByteFIFO:
     """ A FIFO buffer (queue) for bytes. The queue is implemented as a ring buffer in shared memory.
     """
 
-    def __init__(self, bytes=10e6):
+    def __init__(self, buffer_bytes=10e6):
         """
         Initializes a ByteFIFO object.
 
@@ -16,7 +16,7 @@ class ByteFIFO:
             buffer_bytes (int): The size of the buffer in bytes. Defaults to 10 MiB.
         """
 
-        self.buffer_bytes = int(bytes)
+        self.buffer_bytes = int(buffer_bytes)
         self.buffer = mp.Array("c", self.buffer_bytes, lock=False)
         self._view = None
         self.queue = mp.Manager().Queue()  # manager helps avoid out-of-order problems
@@ -212,8 +212,10 @@ class DejaQueue(ByteFIFO):
     """ A fast queue for arbitrary (picklable) Python objects.
 
     Args:
-        buffer_bytes (int): The size of the buffer in bytes.
+        buffer_bytes (int): The size of the buffer in bytes. Defaults to 10 MiB.
     """
+    def __init__(self, buffer_bytes=10e6):
+        super().__init__(buffer_bytes=buffer_bytes)
 
     def put(self, obj, timeout=None):
         """ Puts a Python object into the queue.
@@ -267,7 +269,7 @@ class DejaQueue(ByteFIFO):
     
 @dataclasses.dataclass
 class FrameInfo:
-    ''' A class to store metadata about a data frame in a FIFO queue.'''
+    ''' A class to store metadata about a data frame in a ring buffer.'''
     nbytes: int
     head: int
     tail: int
