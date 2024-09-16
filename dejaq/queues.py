@@ -17,7 +17,7 @@ class ByteFIFO:
         """
 
         self.buffer_bytes = int(buffer_bytes)
-        self.buffer = mp.Array("c", self.buffer_bytes, lock=False)
+        self.buffer = mp.Array("B", self.buffer_bytes, lock=False)
         self._view = None
         self.queue = mp.Manager().Queue()  # manager helps avoid out-of-order problems
         self.get_lock = mp.Lock()
@@ -40,9 +40,10 @@ class ByteFIFO:
             AssertionError: If the size of the byte array exceeds the buffer size.
         """
         if type(array_bytes) == memoryview:
-            array_bytes = np.frombuffer(array_bytes, dtype='byte')
+            #array_bytes = np.frombuffer(array_bytes, dtype='byte')
+            array_bytes = array_bytes
         elif type(array_bytes) == np.ndarray:
-            array_bytes = array_bytes.ravel().view('byte')
+            array_bytes = array_bytes.ravel().view('B')
         nbytes = array_bytes.nbytes
         assert nbytes < self.buffer_bytes, "Array size exceeds buffer size."
         with self.put_lock:
@@ -118,7 +119,7 @@ class ByteFIFO:
         """ numpy.ndarray: A view of the shared memory array as a numpy array. Lazy initialization to avoid pickling issues.
         """
         if self._view is None:
-            self._view = np.frombuffer(self.buffer, "byte")
+            self._view = np.frombuffer(self.buffer, "B")
         return self._view
 
     def __del__(self):
