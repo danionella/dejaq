@@ -1,6 +1,6 @@
 channels:
+  - nodefaults
   - conda-forge
-  - defaults
 
 dependencies:
   - python>=3.8
