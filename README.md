@@ -1,7 +1,7 @@
 
 ![Python Version](https://img.shields.io/badge/python-3.8+-blue)
 [![PyPI - Version](https://img.shields.io/pypi/v/dejaq)](https://pypi.org/project/dejaq/)
-[![Conda Version](https://img.shields.io/conda/v/danionella/dejaq)](https://anaconda.org/danionella/dejaq)
+[![Conda Version](https://img.shields.io/conda/v/conda-forge/dejaq)](https://anaconda.org/conda-forge/dejaq)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![GitHub last commit](https://img.shields.io/github/last-commit/danionella/dejaq)
 
@@ -17,7 +17,7 @@ Auto-generated (minimal) API documentation: https://danionella.github.io/dejaq
 
 
 ## Installation
-- `conda install danionella::dejaq `
+- `conda install conda-forge::dejaq `
 
 - or, if you prefer pip: `pip install dejaq`
 
