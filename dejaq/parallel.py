@@ -138,3 +138,64 @@ class WorkerWrapper:
                 return self._instance(arg, **kwargs)
             return lazymap(worker, iterable, self._n_workers, self._buffer_bytes, **map_kwargs)
         return mapper
+
+
+class OrderedStage:
+    ''' A a processing stage, consisting of one or more workers, that processes items in order.
+    
+    Args:
+        fcn (callable): function that is being called on each item. Signature: fcn(item, **kwargs)
+        n_workers (int): number of workers (default: 1)
+        buffer_bytes (int): size of the queue buffer (default: 10e6 bytes)
+        **kwargs: optional, being passed to fcn
+    '''
+    def __init__(self, fcn, n_workers=1, buffer_bytes=10e6, in_queue = None, start=True, **kwargs):
+        self._in_queue = in_queue or DejaQueue(buffer_bytes)
+        self._out_queue = DejaQueue(buffer_bytes)
+        self._k = mp.Value("l", 0)
+        self._k_changed = mp.Condition()
+        self._n_workers = n_workers
+        self.fcn = fcn
+        self.kwargs = kwargs
+        if start:
+            self.start()
+
+    def _worker_fcn(self, pid, fcn, **kwargs):
+        np.random.seed(pid)
+        while not self._in_queue.done:
+            item = self._in_queue.get()
+            if item is None: break
+            res = fcn(item, **kwargs)
+            with self._k_changed:
+                self._k_changed.wait_for(lambda: self._k.value % self._n_workers == pid)
+                self._out_queue.put(res)
+                self._k.value += 1
+                self._k_changed.notify_all()
+
+    def put(self, item):
+        ''' Puts an item in the queue to be processed by the workers
+        
+        Args:
+            item: the item to be processed
+        '''
+        self._in_queue.put(item)
+
+    def get(self):
+        ''' Gets the next result from the workers'''
+        return self._out_queue.get()
+    
+    def start(self):
+        ''' Starts the workers'''
+        self._workers = [mp.Process(target=self._worker_fcn, args=(pid, self.fcn), kwargs=self.kwargs) for pid in range(self._n_workers)]
+        [w.start() for w in self._workers]
+
+    def close(self):
+        ''' Sends a termination signal to the workers, waits for them to finish, and deletes the queues.
+        ''' 
+        [self._in_queue.put(None) for _ in self._workers]
+        [w.join() for w in self._workers]
+        self._out_queue.close()
+        self._in_queue.close()
+
+    def __del__(self):
+        self.close()
