@@ -1,7 +1,7 @@
 import gc, sys, traceback, time
+import multiprocessing as mp
 
 import numpy as np
-import multiprocessing as mp
 
 from . import DejaQueue
         
@@ -206,22 +206,24 @@ class FutureResult:
     """ A class that represents a future result of a computation in a parallel worker.
     """
     def __init__(self, actor, handle):
-        self.actor = actor
-        self.handle = handle
+        self._actor = actor
+        self._handle = handle
 
     def get(self):
+        """ Fetches the result.
+        """
         if not hasattr(self, '_result'):
-            if self.handle not in self.actor._result_store:
-                response = self.actor._out_queue.get()
+            if self._handle not in self._actor._result_store:
+                response = self._actor._out_queue.get()
                 if response['type'] == 'delayed_result':
-                    self.actor._result_store[response['handle']] = response['value']
-                    assert self.handle == response['handle'], "Unexpected handle"
+                    self._actor._result_store[response['handle']] = response['value']
+                    assert self._handle == response['handle'], "Unexpected handle"
                 elif response['type'] == 'exception':
                     self._raise_remote_exception(response['exception'])
                 else: 
                     raise ValueError(f"Unexpected message: {response}")
-            self._result = self.actor._result_store[self.handle]
-            del self.actor._result_store[self.handle]
+            self._result = self._actor._result_store[self._handle]
+            del self._actor._result_store[self._handle]
         return self._result
 
     def __del__(self):
