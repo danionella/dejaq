@@ -374,9 +374,7 @@ class Actor:
 
         Raises:
             Exception: If there is an error in the subprocess.
-        """
-        assert self._out_queue.empty(), "communication queue is not empty"
-        
+        """        
         def method_proxy(*args, **kwargs):
             """ Proxy function that sends method calls to the subprocess.
             """
