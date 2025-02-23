@@ -252,6 +252,11 @@ class Actor:
         self._process = mp.Process(target=self._run, args=(cls, self._in_queue, self._out_queue, args, kwargs))
         self._process.start()
         self._result_store = {}
+        response = self._out_queue.get()
+        if response['type'] == 'exception':
+            self._raise_remote_exception(response['exception'])
+        elif not (response['type'] == 'OK'):
+            raise ValueError(f"Invalid response type: {response['type']}")
 
     @staticmethod
     def _run(cls, in_queue, out_queue, args, kwargs):
@@ -277,10 +282,11 @@ class Actor:
                 dict: A dictionary containing exception type, message, and traceback.
             """
             exc_type, exc_value, exc_traceback = sys.exc_info()
-            return {'type': exc_type.__name__, 'message': str(e), 'traceback': ''.join(traceback.format_tb(exc_traceback))}
+            return {'type': exc_type.__name__, 'message': str(e), '\nTraceback': ''.join(traceback.format_tb(exc_traceback))}
 
         try:
             obj = cls(*args, **kwargs)
+            out_queue.put(dict(type='OK'))
         except Exception as e:
             out_queue.put(dict(type='exception', exception=serialize_exception(e)))
             return
