@@ -325,13 +325,15 @@ class NamedSemaphore:
             import win32event, win32con
             MAX = int(maxcount if maxcount is not None else 2_147_483_647)
             if create:
-                h = win32event.CreateSemaphore(None, int(initial), MAX, _win_name(name or _safe_base("ns")))
+                nm = _win_name(name or _safe_base("ns"))
+                h = win32event.CreateSemaphore(None, int(initial), MAX, nm)
             else:
-                h = win32event.OpenSemaphore(win32con.SEMAPHORE_MODIFY_STATE | win32con.SYNCHRONIZE,False, _win_name(name))
-            if not h:
-                raise OSError("Create/OpenSemaphore failed")
-            self.name = _win_name(name or self.name)
+                if not name: raise ValueError("NamedSemaphore: name must be provided when create=False")
+                nm = _win_name(name)
+                h = win32event.OpenSemaphore(win32con.SEMAPHORE_MODIFY_STATE | win32con.SYNCHRONIZE,False, nm)
+            if not h: raise OSError("Create/OpenSemaphore failed")
             self._h = h
+            self.name = nm
         else:
             self.name = _posix_name(name.lstrip("/")) if name else _posix_name(_safe_base("ns"))
             import posix_ipc as P
