@@ -311,7 +311,8 @@ def _posix_name(base: str) -> str:
         b = nm.encode()[:31]
         nm = b.decode("ascii", "ignore")
         if not nm.startswith("/"): nm = "/" + nm.lstrip("/")
-    return nm
+def _win_name(name: str) -> str:
+    return name if name.startswith(("Local\\","Global\\")) else "Local\\" + name
 
 class NamedSemaphore:
     """Cross-process named counting semaphore (picklable, best-effort cleanup)."""
