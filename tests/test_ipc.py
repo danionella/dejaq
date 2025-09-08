@@ -4,31 +4,46 @@ import os, time, multiprocessing as mp, numpy as np, pytest
 # adjust this import to your module path
 from dejaq.queues import IS_WIN, NamedSemaphore, NamedByteRing, PicklableDejaQueue
 
+mp.set_start_method("spawn", force=True)
+
 # ---------- spawn-safe worker targets ----------
 
 def _child_sem_acquire(name):
-    from dejaq.queues import NamedSemaphore
-    s = NamedSemaphore(name, create=False)
-    ok = s.acquire(timeout=1.0)
-    os._exit(0 if ok else 1)
+    try:
+        from dejaq.queues import NamedSemaphore
+        s = NamedSemaphore(name, create=False)
+        ok = s.acquire(timeout=1.0)
+        os._exit(0 if ok else 1)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        os._exit(2)
+
 
 def _child_nbr_get_bytes(base):
-    from dejaq.queues import NamedByteRing
-    q = NamedByteRing(name=base, create=False)
-    ok, b = q.get_bytes(timeout=2.0)
-    if not ok or b != b"hello":
-        os._exit(1)
-    os._exit(0)
+    try:
+        from dejaq.queues import NamedByteRing
+        q = NamedByteRing(name=base, create=False)
+        ok, b = q.get_bytes(timeout=2.0)
+        if not ok or b != b"hello":
+            os._exit(1)
+        os._exit(0)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        os._exit(2)
 
 def _child_dejaq_prefill_and_get(base, nbytes):
-    from dejaq.queues import PicklableDejaQueue
-    q = PicklableDejaQueue(name=base, create=False)
-    # consume the prefill
-    _ = q.get(timeout=2.0)
-    # then the measured payload
-    arr = q.get(timeout=2.0)
-    ok = isinstance(arr, (bytes, bytearray, memoryview)) and len(arr) == nbytes
-    os._exit(0 if ok else 1)
+    try:
+        from dejaq.queues import PicklableDejaQueue
+        q = PicklableDejaQueue(name=base, create=False)
+        # consume the prefill
+        _ = q.get(timeout=2.0)
+        # then the measured payload
+        arr = q.get(timeout=2.0)
+        ok = isinstance(arr, (bytes, bytearray, memoryview)) and len(arr) == nbytes
+        os._exit(0 if ok else 1)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        os._exit(2)
 
 # ---------- tests ----------
 

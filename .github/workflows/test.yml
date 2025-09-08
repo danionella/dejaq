@@ -63,6 +63,6 @@ jobs:
       # this runs the platform-specific tests declared in tox.ini
       - name: Test with pytest
         run: |
-          pytest -vv
+          pytest -vv -s
         env:
           PLATFORM: ${{ matrix.platform }}
