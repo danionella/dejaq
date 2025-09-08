@@ -350,7 +350,7 @@ class NamedSemaphore:
     def acquire(self, timeout: float | None = None) -> bool:
         if IS_WIN:
             import win32event, win32con
-            ms = win32con.INFINITE if timeout is None else max(0, int(timeout*1000))
+            ms = win32event.INFINITE if timeout is None else max(0, int(timeout*1000))
             return win32event.WaitForSingleObject(self._h, ms) == win32con.WAIT_OBJECT_0
         else: 
             import posix_ipc as P
