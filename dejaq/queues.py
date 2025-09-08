@@ -322,14 +322,15 @@ class NamedSemaphore:
                  initial: int = 0, maxcount: int | None = None, *, auto_unlink: bool = False) -> None:
         self.backend = "win32" if IS_WIN else "posix"
         if IS_WIN:
-            nm = name or _safe_base("ns")
-            self.name = _win_name(nm)
-            import win32event
+            import win32event, win32con
             MAX = int(maxcount if maxcount is not None else 2_147_483_647)
-            h = win32event.CreateSemaphore(None, int(initial), MAX, self.name) if create else \
-                __import__("win32event").OpenSemaphore(__import__("win32con").SEMAPHORE_MODIFY_STATE |
-                                                       __import__("win32con").SYNCHRONIZE, False, self.name)
-            if not h: raise OSError("Create/OpenSemaphore failed")
+            if create:
+                h = win32event.CreateSemaphore(None, int(initial), MAX, _win_name(name or _safe_base("ns")))
+            else:
+                h = win32event.OpenSemaphore(win32con.SEMAPHORE_MODIFY_STATE | win32con.SYNCHRONIZE,False, _win_name(name))
+            if not h:
+                raise OSError("Create/OpenSemaphore failed")
+            self.name = _win_name(name or self.name)
             self._h = h
         else:
             self.name = _posix_name(name.lstrip("/")) if name else _posix_name(_safe_base("ns"))
@@ -347,14 +348,20 @@ class NamedSemaphore:
 
     def acquire(self, timeout: float | None = None) -> bool:
         if IS_WIN:
-            import win32event, win32con
-            ms = win32event.INFINITE if timeout is None else max(0, int(timeout*1000))
-            return win32event.WaitForSingleObject(self._h, ms) == win32con.WAIT_OBJECT_0
-        import posix_ipc as P
-        try:
-            self._sem.acquire(timeout=None if timeout is None else float(timeout)); return True
-        except P.BusyError:
-            return False
+            import win32event
+            ms = win32event.INFINITE if timeout is None else max(0, int(timeout * 1000))
+            rc = win32event.WaitForSingleObject(self._h, ms)
+            if rc == win32event.WAIT_OBJECT_0:
+                return True
+            if rc == win32event.WAIT_TIMEOUT:
+                return False
+            raise RuntimeError(f"WaitForSingleObject failed/abandoned (rc={rc})")
+        else: 
+            import posix_ipc as P
+            try:
+                self._sem.acquire(timeout=None if timeout is None else float(timeout)); return True
+            except P.BusyError:
+                return False
 
     def release(self, n: int = 1) -> None:
         if IS_WIN:
@@ -456,10 +463,11 @@ class NamedByteRing:
             try:
                 self.buf = shared_memory.SharedMemory(name=buf_name, create=True, size=total)
                 self._owns_buf = True
+                _view = np.frombuffer(self.buf.buf, dtype='B', count=total)
+                _view[:] = 0
             except FileExistsError:
                 self.buf = shared_memory.SharedMemory(name=buf_name, create=False)
-            _view = np.frombuffer(self.buf.buf, dtype='B', count=total)
-            _view[:] = 0
+
         else:
             self.buf = shared_memory.SharedMemory(name=buf_name, create=False)
         self._buf_name = buf_name
