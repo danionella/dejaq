@@ -51,26 +51,27 @@ class ByteFIFO:
                 with self.head_changed:
                     if not self.head_changed.wait(timeout=timeout):
                         raise TimeoutError("Timeout waiting for available space.")
-            head = self.tail.value
-            self._write_buffer(array_bytes)
-            frame_info = FrameInfo(nbytes=nbytes, head=head, tail=self.tail.value, meta=meta)
+            _, frame_head, frame_tail = self._write_buffer(array_bytes)
+            frame_info = FrameInfo(nbytes=nbytes, head=frame_head, tail=frame_tail, meta=meta)
             self.queue.put(frame_info)
 
 
-    def _write_buffer(self, array_bytes):
+    def _write_buffer(self, array_bytes, old_tail=None):
         ''' Write a byte array into the queue. Warning: this function should be called after acquiring the put_lock.
         '''
-        tail = self.tail.value
+        old_tail = old_tail or self.tail.value
         nbytes = len(array_bytes)
-        if tail + nbytes <= self.buffer_bytes:
-            self.view[tail : tail + nbytes] = array_bytes
-            self.tail.value = (tail + nbytes) % self.buffer_bytes
+        if old_tail + nbytes <= self.buffer_bytes:
+            #print(type(array_bytes), array_bytes.nbytes, array_bytes.shape)
+            self.view[old_tail : old_tail + nbytes] = array_bytes
+            new_tail = (old_tail + nbytes) % self.buffer_bytes
         else:
-            tail_part_size = self.buffer_bytes - tail
-            self.view[tail:] = array_bytes[:tail_part_size]
+            tail_part_size = self.buffer_bytes - old_tail
+            self.view[old_tail:] = array_bytes[:tail_part_size]
             self.view[: nbytes - tail_part_size] = array_bytes[tail_part_size:]
-            self.tail.value = nbytes - tail_part_size
-        return nbytes
+            new_tail = nbytes - tail_part_size
+        self.tail.value = new_tail
+        return nbytes, old_tail, new_tail
 
 
     def get(self, callback=None, copy=None, **kwargs):
@@ -86,6 +87,9 @@ class ByteFIFO:
         """
         with self.get_lock:
             frame_info = self.queue.get(**kwargs)
+            if frame_info is Ellipsis:
+                self.close()
+                return Ellipsis
             head = frame_info.head
             tail = frame_info.tail
             assert head == self.head.value, f"head: {head}, self.head: {self.head.value}"
@@ -152,6 +156,19 @@ class ByteFIFO:
     def done(self):
         ''' Returns True if the queue is empty and closed.'''
         return self.queue.empty() and self.closed.value
+
+    def __iter__(self):
+        while True:
+            x = self.get()
+            if x is Ellipsis: 
+                self.queue.put(Ellipsis)
+                return
+            yield x
+    
+    def _signal_stop(self, n=1):
+        ''' Puts n stop signals into the queue. '''
+        for _ in range(n):
+            self.queue.put(Ellipsis)
 
     def __getstate__(self):
         state = {k:v for k,v in self.__dict__.items() if k != '_view'}
