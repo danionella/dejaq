@@ -568,8 +568,6 @@ class NamedByteRing:
         self.items.close(); self.space_gate.close()
 
     def unlink(self) -> None:
-        self.view = None
-        gc.collect()
         try: self.state.shm.unlink()
         except Exception: pass
         try: self.buf.unlink()
@@ -647,7 +645,7 @@ class PicklableDejaQueue(NamedByteRing):
                 if rem <= 0 or not self.space_gate.acquire(timeout=rem): return False
 
     def get(self, timeout: float | None = None):
-        if not self.items.acquire(timeout=timeout): return False, None
+        if not self.items.acquire(timeout=timeout): return None
 
         with self.get_lock:
             cap = self.cap
