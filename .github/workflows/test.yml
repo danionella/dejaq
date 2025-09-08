@@ -1,0 +1,68 @@
+# This workflows will upload a Python Package using Twine when a release is created
+# For more information see: https://help.github.com/en/actions/language-and-framework-guides/using-python-with-github-actions#publishing-to-package-registries
+
+name: tests
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*" # Push events to matching v*, i.e. v1.0, v20.15.10
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.platform }} py${{ matrix.python-version }}
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        platform: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.12"]
+
+    defaults:
+      run:
+        shell: bash -l {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # - name: Get cache key for current week and OS
+      #   id: cachekey
+      #   run: |
+      #     echo "cache_key=${{ runner.os }}-${{ matrix.python-version }}-$(date +'%Y-%V')" >> $GITHUB_OUTPUT
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: tests
+          init-shell: >-
+            bash
+            powershell
+          # cache-downloads: true
+          # cache-downloads-key: "download-${{ runner.os }}-${{ matrix.python-version }}"
+          # cache-environment: false
+          # #cache-environment-key: "env-${{ steps.cachekey.outputs.cache_key }}"
+          post-cleanup: 'all'
+      
+      - name: Install dependencies
+        run: |
+          pip install pytest
+
+      - name: Install package
+        run: |
+          pip install -e .
+
+      # this runs the platform-specific tests declared in tox.ini
+      - name: Test with pytest
+        run: |
+          pytest tests/
+        env:
+          PLATFORM: ${{ matrix.platform }}
