@@ -355,7 +355,7 @@ class NamedSemaphore:
                 return True
             if rc == win32event.WAIT_TIMEOUT:
                 return False
-            raise RuntimeError(f"WaitForSingleObject failed/abandoned (rc={rc})")
+            raise RuntimeError(f"WaitForSingleObject rc={rc}")
         else: 
             import posix_ipc as P
             try:
@@ -367,7 +367,7 @@ class NamedSemaphore:
         if IS_WIN:
             import win32event, pywintypes
             try:
-                win32event.ReleaseSemaphore(self._h, int(n), None)
+                win32event.ReleaseSemaphore(self._h, int(n))
             except pywintypes.error as e:
                 if getattr(e, "winerror", None) == 298:  # ERROR_TOO_MANY_POSTS
                     raise RuntimeError("Over-release of NamedSemaphore") from e
