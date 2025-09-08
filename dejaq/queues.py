@@ -314,60 +314,62 @@ def _posix_name(base: str) -> str:
     return nm
 
 class NamedSemaphore:
-    """Cross-process named counting semaphore (picklable, best-effort cleanup). 
-    On POSIX uses ``posix_ipc.Semaphore``; on Windows uses ``Create/OpenSemaphoreW``.
-
-    Args:
-        name (str | None): Name of the semaphore. If None (default), a random name is generated.
-        create (bool): If True (default), attempt to create a new semaphore; if it already exists, open it. If False, only open an existing semaphore.
-        initial (int): Initial value for the semaphore (default 0). Ignored if create is False.
-    """
+    """Cross-process named counting semaphore (picklable, best-effort cleanup)."""
     def __init__(self, name: str | None = None, create: bool = True,
-                 initial: int = 0, maxcount: int | None = None, *,
-                 auto_unlink: bool = False) -> None:
+                 initial: int = 0, maxcount: int | None = None, *, auto_unlink: bool = False) -> None:
         self.backend = "win32" if IS_WIN else "posix"
-        self.name = (name if IS_WIN else _posix_name(name.lstrip("/"))) if name else \
-                    (_safe_base("ns") if IS_WIN else _posix_name(_safe_base("ns")))
-        self._owns = False
-        self._auto_unlink = bool(auto_unlink)
         if IS_WIN:
-            import win32event, win32con
+            nm = name or _safe_base("ns")
+            self.name = _win_name(nm)
+            import win32event
             MAX = int(maxcount if maxcount is not None else 2_147_483_647)
-            h = (win32event.CreateSemaphore(None, int(initial), MAX, self.name) if create else
-                 win32event.OpenSemaphore(win32con.SEMAPHORE_MODIFY_STATE | win32con.SYNCHRONIZE, False, self.name))
+            h = win32event.CreateSemaphore(None, int(initial), MAX, self.name) if create else \
+                __import__("win32event").OpenSemaphore(__import__("win32con").SEMAPHORE_MODIFY_STATE |
+                                                       __import__("win32con").SYNCHRONIZE, False, self.name)
             if not h: raise OSError("Create/OpenSemaphore failed")
-            self._h = h; self._owns = bool(create)
+            self._h = h
         else:
+            self.name = _posix_name(name.lstrip("/")) if name else _posix_name(_safe_base("ns"))
             import posix_ipc as P
             flags = P.O_CREAT | (P.O_EXCL if create else 0)
             if create:
-                try: self._sem = P.Semaphore(self.name, flags=flags, initial_value=int(initial)); self._owns = True
-                except Exception: self._sem = P.Semaphore(self.name)
+                try:
+                    self._sem = P.Semaphore(self.name, flags=flags, initial_value=int(initial))
+                except Exception:
+                    self._sem = P.Semaphore(self.name)
             else:
                 self._sem = P.Semaphore(self.name)
-        weakref.finalize(self, NamedSemaphore._finalize, self.backend, self.name, self._owns, self._auto_unlink)
+        self._auto_unlink = bool(auto_unlink)
+        weakref.finalize(self, NamedSemaphore._finalize, self.backend, self.name, self._auto_unlink)
 
     def acquire(self, timeout: float | None = None) -> bool:
         if IS_WIN:
             import win32event, win32con
-            ms = win32event.INFINITE if timeout is None else max(0, int(timeout*1000))
+            ms = win32con.INFINITE if timeout is None else max(0, int(timeout*1000))
             return win32event.WaitForSingleObject(self._h, ms) == win32con.WAIT_OBJECT_0
-        else: 
-            import posix_ipc as P
-            try:
-                self._sem.acquire(timeout=None if timeout is None else float(timeout)); return True
-            except P.BusyError:
-                return False
+        import posix_ipc as P
+        try:
+            self._sem.acquire(timeout=None if timeout is None else float(timeout)); return True
+        except P.BusyError:
+            return False
 
     def release(self, n: int = 1) -> None:
         if IS_WIN:
-            import win32event
-            for _ in range(int(n)): win32event.ReleaseSemaphore(self._h, 1, None)
+            import win32event, pywintypes
+            try:
+                win32event.ReleaseSemaphore(self._h, int(n), None)
+            except pywintypes.error as e:
+                if getattr(e, "winerror", None) == 298:  # ERROR_TOO_MANY_POSTS
+                    raise RuntimeError("Over-release of NamedSemaphore") from e
+                raise
         else:
             for _ in range(int(n)): self._sem.release()
 
     def close(self) -> None:
-        if not IS_WIN:
+        if IS_WIN:
+            try: __import__("win32event").CloseHandle(self._h)
+            except Exception: pass
+        else:
             try: self._sem.close()
             except Exception: pass
 
@@ -379,13 +381,14 @@ class NamedSemaphore:
 
     def __getstate__(self) -> dict: return {"name": self.name, "backend": self.backend}
     def __setstate__(self, s: dict) -> None:
-        self.__dict__.clear(); self.backend = s["backend"]; self.__init__(s["name"], create=False)
+        self.__dict__.clear(); self.backend = s["backend"]
+        self.__init__(s["name"], create=False)
 
     @staticmethod
-    def _finalize(backend: str, name: str, owns: bool, auto_unlink: bool) -> None:
-        if backend == "posix" and auto_unlink and owns:
-            import posix_ipc as P
-            try: P.unlink_semaphore(name)
+    def _finalize(backend: str, name: str, auto_unlink: bool) -> None:
+        if backend == "posix" and auto_unlink:
+            try:
+                import posix_ipc as P; P.unlink_semaphore(name)
             except Exception: pass
 
     def __del__(self):
@@ -395,15 +398,23 @@ class NamedSemaphore:
     def __enter__(self): self.acquire(); return self
     def __exit__(self, *_): self.release()
 
-
 class NamedLock(NamedSemaphore):
-    """Mutex built on NamedSemaphore (capacity 1)."""
-
+    """Mutex from NamedSemaphore (maxcount=1). Detects over-release on POSIX."""
     def __init__(self, name: str | None = None, create: bool = True, *, auto_unlink: bool = False) -> None:
         super().__init__(name=name, create=create, initial=1, maxcount=1, auto_unlink=auto_unlink)
 
-    def release(self) -> None:  # clarify intent
-        super().release(1)
+    def release(self) -> None:
+        if IS_WIN:
+            return super().release(1)
+        # POSIX: probe to avoid silent over-release
+        import posix_ipc as P
+        try:
+            self._sem.acquire(timeout=0)  # trywait
+        except P.BusyError:
+            self._sem.release()           # normal unlock
+        else:
+            self._sem.release()           # restore
+            raise RuntimeError("Over-release of NamedLock on POSIX")
 
 class NamedByteRing:
     """Manager/Condition-free ring buffer queue (bytes) with named semaphores.
