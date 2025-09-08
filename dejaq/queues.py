@@ -444,11 +444,11 @@ class NamedByteRing:
                 self._owns_buf = True
             except FileExistsError:
                 self.buf = shared_memory.SharedMemory(name=buf_name, create=False)
+            _view = np.frombuffer(self.buf.buf, dtype='B', count=total)
+            _view[:] = 0
         else:
             self.buf = shared_memory.SharedMemory(name=buf_name, create=False)
         self._buf_name = buf_name
-        _view = np.frombuffer(self.buf.buf, dtype='B', count=total)
-        _view[:] = 0
 
         # Sync: serialize producers/consumers + count items + wake producers
         self.put_lock   = NamedLock(("NLp_"+base) if IS_WIN else base+"_Lp", create=create, auto_unlink=auto_unlink)
