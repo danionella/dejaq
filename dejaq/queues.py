@@ -5,7 +5,10 @@ from multiprocessing import shared_memory
 import pickle
 import dataclasses
 from typing import Any
+
 import numpy as np
+
+from . import ctx
 
 IS_WIN = sys.platform.startswith("win")
 
@@ -13,24 +16,38 @@ class ByteFIFO:
     """ A FIFO buffer (queue) for bytes. The queue is implemented as a ring buffer in shared memory.
     """
 
-    def __init__(self, buffer_bytes=10e6):
+    def __init__(self, buffer_bytes=10e6, use_manager=False):
         """
         Initializes a ByteFIFO object.
 
         Args:
             buffer_bytes (int): The size of the buffer in bytes. Defaults to 10 MiB.
+            use_manager (bool): Whether to use a multiprocessing Manager for synchronization primitives. Defaults to False. 
         """
-
         self.buffer_bytes = int(buffer_bytes)
-        self.buffer = mp.Array("B", self.buffer_bytes, lock=False)
-        self._view = None
-        self.queue = mp.Manager().Queue()  # manager helps avoid out-of-order problems
-        self.get_lock = mp.Lock()
-        self.put_lock = mp.Lock()
-        self.head_changed = mp.Condition()
-        self.head = mp.Value("l", 0)
-        self.tail = mp.Value("l", 0)
-        self.closed = mp.Value("b", False)
+        self.shm = shared_memory.SharedMemory(create=True, size=self.buffer_bytes)
+        self.shm_name = self.shm.name
+        self.view = np.frombuffer(self.shm.buf, dtype='B', count=self.buffer_bytes)
+        self.view[:] = 0
+        self._owner = True
+        self._manager = ctx.Manager() if use_manager else None
+        factory = self._manager or mp
+        self.queue = factory.Queue()
+        self.get_lock = factory.Lock()
+        self.put_lock = factory.Lock()
+        self.head_changed = factory.Condition()
+        self.head = factory.Value("l", 0)
+        self.tail = factory.Value("l", 0)
+        self.closed = factory.Value("b", False)
+        self._finalizer = weakref.finalize(self, ByteFIFO._finalize_shm, self.shm_name, True)
+        self._mgr_finalizer = weakref.finalize(self, ByteFIFO._shutdown_manager, self._manager)
+
+    def init_buffer(self):
+        ''' Initialize the shared memory buffer. This is needed when the object is passed to a new process.
+        '''
+        self.shm = shared_memory.SharedMemory(name=self.shm_name)
+        self.view = np.frombuffer(self.shm.buf, dtype=np.uint8, count=self.buffer_bytes)
+        self._owner = False
 
 
     def put(self, array_bytes, meta=None, timeout=None):
@@ -123,17 +140,6 @@ class ByteFIFO:
         """
         return (self.head.value - self.tail.value - 1) % self.buffer_bytes
 
-    @property
-    def view(self):
-        """ numpy.ndarray: A view of the shared memory array as a numpy array. Lazy initialization to avoid pickling issues.
-        """
-        if self._view is None:
-            self._view = np.frombuffer(self.buffer, "B")
-        return self._view
-
-    def __del__(self):
-        self._view = None
-
     def empty(self):
         """ Checks if the queue is empty.
 
@@ -176,13 +182,59 @@ class ByteFIFO:
             self.queue.put(Ellipsis)
 
     def __getstate__(self):
-        state = {k:v for k,v in self.__dict__.items() if k != '_view'}
-        state['_view'] = None
+        state = dict(self.__dict__)
+        state.pop("shm", None)
+        state.pop("view", None)
+        state.pop("_manager", None)
         return state
     
     def __setstate__(self, state):
         self.__dict__ = state
-        
+        self.shm = shared_memory.SharedMemory(name=self.shm_name)
+        self.view = np.frombuffer(self.shm.buf, dtype='B', count=self.buffer_bytes)
+        self._owner = False
+        self._finalizer = weakref.finalize(self, ByteFIFO._finalize_shm, self.shm_name, False)
+
+    def __del__(self):
+        try:
+            try:
+                self.view = None
+                gc.collect()
+            except Exception:
+                pass
+            if hasattr(self, "_finalizer"):
+                self._finalizer()
+            if hasattr(self, "_mgr_finalizer"):
+                self._mgr_finalizer()
+        except Exception:
+            pass
+
+
+    @staticmethod
+    def _finalize_shm(shm_name: str, owner: bool):
+        """Close (and if owner, unlink) the named shared memory. Safe and idempotent."""
+        try:
+            shm = shared_memory.SharedMemory(name=shm_name)
+        except Exception:
+            shm = None
+        if shm is not None:
+            try:
+                shm.close()
+            finally:
+                if owner:
+                    try:
+                        shm.unlink()
+                    except Exception:
+                        pass
+
+    @staticmethod
+    def _shutdown_manager(mgr):
+        try:
+            mgr.shutdown()
+        except Exception:
+            pass
+
+
 
 class ArrayFIFO(ByteFIFO):
     """ A fast queue for numpy arrays. 
@@ -237,8 +289,8 @@ class DejaQueue(ByteFIFO):
     Args:
         buffer_bytes (int): The size of the buffer in bytes. Defaults to 10 MiB.
     """
-    def __init__(self, buffer_bytes=10e6):
-        super().__init__(buffer_bytes=buffer_bytes)
+    def __init__(self, buffer_bytes=10e6, use_manager=False):
+        super().__init__(buffer_bytes=buffer_bytes, use_manager=use_manager)
 
     def put(self, obj, timeout=None):
         """ Puts a Python object into the queue.
@@ -260,12 +312,11 @@ class DejaQueue(ByteFIFO):
                     if not self.head_changed.wait(timeout=timeout):
                         raise TimeoutError("Timeout waiting for available space.")
 
-            head = self.tail.value
-            self._write_buffer(np.frombuffer(pkl, 'byte'))
+            _, old_tail, new_tail = self._write_buffer(np.frombuffer(pkl, 'byte'))
             for buf in buffers:
-                self._write_buffer(buf.raw())
+                _, _, new_tail = self._write_buffer(buf.raw(), old_tail=new_tail)
 
-            frame_info = FrameInfo(nbytes=nbytes_total, head=head, tail=self.tail.value, meta=buffer_lengths)
+            frame_info = FrameInfo(nbytes=nbytes_total, head=old_tail, tail=new_tail, meta=buffer_lengths)
             self.queue.put(frame_info)
 
     def get(self, **kwargs):
@@ -289,7 +340,7 @@ class DejaQueue(ByteFIFO):
         obj = super().get(copy=False, callback=callback, **kwargs)
         return obj
     
-    
+
 @dataclasses.dataclass
 class FrameInfo:
     ''' A class to store metadata about a data frame in a ring buffer.'''
@@ -684,3 +735,44 @@ class PicklableDejaQueue(NamedByteRing):
 
 
 
+import statistics as stats
+
+def _worker(q, total, conn):
+    # Signal ready
+    conn.send(1)
+    for _ in range(total):
+        got = q.get()
+        conn.send(1)
+    conn.close()
+
+
+def bench_queue(q, msg_sizes, repeats=10, start_method="spawn"):
+    """
+    Measure round-trip time (put -> child get -> ack) for each message size.
+    Prints min/median/mean/max (µs) and returns {size_bytes: mean_µs}.
+    """
+    ctx = mp.get_context(start_method)
+    parent, child = ctx.Pipe(duplex=False)
+
+    
+    total = repeats * len(msg_sizes)
+    p = ctx.Process(target=_worker, args=(q, total, child))
+    p.start()
+    parent.recv()  # wait until worker is ready
+    results = {}
+    for n in msg_sizes:
+        payload = np.random.randint(0, 256, size=n, dtype='uint8').view('B')
+        samples = []
+        for _ in range(repeats):
+            t0 = time.perf_counter_ns()
+            q.put(payload)
+            parent.recv()  # ack: child consumed one item
+            dt_us = (time.perf_counter_ns() - t0) / 1000.0
+            samples.append(dt_us)
+        mn, mx = min(samples), max(samples)
+        med, mean = stats.median(samples), stats.mean(samples)
+        print(f"{n:>8} B  min {mn:8.1f} µs  median {med:8.1f} µs  mean {mean:8.1f} µs  max {mx:8.1f} µs | MiB/s: {n/mean:.2f}")
+        results[n] = mean
+
+    p.join()
+    return results
