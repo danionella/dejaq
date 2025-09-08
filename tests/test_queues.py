@@ -109,10 +109,12 @@ def test_queue_mp_stress(QueueCls):
     items = [np.random.bytes(random.randint(100, 10000)) for _ in range(N)]
     manager = mp.Manager()
     results = manager.list()
-    prods = [mp.Process(target=producer, args=(q, items[i::4])) for i in range(4)]
+    prods = [mp.Process(target=producer, args=(q, items[i::4], 0, False)) for i in range(4)]
     cons_ = [mp.Process(target=consumer, args=(q, results)) for _ in range(4)]
     for p in prods + cons_:
         p.start()
+    time.sleep(1)
+    q._signal_stop()
     for p in prods + cons_:
         p.join()
     assert len(results) == len(items)
