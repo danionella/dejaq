@@ -642,10 +642,12 @@ class PicklableDejaQueue(NamedByteRing):
                 self.space_gate.acquire()
             else:
                 rem = deadline - time.time()
-                if rem <= 0 or not self.space_gate.acquire(timeout=rem): return False
+                if rem <= 0 or not self.space_gate.acquire(timeout=rem): 
+                    raise TimeoutError("Timeout waiting for space in queue.")
 
     def get(self, timeout: float | None = None):
-        if not self.items.acquire(timeout=timeout): return None
+        if not self.items.acquire(timeout=timeout): 
+            raise TimeoutError("Timeout waiting for item.")
 
         with self.get_lock:
             cap = self.cap
