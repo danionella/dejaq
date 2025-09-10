@@ -1,10 +1,11 @@
-# remote.py
 from __future__ import annotations
 
+import logging
 import os
 import time
 import uuid
 import traceback
+import psutil
 import inspect
 import multiprocessing as mp
 import weakref
@@ -13,11 +14,8 @@ from typing import Any, Callable, Optional, Dict, Tuple, List
 
 import cloudpickle
 
-# Transport: your picklable, zero-copy queue (mp.Queue-like API; raises TimeoutError on timeout)
 from dejaq.queues import PicklableDejaQueue
 
-
-# ============================== Wire types & errors ==============================
 
 @dataclass
 class _Req:
@@ -31,8 +29,9 @@ class _Req:
         args: Positional arguments.
         kwargs: Keyword arguments (for setattr: {"value": ...}).
     """
+
     call_id: str
-    reply: Optional[str]   # <-- allow None to mean "no reply requested"
+    reply: Optional[str]  # <-- allow None to mean "no reply requested"
     kind: str
     name: str
     args: tuple
@@ -48,6 +47,7 @@ class _Rep:
         ok: True if the call succeeded; False if it raised.
         payload: Result object (if ok), else a tuple (etype, eargs, tb_str).
     """
+
     call_id: str
     ok: bool
     payload: Any
@@ -65,7 +65,8 @@ class RemoteError(RuntimeError):
 
 # ============================== Server/worker loops ==============================
 
-def _actor_server(cls_pkl: bytes, ctor_args: tuple, ctor_kwargs: dict, req_name: str) -> None:
+
+def _actor_server(cls_pkl: bytes, actor_args: tuple, actor_kwargs: dict, req_name: str) -> None:
     """Actor loop: instantiates `cls` and services _Req from a request queue.
 
     The server replies to the mailbox specified by each request's `reply`
@@ -73,7 +74,7 @@ def _actor_server(cls_pkl: bytes, ctor_args: tuple, ctor_kwargs: dict, req_name:
     """
     req = PicklableDejaQueue(name=req_name, create=False)
     cls = cloudpickle.loads(cls_pkl)
-    obj = cls(*ctor_args, **ctor_kwargs)
+    obj = cls(*actor_args, **actor_kwargs)
 
     rep_cache: Dict[str, PicklableDejaQueue] = {}
 
@@ -148,11 +149,10 @@ def _actor_server(cls_pkl: bytes, ctor_args: tuple, ctor_kwargs: dict, req_name:
         except BaseException as e:
             # Only attempt to send the error back if a reply was requested
             if msg.reply is not None:
-                _maybe_reply(
-                    msg,
-                    _Rep(msg.call_id, False, (type(e).__name__, e.args, traceback.format_exc()))
-                )
-            # else: swallow — caller explicitly opted out of replies
+                _maybe_reply(msg, _Rep(msg.call_id, False, (type(e).__name__, e.args, traceback.format_exc())))
+            else:  # else: swallow — caller explicitly opted out of replies
+                logging.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
+
 
 def _func_worker(fn_ser: Tuple[str, str] | Callable, req_name: str) -> None:
     """Function worker loop: applies a function for 'apply' requests.
@@ -193,13 +193,11 @@ def _func_worker(fn_ser: Tuple[str, str] | Callable, req_name: str) -> None:
             _maybe_reply(msg, _Rep(msg.call_id, True, out))
         except BaseException as e:
             if msg.reply is not None:
-                _maybe_reply(
-                    msg,
-                    _Rep(msg.call_id, False, (type(e).__name__, e.args, traceback.format_exc()))
-                )
+                _maybe_reply(msg, _Rep(msg.call_id, False, (type(e).__name__, e.args, traceback.format_exc())))
 
 
 # ============================== Client-side demux & futures ==============================
+
 
 class _Mailbox:
     """Demultiplex replies by `call_id` for a single client process.
@@ -211,6 +209,7 @@ class _Mailbox:
     Args:
       rep_q: The reply/mailbox queue owned by this process.
     """
+
     def __init__(self, rep_q: PicklableDejaQueue) -> None:
         self.q = rep_q
         self._buf: Dict[str, _Rep] = {}
@@ -226,6 +225,19 @@ class _Mailbox:
             if rep.call_id == call_id:
                 return rep
             self._buf[rep.call_id] = rep
+
+    def msg_arrived(self, call_id: str) -> bool:
+        """Check if a message with `call_id` has arrived (non-blocking)."""
+        if call_id in self._buf:
+            return True
+        try:
+            while True:
+                rep: _Rep = self.q.get(timeout=0.0)
+                if rep.call_id == call_id:
+                    return True
+                self._buf[rep.call_id] = rep
+        except TimeoutError:
+            return False
 
 
 class Future:
@@ -244,6 +256,7 @@ class Future:
 
 
 # ============================== Public API: Actor & RemoteFunc ==============================
+
 
 class _RemoteMethod:
     """Lightweight callable proxy for a remote method."""
@@ -289,14 +302,8 @@ class _RemoteMethod:
 class Actor:
     """Run a class instance in a separate process and call its methods/attributes remotely.
 
-    Cache-free variant:
-      • Method/attribute classification uses a per-name 'resolve' RPC that relies on
-        `inspect.getattr_static` on the server (no unintended property/descriptor execution).
-      • Tab completion (`__dir__`) calls remote 'dir' **every time** (no client cache).
-
     Supports:
       • Remote method calls: `a.method(x)`, `a.method_async(x)`, `a.method(..., noreply=True)`
-      • Remote attribute get/set: `a.getattr("x")`, `a.setattr("x", v)`
       • Jupyter tab completion: `__dir__` merges local + remote names
 
     Args:
@@ -306,24 +313,41 @@ class Actor:
       start_method: Multiprocessing start method (default 'spawn' for portability).
       **kwargs: Keyword args for the class constructor.
     """
+
     # --- construction ---
-    def __init__(self, cls: type, *args,
-                 buffer_bytes: int = 8_000_000,
-                 start_method: str = "spawn",
-                 **kwargs) -> None:
+    def __init__(self, cls: type, *args, buffer_bytes: int = int(10e6), start_method: str = "spawn", **kwargs) -> None:
         base = f"act-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        object.__setattr__(self, "_rep", PicklableDejaQueue(buffer_bytes=buffer_bytes, name=base+"_mb", create=True))   # mailbox
-        object.__setattr__(self, "_mbox", _Mailbox(self._rep))
-        object.__setattr__(self, "_req", PicklableDejaQueue(buffer_bytes=buffer_bytes, name=base+"_req", create=True))  # requests
+        self._rep = PicklableDejaQueue(buffer_bytes=buffer_bytes, name=base + "_mb", create=True)  # mailbox
+        self._mbox = _Mailbox(self._rep)
+        self._req = PicklableDejaQueue(buffer_bytes=buffer_bytes, name=base + "_req", create=True)  # requests
         ctx = mp.get_context(start_method)
-        cls_pkl = cloudpickle.dumps(cls)  # support nested/local classes
-        p = ctx.Process(target=_actor_server, args=(cls_pkl, args, kwargs, self._req.base))
+        self._args = args
+        self._kwargs = kwargs
+        self._cls_pkl = cloudpickle.dumps(cls)
+        p = ctx.Process(target=_actor_server, args=(self._cls_pkl, self._args, self._kwargs, self._req.base))
         p.start()
-        object.__setattr__(self, "_p", p)
-        object.__setattr__(self, "_closed", False)
+        self._proc_meta = {"pid": p.pid, "create_time": psutil.Process(p.pid).create_time()}
+        self._cache = {}  # Cache for resolved remote methods/attributes
 
     # --- internals ---
+    def is_proc_alive(self) -> bool:
+        try:
+            pr = psutil.Process(self._proc_meta["pid"])
+            return (
+                pr.create_time() == self._proc_meta["create_time"]
+                and pr.is_running()
+                and pr.status() != psutil.STATUS_ZOMBIE
+            )
+        except psutil.NoSuchProcess:
+            return False
+
+    def _ensure_open(self) -> None:
+        """Raise RuntimeError if the actor is closed or its process is dead."""
+        if not self.is_proc_alive():
+            raise RuntimeError("Actor process has exited")
+
     def _send(self, kind: str, name: str, args: tuple, kwargs: dict, *, expect_reply: bool = True) -> str:
+        self._ensure_open()
         cid = uuid.uuid4().hex
         reply = self._rep.base if expect_reply else None
         self._req.put(_Req(cid, reply, kind, name, args, kwargs))
@@ -342,8 +366,12 @@ class Actor:
           AttributeError: If the remote object has no such attribute.
           RemoteError: If the remote getattr/resolve raised.
         """
-        if name.startswith("_"):
+        if name.startswith("_") and name != "__call__":
             raise AttributeError(name)
+
+        # Check cache first
+        if name in self._cache:
+            return self._cache[name]
 
         # async sugar
         if name.endswith("_async"):
@@ -353,6 +381,7 @@ class Actor:
                 cid = self._send("call", real, args, kwargs, expect_reply=True)
                 return Future(self._mbox, cid)
 
+            self._cache[name] = _async
             return _async
 
         # classify safely via resolve
@@ -365,7 +394,9 @@ class Actor:
         if not meta.get("exists", False):
             raise AttributeError(name)
         if meta.get("callable", False):
-            return _RemoteMethod(self, name)
+            method = _RemoteMethod(self, name)
+            self._cache[name] = method
+            return method
 
         # non-callable attribute: fetch its value (this may execute properties by design)
         cid = self._send("getattr", name, (), {}, expect_reply=True)
@@ -373,7 +404,9 @@ class Actor:
         if not rep.ok:
             et, ea, tb = rep.payload
             raise RemoteError(et, ea, tb)
-        return rep.payload
+        value = rep.payload
+        self._cache[name] = value
+        return value
 
     def __setattr__(self, name: str, value: Any) -> None:
         """Assign to remote attributes for public names; keep locals for private ones.
@@ -417,25 +450,25 @@ class Actor:
         cid = self._send("ping", "", (), {}, expect_reply=True)
         t1 = self._mbox.wait(cid, 2.0).payload
         t2 = time.time()
-        return {"out_ms": (t1 - t0)*1000, "back_ms": (t2 - t1)*1000, "total_ms": (t2 - t0)*1000}
+        return {"out_ms": (t1 - t0) * 1000, "back_ms": (t2 - t1) * 1000, "total_ms": (t2 - t0) * 1000}
 
     def close(self, timeout: float = 2.0) -> None:
         """Gracefully stop the actor process."""
-        if self._closed:
-            return
         try:
             cid = self._send("shutdown", "", (), {}, expect_reply=True)
             _ = self._mbox.wait(cid, timeout)
         except Exception:
-            pass
+            logging.warning("Actor.close: graceful shutdown failed, terminating")
         self._p.join(timeout)
         if self._p.is_alive():
             self._p.terminate()
             self._p.join()
-        object.__setattr__(self, "_closed", True)
 
-    def __enter__(self): return self
-    def __exit__(self, exc_type, exc, tb): self.close()
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
 
 
 class RemoteFunc:
@@ -458,13 +491,14 @@ class RemoteFunc:
       buffer_bytes: Size of each queue (request/mailbox) in bytes.
       start_method: Multiprocessing start method (default 'spawn').
     """
-    def __init__(self, fn: Callable, workers: int = 1,
-                 buffer_bytes: int = 8_000_000,
-                 start_method: str = "spawn") -> None:
+
+    def __init__(
+        self, fn: Callable, workers: int = 1, buffer_bytes: int = 8_000_000, start_method: str = "spawn"
+    ) -> None:
         base = f"rf-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        self._rep = PicklableDejaQueue(buffer_bytes=buffer_bytes, name=base+"_mb", create=True)    # mailbox
+        self._rep = PicklableDejaQueue(buffer_bytes=buffer_bytes, name=base + "_mb", create=True)  # mailbox
         self._mbox = _Mailbox(self._rep)
-        self._req = PicklableDejaQueue(buffer_bytes=buffer_bytes, name=base+"_req", create=True)   # work queue
+        self._req = PicklableDejaQueue(buffer_bytes=buffer_bytes, name=base + "_req", create=True)  # work queue
         ctx = mp.get_context(start_method)
 
         # Prefer (module, name) reference for spawn-friendliness; fall back to pickled callable.
@@ -475,8 +509,7 @@ class RemoteFunc:
         except Exception:
             fn_ref = fn
 
-        self._ps = [ctx.Process(target=_func_worker, args=(fn_ref, self._req.base))
-                    for _ in range(int(workers))]
+        self._ps = [ctx.Process(target=_func_worker, args=(fn_ref, self._req.base)) for _ in range(int(workers))]
         for p in self._ps:
             p.start()
 
@@ -526,8 +559,11 @@ class RemoteFunc:
                 p.terminate()
                 p.join()
 
-    def __enter__(self): return self
-    def __exit__(self, exc_type, exc, tb): self.close()
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
 
     def __del__(self):
         try:
@@ -536,11 +572,22 @@ class RemoteFunc:
             pass
 
 
-# ---------- convenience ----------
-def spawn_actor(cls: type, *args, **kwargs) -> Actor:
-    """Convenience factory for Actor."""
-    return Actor(cls, *args, **kwargs)
+class ActorDecorator:
+    """Decorator to create an Actor from a class definition."""
 
-def spawn_function(fn: Callable, workers: int = 1, **kwargs) -> RemoteFunc:
-    """Convenience factory for RemoteFunc."""
-    return RemoteFunc(fn, workers=workers, **kwargs)
+    def __init__(self, cls: type, buffer_bytes: int = int(10e6)):
+        self._cls = cls
+        self._buffer_bytes = buffer_bytes
+
+    def __call__(self, *args, **kwargs) -> Actor:
+        return Actor(self._cls, *args, **kwargs)
+
+
+# # ---------- convenience ----------
+# def spawn_actor(cls: type, *args, **kwargs) -> Actor:
+#     """Convenience factory for Actor."""
+#     return Actor(cls, *args, **kwargs)
+
+# def spawn_function(fn: Callable, workers: int = 1, **kwargs) -> RemoteFunc:
+#     """Convenience factory for RemoteFunc."""
+#     return RemoteFunc(fn, workers=workers, **kwargs)
