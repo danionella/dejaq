@@ -11,8 +11,9 @@ import multiprocessing as mp
 import weakref
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Dict, Tuple, List
+from types import ModuleType
 
-import cloudpickle
+import cloudpickle, dill
 
 from dejaq.queues import PicklableDejaQueue
 
@@ -36,6 +37,7 @@ class _Req:
     name: str
     args: tuple
     kwargs: dict
+    cloudpickle_result: bool = False  # <-- whether to serialize the result with cloudpickle
 
 
 @dataclass
@@ -66,15 +68,18 @@ class RemoteError(RuntimeError):
 # ============================== Server/worker loops ==============================
 
 
-def _actor_server(cls_pkl: bytes, actor_args: tuple, actor_kwargs: dict, req_name: str) -> None:
+def _actor_server(pkl: bytes) -> None:
     """Actor loop: instantiates `cls` and services _Req from a request queue.
 
     The server replies to the mailbox specified by each request's `reply`
     (skipped entirely if `reply` is None). Designed to be module-level for Windows 'spawn'.
     """
+    cls, actor_args, actor_kwargs, req_name = cloudpickle.loads(pkl)
     req = PicklableDejaQueue(name=req_name, create=False)
-    cls = cloudpickle.loads(cls_pkl)
-    obj = cls(*actor_args, **actor_kwargs)
+    if isinstance(cls, ModuleType):
+        obj = cls
+    else:
+        obj = cls(*actor_args, **actor_kwargs)
 
     rep_cache: Dict[str, PicklableDejaQueue] = {}
 
@@ -86,6 +91,7 @@ def _actor_server(cls_pkl: bytes, actor_args: tuple, actor_kwargs: dict, req_nam
         return q
 
     def _maybe_reply(msg: _Req, rep: _Rep) -> None:
+        # Only reply if requested (fire-and-forget otherwise)
         if msg.reply is not None:
             repq(msg.reply).put(rep)
 
@@ -121,7 +127,8 @@ def _actor_server(cls_pkl: bytes, actor_args: tuple, actor_kwargs: dict, req_nam
                 _maybe_reply(msg, _Rep(msg.call_id, True, out))
             elif msg.kind == "call":
                 out = getattr(obj, msg.name)(*msg.args, **msg.kwargs)
-                # Only reply if requested (fire-and-forget otherwise)
+                if msg.cloudpickle_result:
+                    out = cloudpickle.dumps(out)
                 _maybe_reply(msg, _Rep(msg.call_id, True, out))
             elif msg.kind == "getattr":
                 out = getattr(obj, msg.name)
@@ -129,17 +136,20 @@ def _actor_server(cls_pkl: bytes, actor_args: tuple, actor_kwargs: dict, req_nam
             elif msg.kind == "setattr":
                 setattr(obj, msg.name, msg.kwargs.get("value"))
                 _maybe_reply(msg, _Rep(msg.call_id, True, True))
-            elif msg.kind == "resolve":
-                # classify *without* invoking descriptors/properties
+            elif msg.kind == "resolve":  # classify *without* invoking descriptors/properties
                 try:
                     v = inspect.getattr_static(obj, msg.name)
                 except AttributeError:
-                    out = {"exists": False, "callable": False}
-                else:
-                    if isinstance(v, (staticmethod, classmethod)):
-                        v = v.__func__
-                    is_prop = isinstance(v, property)
-                    out = {"exists": True, "callable": (callable(v) and not is_prop)}
+                    try:  # Fallback to the unwrapped target (common for proxies)
+                        v = inspect.getattr_static(inspect.unwrap(obj), msg.name)
+                    except AttributeError:
+                        out = {"exists": False, "callable": False}
+                        _maybe_reply(msg, _Rep(msg.call_id, True, out))
+                        continue
+                if isinstance(v, (staticmethod, classmethod)):
+                    v = v.__func__
+                is_prop = isinstance(v, property)
+                out = {"exists": True, "callable": (callable(v) and not is_prop)}
                 _maybe_reply(msg, _Rep(msg.call_id, True, out))
             elif msg.kind == "dir":
                 out = _dir_payload()
@@ -147,8 +157,7 @@ def _actor_server(cls_pkl: bytes, actor_args: tuple, actor_kwargs: dict, req_nam
             else:
                 raise ValueError(f"unknown kind {msg.kind!r}")
         except BaseException as e:
-            # Only attempt to send the error back if a reply was requested
-            if msg.reply is not None:
+            if msg.reply is not None:  # Only attempt to send the error back if a reply was requested
                 _maybe_reply(msg, _Rep(msg.call_id, False, (type(e).__name__, e.args, traceback.format_exc())))
             else:  # else: swallow — caller explicitly opted out of replies
                 logging.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
@@ -265,7 +274,7 @@ class _RemoteMethod:
         self._actor = weakref.proxy(actor_ref)
         self._name = name
 
-    def __call__(self, *args, timeout: Optional[float] = None, noreply: bool = False, **kwargs):
+    def __call__(self, *args, timeout: Optional[float] = None, noreply: bool = False, _use_cloudpickle=False, **kwargs):
         """Invoke the remote method.
 
         Args:
@@ -280,12 +289,14 @@ class _RemoteMethod:
           • When `noreply=True`, remote exceptions are not propagated.
           • Use this for high-throughput paths where acknowledgement is unnecessary.
         """
-        cid = self._actor._send("call", self._name, args, kwargs, expect_reply=not noreply)
+        cid = self._actor._send(
+            "call", self._name, args, kwargs, expect_reply=not noreply, _use_cloudpickle=_use_cloudpickle
+        )
         if noreply:
             return None
         rep = self._actor._mbox.wait(cid, timeout)
         if rep.ok:
-            return rep.payload
+            return rep.payload if not _use_cloudpickle else cloudpickle.loads(rep.payload)
         et, ea, tb = rep.payload
         raise RemoteError(et, ea, tb)
 
@@ -315,26 +326,27 @@ class Actor:
     """
 
     # --- construction ---
-    def __init__(self, cls: type, *args, buffer_bytes: int = int(10e6), start_method: str = "spawn", **kwargs) -> None:
+    def __init__(self, cls: type, *args, buffer_bytes: int = int(10e6), start_method: str = "spawn", workers=1, **kwargs) -> None:
         base = f"act-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         self._rep = PicklableDejaQueue(buffer_bytes=buffer_bytes, name=base + "_mb", create=True)  # mailbox
         self._mbox = _Mailbox(self._rep)
         self._req = PicklableDejaQueue(buffer_bytes=buffer_bytes, name=base + "_req", create=True)  # requests
         ctx = mp.get_context(start_method)
-        self._args = args
-        self._kwargs = kwargs
-        self._cls_pkl = cloudpickle.dumps(cls)
-        p = ctx.Process(target=_actor_server, args=(self._cls_pkl, self._args, self._kwargs, self._req.base))
-        p.start()
-        self._proc_meta = {"pid": p.pid, "create_time": psutil.Process(p.pid).create_time()}
+        # check if any args or kwargs are need pickling with dill:
+        pkl = cloudpickle.dumps((cls, args, kwargs, self._req.base))
+        logging.info(f"args: {args}, kwargs: {kwargs}, base: {base}")
+        ps = [ctx.Process(target=_actor_server, args=(pkl,)) for _ in range(workers)]
+        [p.start() for p in ps]
+        logging.info(f"Actor: started process with PID {[p.pid for p in ps]}")
+        self._proc_meta = [{"pid": p.pid, "create_time": psutil.Process(p.pid).create_time()} for p in ps]
         self._cache = {}  # Cache for resolved remote methods/attributes
 
     # --- internals ---
-    def is_proc_alive(self) -> bool:
+    def is_proc_alive(self, _proc_meta) -> bool:
         try:
-            pr = psutil.Process(self._proc_meta["pid"])
+            pr = psutil.Process(_proc_meta["pid"])
             return (
-                pr.create_time() == self._proc_meta["create_time"]
+                pr.create_time() == _proc_meta["create_time"]
                 and pr.is_running()
                 and pr.status() != psutil.STATUS_ZOMBIE
             )
@@ -343,14 +355,16 @@ class Actor:
 
     def _ensure_open(self) -> None:
         """Raise RuntimeError if the actor is closed or its process is dead."""
-        if not self.is_proc_alive():
+        if not any([self.is_proc_alive(_proc_meta) for _proc_meta in self._proc_meta]):
             raise RuntimeError("Actor process has exited")
 
-    def _send(self, kind: str, name: str, args: tuple, kwargs: dict, *, expect_reply: bool = True) -> str:
+    def _send(
+        self, kind: str, name: str, args: tuple, kwargs: dict, *, expect_reply: bool = True, _use_cloudpickle: bool = False
+    ) -> str:
         self._ensure_open()
         cid = uuid.uuid4().hex
         reply = self._rep.base if expect_reply else None
-        self._req.put(_Req(cid, reply, kind, name, args, kwargs))
+        self._req.put(_Req(cid, reply, kind, name, args, kwargs, cloudpickle_result=_use_cloudpickle))
         return cid
 
     # --- dynamic attribute/method resolution ---
@@ -572,22 +586,19 @@ class RemoteFunc:
             pass
 
 
-class ActorDecorator:
-    """Decorator to create an Actor from a class definition."""
+def ActorDecorator(cls, **decorator_kwargs) -> Actor:
+    """Convenience factory for Actor."""
+    def WrappedActor(*args, **kwargs):
+        kwargs = {**kwargs, **decorator_kwargs}
+        return Actor(cls, *args, **kwargs)
+    return WrappedActor
 
-    def __init__(self, cls: type, buffer_bytes: int = int(10e6)):
+class PickledObject:
+    """Decorator to create a pickled object from a class definition."""
+
+    def __init__(self, cls: type):
         self._cls = cls
-        self._buffer_bytes = buffer_bytes
+        self._pkl = dill.dumps(cls)
 
-    def __call__(self, *args, **kwargs) -> Actor:
-        return Actor(self._cls, *args, **kwargs)
-
-
-# # ---------- convenience ----------
-# def spawn_actor(cls: type, *args, **kwargs) -> Actor:
-#     """Convenience factory for Actor."""
-#     return Actor(cls, *args, **kwargs)
-
-# def spawn_function(fn: Callable, workers: int = 1, **kwargs) -> RemoteFunc:
-#     """Convenience factory for RemoteFunc."""
-#     return RemoteFunc(fn, workers=workers, **kwargs)
+    def load(self):
+        return dill.loads(self._pkl)
