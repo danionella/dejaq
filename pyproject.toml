@@ -15,6 +15,7 @@ requires-python = ">=3.8"
 dependencies = ["numpy", 
                 "tqdm", 
                 'psutil',
+                'cloudpickle',
                 'posix_ipc ; platform_system != "Windows"',
                 'pywin32 ; platform_system == "Windows"',
                 ]
