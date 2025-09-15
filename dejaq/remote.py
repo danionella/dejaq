@@ -320,7 +320,7 @@ class Actor:
     Args:
       cls: Class to run in the actor process (nested/local supported via cloudpickle).
       *args: Positional args for the class constructor.
-      buffer_bytes: Size of each queue (request/mailbox) in bytes.
+      buffer_bytes: Size of each queue (request/mailbox) in bytes. Default 10e6 (10 MiB).
       start_method: Multiprocessing start method (default 'spawn' for portability).
       **kwargs: Keyword args for the class constructor.
     """
@@ -586,7 +586,28 @@ class RemoteFunc:
 
 
 def ActorDecorator(cls, **decorator_kwargs) -> Actor:
-    """Convenience factory for Actor."""
+    """Decorator to create an Actor from a class definition.
+
+    Args:
+      cls: Class to run in the actor process (nested/local supported via cloudpickle).
+      buffer_bytes: Size of each queue (request/mailbox) in bytes. Defaults to 10e6.
+      **decorator_kwargs: Keyword args for the class constructor.
+
+    Returns:
+        A factory function that creates an Actor instance when called with positional
+        and keyword arguments for the class constructor
+
+    Example:
+        @ActorDecorator(buffer_bytes=1e6)
+        class Counter:
+            def __init__(self, start=0):
+                self.value = start
+            def inc(self, n=1):
+                self.value += n
+                return self.value
+            def get(self):
+                return self.value
+    """
     def WrappedActor(*args, **kwargs):
         kwargs = {**kwargs, **decorator_kwargs}
         return Actor(cls, *args, **kwargs)

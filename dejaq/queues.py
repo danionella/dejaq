@@ -181,7 +181,7 @@ class ByteFIFO:
     
     def __setstate__(self, state):
         self.__dict__ = state
-        
+
 
 class ArrayFIFO(ByteFIFO):
     """ A fast queue for numpy arrays. 
@@ -287,8 +287,8 @@ class DejaQueue(ByteFIFO):
 
         obj = super().get(copy=False, callback=callback, **kwargs)
         return obj
-    
-    
+
+
 @dataclasses.dataclass
 class FrameInfo:
     ''' A class to store metadata about a data frame in a ring buffer.'''
@@ -296,8 +296,6 @@ class FrameInfo:
     head: int
     tail: int
     meta: Any  # any picklable object
-
-
 
 
 def _safe_base(prefix: str = "ns") -> str:
@@ -615,7 +613,23 @@ class NamedByteRing:
         except Exception: pass
 
 class PicklableDejaQueue(NamedByteRing):
-    """Pickleable queue for arbitrary Python objects"""
+    """Pickleable queue for arbitrary Python objects. Uses a ring buffer of shared memory and named semaphores.
+
+    Args:
+        buffer_bytes (int): Size of the ring buffer in bytes. Default 10 MiB.
+        name (str | None): Base name for shared memory and semaphores. If None (default), a random name is generated.
+        create (bool): If True (default), attempt to create new shared memory and semaphores; if they already exist, open them. If False, only open existing resources.
+        auto_unlink (bool): If True, automatically unlink shared memory and semaphores when the last reference is gone. Default True.
+
+    Example:
+        >>> import pickle
+        >>> q = PicklableDejaQueue(buffer_bytes=1e7)
+        >>> pkl = pickle.dumps(q)
+        >>> q2 = pickle.loads(pkl)
+        >>> q.put({"a": 1, "b": [1,2,3]})
+        >>> q2.get()
+        {'a': 1, 'b': [1, 2, 3]}
+    """
 
     def put(self, obj, timeout: float | None = None) -> bool:
         bufs = []
@@ -682,7 +696,7 @@ class PicklableDejaQueue(NamedByteRing):
 
         self.space_gate.release(1)
         return obj
-    
+
     def __iter__(self):
         while True:
             x = self.get()
@@ -690,11 +704,8 @@ class PicklableDejaQueue(NamedByteRing):
                 self.put(Ellipsis)
                 return
             yield x
-    
+
     def _signal_stop(self, n=1):
         ''' Puts n stop signals into the queue. '''
         for _ in range(n):
             self.put(Ellipsis)
-
-
-
