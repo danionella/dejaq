@@ -626,6 +626,9 @@ class PicklableDejaQueue(NamedByteRing):
         hdr = struct.pack("<I", K) + struct.pack("<" + "I"*K, *lens)
         need = len(hdr) + sum(lens)
 
+        if need >= self.cap:
+            raise ValueError(f"Payload ({need} bytes) exceeds queue capacity ({self.cap} bytes). Increase buffer_bytes.")
+
         deadline = None if timeout is None else (time.time() + float(timeout))
         while True:
             with self.put_lock:
