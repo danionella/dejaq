@@ -67,7 +67,6 @@ class ByteFIFO:
         old_tail = old_tail or self.tail.value
         nbytes = len(array_bytes)
         if old_tail + nbytes <= self.buffer_bytes:
-            #print(type(array_bytes), array_bytes.nbytes, array_bytes.shape)
             self.view[old_tail : old_tail + nbytes] = array_bytes
             new_tail = (old_tail + nbytes) % self.buffer_bytes
         else:
@@ -503,8 +502,8 @@ class NamedByteRing:
             new_tail = end % cap
         else:
             first = cap - tail
-            self.buf.buf[tail:] = data[:first]
-            self.buf.buf[:n-first] = data[first:]
+            self.buf.buf[tail:cap] = data[0:first]
+            self.buf.buf[0:n-first] = data[first:n]
             new_tail = n - first
         self.state[1] = int(new_tail)
         return int(new_tail)
@@ -519,7 +518,7 @@ class NamedByteRing:
             new_head = end % cap
         else:
             first = cap - head
-            out = bytes(self.buf.buf[head:]) + bytes(self.buf.buf[:n-first])
+            out = bytes(self.buf.buf[head:cap]) + bytes(self.buf.buf[0:n-first])
             new_head = n - first
         self.state[0] = int(new_head)
         return out
@@ -627,6 +626,9 @@ class PicklableDejaQueue(NamedByteRing):
         hdr = struct.pack("<I", K) + struct.pack("<" + "I"*K, *lens)
         need = len(hdr) + sum(lens)
 
+        if need >= self.cap:
+            raise ValueError(f"Payload ({need} bytes) exceeds queue capacity ({self.cap} bytes). Increase buffer_bytes.")
+
         deadline = None if timeout is None else (time.time() + float(timeout))
         while True:
             with self.put_lock:
@@ -642,10 +644,12 @@ class PicklableDejaQueue(NamedByteRing):
                 self.space_gate.acquire()
             else:
                 rem = deadline - time.time()
-                if rem <= 0 or not self.space_gate.acquire(timeout=rem): return False
+                if rem <= 0 or not self.space_gate.acquire(timeout=rem): 
+                    raise TimeoutError("Timeout waiting for space in queue.")
 
     def get(self, timeout: float | None = None):
-        if not self.items.acquire(timeout=timeout): return None
+        if not self.items.acquire(timeout=timeout): 
+            raise TimeoutError("Timeout waiting for item.")
 
         with self.get_lock:
             cap = self.cap
@@ -656,7 +660,7 @@ class PicklableDejaQueue(NamedByteRing):
                 start %= cap; end = start + n
                 if end <= cap: return bytes(buf[start:end])
                 first = cap - start
-                return bytes(buf[start:]) + bytes(buf[:n-first])
+                return bytes(buf[start:cap]) + bytes(buf[0:n-first])
 
             # header (copy — small)
             K = struct.unpack("<I", _copy_span(head0, 4))[0]

@@ -5,7 +5,33 @@ import random
 import multiprocessing as mp
 import time
 
-from dejaq.queues import DejaQueue, PicklableDejaQueue
+from dejaq.queues import DejaQueue, PicklableDejaQueue, NamedSemaphore
+
+def sema_acquire(name, result_list):
+    sem = NamedSemaphore(name=name, create=False)
+    acquired = sem.acquire(timeout=2)
+    result_list.append(acquired)
+    if acquired:
+        sem.release()
+
+def test_namedsemaphore_across_processes():
+    name = "test_sema_" + str(time.time())
+    sem = NamedSemaphore(name=name, create=True, initial=0)
+    manager = mp.Manager()
+    results = manager.list()
+
+    # Start a process that will try to acquire the semaphore (should block until released)
+    p = mp.Process(target=sema_acquire, args=(name, results))
+    p.start()
+    time.sleep(1)  # Ensure the process is waiting on acquire
+
+    # Now release the semaphore from the main process
+    sem.release()
+    p.join(timeout=5)
+
+    assert list(results) == [True], f"Semaphore was not acquired in child process: {results}"
+
+
 
 def producer(q, items, delay=0, stop=True):
     for item in items:
