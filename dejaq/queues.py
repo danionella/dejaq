@@ -518,7 +518,7 @@ class NamedByteRing:
             new_head = end % cap
         else:
             first = cap - head
-            out = bytes(self.buf.buf[head:0]) + bytes(self.buf.buf[0:n-first])
+            out = bytes(self.buf.buf[head:cap]) + bytes(self.buf.buf[0:n-first])
             new_head = n - first
         self.state[0] = int(new_head)
         return out
