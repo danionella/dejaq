@@ -326,7 +326,7 @@ class Actor:
     """
 
     # --- construction ---
-    def __init__(self, cls: type, *args, buffer_bytes: int = int(10e6), start_method: str = "spawn", workers=1, **kwargs) -> None:
+    def __init__(self, cls: type, *args, buffer_bytes: int = int(10e6), start_method: str = "spawn", **kwargs) -> None:
         base = f"act-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         self._rep = PicklableDejaQueue(buffer_bytes=buffer_bytes, name=base + "_mb", create=True)  # mailbox
         self._mbox = _Mailbox(self._rep)
@@ -335,7 +335,7 @@ class Actor:
         # check if any args or kwargs are need pickling with dill:
         pkl = cloudpickle.dumps((cls, args, kwargs, self._req.base))
         logging.info(f"args: {args}, kwargs: {kwargs}, base: {base}")
-        ps = [ctx.Process(target=_actor_server, args=(pkl,)) for _ in range(workers)]
+        ps = [ctx.Process(target=_actor_server, args=(pkl,)) for _ in range(1)]
         [p.start() for p in ps]
         logging.info(f"Actor: started process with PID {[p.pid for p in ps]}")
         self._proc_meta = [{"pid": p.pid, "create_time": psutil.Process(p.pid).create_time()} for p in ps]
