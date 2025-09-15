@@ -471,11 +471,11 @@ class Actor:
             cid = self._send("shutdown", "", (), {}, expect_reply=True)
             _ = self._mbox.wait(cid, timeout)
         except Exception:
-            logging.warning("Actor.close: graceful shutdown failed, terminating")
-        self._p.join(timeout)
-        if self._p.is_alive():
-            self._p.terminate()
-            self._p.join()
+            logging.warning("Actor.close: graceful shutdown failed!")
+        # self._p.join(timeout)
+        # if self._p.is_alive():
+        #     self._p.terminate()
+        #     self._p.join()
 
     def __enter__(self):
         return self
