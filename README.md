@@ -129,6 +129,65 @@ result = stage3.compute()
 result = Consumer(1000)(Processor(10.0)(Producer(0.5)(input_iterable))).compute()
 ```
 
+
+## `dejaq.Actor` and `ActorDecorator`
+
+`dejaq.Actor` allows you to run a class instance in a separate process and call its methods or access its attributes remotely, as if it were local. This is useful for isolating heavy computations, stateful services, or legacy code in a separate process, while keeping a simple Pythonic interface.
+
+
+### Example: Using `Actor` directly
+
+```python
+from dejaq import Actor
+
+class Counter:
+    def __init__(self, start=0):
+        self.value = start
+    def increment(self, n=1):
+        self.value += n
+        return self.value
+    def get(self):
+        return self.value
+
+# Start the actor in a separate process
+counter = Actor(Counter, start=10)
+
+print(counter.get())         # 10
+print(counter.increment())   # 11
+print(counter.increment(5))  # 16
+print(counter.get())         # 16
+
+counter.close()  # Clean up the process
+```
+
+### Example: Using `ActorDecorator`
+
+```python
+from dejaq import ActorDecorator
+
+@ActorDecorator
+class Greeter:
+    def __init__(self, name):
+        self.name = name
+    def greet(self):
+        return f"Hello, {self.name}!"
+
+greeter = Greeter("Alice")
+print(greeter.greet())  # "Hello, Alice!"
+greeter.close()
+```
+
+### Features
+
+- **Remote method calls:** Call methods as if the object were local.
+- **Remote attribute access:** Get/set attributes transparently.
+- **Async support:** Call `method_async()` to get a `Future` for non-blocking calls.
+- **Tab completion:** Works in Jupyter and most IDEs.
+- **Graceful shutdown:** Use `.close()` or a context manager.
+
+
+
+
 # See also
 - [ArrayQueues](https://github.com/portugueslab/arrayqueues) 
 - [joblib.Parallel](https://joblib.readthedocs.io/en/latest/generated/joblib.Parallel.html)
