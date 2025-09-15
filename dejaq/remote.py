@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, Dict, Tuple, List
 from types import ModuleType
 
-import cloudpickle, dill
+import cloudpickle
 
 from dejaq.queues import PicklableDejaQueue
 
@@ -332,7 +332,6 @@ class Actor:
         self._mbox = _Mailbox(self._rep)
         self._req = PicklableDejaQueue(buffer_bytes=buffer_bytes, name=base + "_req", create=True)  # requests
         ctx = mp.get_context(start_method)
-        # check if any args or kwargs are need pickling with dill:
         pkl = cloudpickle.dumps((cls, args, kwargs, self._req.base))
         logging.info(f"args: {args}, kwargs: {kwargs}, base: {base}")
         ps = [ctx.Process(target=_actor_server, args=(pkl,)) for _ in range(1)]
@@ -598,7 +597,7 @@ class PickledObject:
 
     def __init__(self, cls: type):
         self._cls = cls
-        self._pkl = dill.dumps(cls)
+        self._pkl = cloudpickle.dumps(cls)
 
     def load(self):
-        return dill.loads(self._pkl)
+        return cloudpickle.loads(self._pkl)
