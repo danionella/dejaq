@@ -60,7 +60,7 @@ def test_named_semaphore_roundtrip_spawn():
 def test_namedbytering_put_get_bytes():
     ctx = mp.get_context("spawn")
     q = NamedByteRing(buffer_bytes=1_000_000, create=True)
-    base = q.base
+    base = q._base
     p = ctx.Process(target=_child_nbr_get_bytes, args=(base,))
     p.start()
     q.put_bytes(b"hello")
@@ -71,7 +71,7 @@ def test_picklable_dejaqueue_prefill_then_get():
     """Reproduces the 'prefill then bench' flow."""
     ctx = mp.get_context("spawn")
     q = PicklableDejaQueue(buffer_bytes=2_000_000, create=True)
-    base = q.base
+    base = q._base
     # prefill with a small object
     q.put(1)
     # spawn consumer that drains prefill and then expects the big item
