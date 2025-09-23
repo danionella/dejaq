@@ -681,10 +681,11 @@ class PicklableDejaQueue(NamedByteRing):
             timeout (float | None): Maximum time to wait for an item. Default None (wait indefinitely).
             peek_only (bool): If True, read the item without removing it from the queue. Default False.
         """
-        if not self._items.acquire(timeout=timeout): 
-            raise TimeoutError("Timeout waiting for item.")
 
         with self._get_lock:
+            if not self._items.acquire(timeout=timeout): 
+                raise TimeoutError("Timeout waiting for item.")
+
             cap = self.cap
             head0 = int(self._state[0])
             buf = self.buf.buf
