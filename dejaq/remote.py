@@ -149,7 +149,11 @@ def _actor_server(pkl: bytes) -> None:
                 if isinstance(v, (staticmethod, classmethod)):
                     v = v.__func__
                 is_prop = isinstance(v, property)
-                out = {"exists": True, "callable": (callable(v) and not is_prop)}
+                out = {
+                    "exists": True,
+                    "callable": (callable(v) and not is_prop),
+                    "signature": inspect.signature(v) if callable(v) else None,
+                }
                 _maybe_reply(msg, _Rep(msg.call_id, True, out))
             elif msg.kind == "dir":
                 out = _dir_payload()
@@ -270,11 +274,20 @@ class Future:
 class _RemoteMethod:
     """Lightweight callable proxy for a remote method."""
 
-    def __init__(self, actor_ref: "Actor", name: str):
+    def __init__(self, actor_ref: "Actor", name: str, signature: Optional[inspect.Signature] = None) -> None:
         self._actor = weakref.proxy(actor_ref)
         self._name = name
+        self._signature = signature
 
-    def __call__(self, *args, timeout: Optional[float] = None, noreply: bool = False, _use_cloudpickle=False, **kwargs):
+    def __call__(
+        self,
+        *args,
+        timeout: Optional[float] = None,
+        noreply: bool = False,
+        _use_cloudpickle=False,
+        _ensure_open=True,
+        **kwargs,
+    ):
         """Invoke the remote method.
 
         Args:
@@ -290,7 +303,13 @@ class _RemoteMethod:
           • Use this for high-throughput paths where acknowledgement is unnecessary.
         """
         cid = self._actor._send(
-            "call", self._name, args, kwargs, expect_reply=not noreply, _use_cloudpickle=_use_cloudpickle
+            "call",
+            self._name,
+            args,
+            kwargs,
+            expect_reply=not noreply,
+            _use_cloudpickle=_use_cloudpickle,
+            _ensure_open=_ensure_open,
         )
         if noreply:
             return None
@@ -354,13 +373,23 @@ class Actor:
 
     def _ensure_open(self) -> None:
         """Raise RuntimeError if the actor is closed or its process is dead."""
+        # TODO: decide whether to keep abillity to have multiple PIDs, or simplify
         if not any([self.is_proc_alive(_proc_meta) for _proc_meta in self._proc_meta]):
             raise RuntimeError("Actor process has exited")
 
     def _send(
-        self, kind: str, name: str, args: tuple, kwargs: dict, *, expect_reply: bool = True, _use_cloudpickle: bool = False
+        self,
+        kind: str,
+        name: str,
+        args: tuple,
+        kwargs: dict,
+        *,
+        expect_reply: bool = True,
+        _use_cloudpickle: bool = False,
+        _ensure_open=True,
     ) -> str:
-        self._ensure_open()
+        if _ensure_open:
+            self._ensure_open()
         cid = uuid.uuid4().hex
         reply = self._rep.base if expect_reply else None
         self._req.put(_Req(cid, reply, kind, name, args, kwargs, cloudpickle_result=_use_cloudpickle))
@@ -406,8 +435,8 @@ class Actor:
         meta = rep.payload  # {"exists": bool, "callable": bool}
         if not meta.get("exists", False):
             raise AttributeError(name)
-        if meta.get("callable", False):
-            method = _RemoteMethod(self, name)
+        if meta.get("callable", False):  # if True
+            method = _RemoteMethod(self, name, signature=meta.get("signature", None))
             self._cache[name] = method
             return method
 
@@ -608,10 +637,13 @@ def ActorDecorator(cls, **decorator_kwargs) -> Actor:
             def get(self):
                 return self.value
     """
+
     def WrappedActor(*args, **kwargs):
         kwargs = {**kwargs, **decorator_kwargs}
         return Actor(cls, *args, **kwargs)
+
     return WrappedActor
+
 
 class PickledObject:
     """Decorator to create a pickled object from a class definition."""
