@@ -437,7 +437,7 @@ class NamedByteRing:
     """
     def __init__(self, buffer_bytes: int = 10_000_000, name: str | None = None, create: bool = True, *, auto_unlink: bool = True) -> None:
         base = name or _safe_base("nq")
-        self.base = base
+        self._base = base
         self._auto_unlink = bool(auto_unlink)
 
         # Shared state: head, tail, capacity, closed (0/1)
@@ -445,18 +445,18 @@ class NamedByteRing:
         self._owns_state = False
         if create:
             try:
-                self.state = shared_memory.ShareableList([0, 0, int(buffer_bytes), 0], name=st_name)
+                self._state = shared_memory.ShareableList([0, 0, int(buffer_bytes), 0], name=st_name)
                 self._owns_state = True
             except FileExistsError:
-                self.state = shared_memory.ShareableList(name=st_name)
+                self._state = shared_memory.ShareableList(name=st_name)
         else:
-            self.state = shared_memory.ShareableList(name=st_name)
+            self._state = shared_memory.ShareableList(name=st_name)
         self._state_name = st_name
 
         # Data buffer
         buf_name = ("NB_"+base) if IS_WIN else base+"_B"
         total = int(buffer_bytes)
-        self.cap = int(self.state[2])
+        self.cap = int(self._state[2])
         self._owns_buf = False
         if create:
             try:
@@ -472,20 +472,33 @@ class NamedByteRing:
         self._buf_name = buf_name
 
         # Sync: serialize producers/consumers + count items + wake producers
-        self.put_lock   = NamedLock(("NLp_"+base) if IS_WIN else base+"_Lp", create=create, auto_unlink=auto_unlink)
-        self.get_lock   = NamedLock(("NLg_"+base) if IS_WIN else base+"_Lg", create=create, auto_unlink=auto_unlink)
-        self.items      = NamedSemaphore(("NI_"+base)  if IS_WIN else base+"_I", create=create, initial=0, auto_unlink=auto_unlink)
-        self.space_gate = NamedSemaphore(("NG_"+base)  if IS_WIN else base+"_G", create=create, initial=0, auto_unlink=auto_unlink)
+        self._put_lock   = NamedLock(("NLp_"+base) if IS_WIN else base+"_Lp", create=create, auto_unlink=auto_unlink)
+        self._get_lock   = NamedLock(("NLg_"+base) if IS_WIN else base+"_Lg", create=create, auto_unlink=auto_unlink)
+        self._items      = NamedSemaphore(("NI_"+base)  if IS_WIN else base+"_I", create=create, initial=0, auto_unlink=auto_unlink)
+        self._space_gate = NamedSemaphore(("NG_"+base)  if IS_WIN else base+"_G", create=create, initial=0, auto_unlink=auto_unlink)
 
         weakref.finalize(self, NamedByteRing._finalize, self._state_name, self._buf_name,
                          self._owns_state, self._owns_buf, self._auto_unlink)
 
     @property
-    def closed(self) -> bool: return bool(int(self.state[3]))
+    def closed(self) -> bool: 
+        return bool(int(self._state[3]))
 
+    @property
+    def is_empty(self) -> bool:
+        return self._avail_space() == self.cap - 1
+    
+    def purge(self) -> None:
+        """ Clear all items from the queue. """
+        with self._put_lock:
+            tail = self._state[1]
+            with self._get_lock:
+                self._state[0] = tail  # head = tail
+        self._space_gate.release(self.cap)
+    
     def _avail_space(self, head: int | None = None, tail: int | None = None) -> int:
-        if head is None: head = int(self.state[0])
-        if tail is None: tail = int(self.state[1])
+        if head is None: head = int(self._state[0])
+        if tail is None: tail = int(self._state[1])
         return (head - tail - 1) % self.cap
 
     def _write_bytes(self, data: memoryview | bytes, tail: int | None = None) -> int:
@@ -493,7 +506,7 @@ class NamedByteRing:
         if not isinstance(data, memoryview):
             data = memoryview(data)
         n = len(data); cap = self.cap
-        tail = int(self.state[1]) if tail is None else tail
+        tail = int(self._state[1]) if tail is None else tail
         end = tail + n
         if end <= cap:
             self.buf.buf[tail:end] = data
@@ -503,13 +516,13 @@ class NamedByteRing:
             self.buf.buf[tail:cap] = data[0:first]
             self.buf.buf[0:n-first] = data[first:n]
             new_tail = n - first
-        self.state[1] = int(new_tail)
+        self._state[1] = int(new_tail)
         return int(new_tail)
 
     def _read_bytes(self, n: int, head: int | None = None) -> bytes:
         """Read n bytes from current head; advance head. Caller holds get_lock."""
         cap = self.cap
-        head = int(self.state[0]) if head is None else head
+        head = int(self._state[0]) if head is None else head
         end = head + n
         if end <= cap:
             out = bytes(self.buf.buf[head:end])
@@ -518,7 +531,7 @@ class NamedByteRing:
             first = cap - head
             out = bytes(self.buf.buf[head:cap]) + bytes(self.buf.buf[0:n-first])
             new_head = n - first
-        self.state[0] = int(new_head)
+        self._state[0] = int(new_head)
         return out
 
     def put_bytes(self, payload: bytes, timeout: float | None = None) -> bool:
@@ -526,7 +539,7 @@ class NamedByteRing:
         total = 4 + len(payload)  # 4-byte length prefix
         deadline = None if timeout is None else (time.time() + float(timeout))
         while True:
-            with self.put_lock:
+            with self._put_lock:
                 if self._avail_space() >= total:
                     # write len prefix then payload, then publish an item
                     self._write_bytes(struct.pack("<I", len(payload)))
@@ -535,64 +548,64 @@ class NamedByteRing:
                 else:
                     ok = False
             if ok:
-                self.items.release(1)
+                self._items.release(1)
                 return True
             # wait for space
             if deadline is None:
-                self.space_gate.acquire()  # wake when any consumer ran
+                self._space_gate.acquire()  # wake when any consumer ran
             else:
                 rem = deadline - time.time()
                 if rem <= 0: return False
-                if not self.space_gate.acquire(timeout=rem): return False
+                if not self._space_gate.acquire(timeout=rem): return False
 
     def get_bytes(self, timeout: float | None = None) -> tuple[bool, bytes | None]:
         """Dequeue one message (bytes)."""
-        if not self.items.acquire(timeout=timeout):
+        if not self._items.acquire(timeout=timeout):
             return False, None
-        with self.get_lock:
+        with self._get_lock:
             (n,) = struct.unpack("<I", self._read_bytes(4))
             data = self._read_bytes(n)
         # signal one producer that space changed
-        self.space_gate.release(1)
+        self._space_gate.release(1)
         return True, data
 
     def close(self) -> None:
-        try: self.state.shm.close()
+        try: self._state.shm.close()
         except Exception: pass
         try: self.buf.close()
         except Exception: pass
-        self.put_lock.close(); self.get_lock.close()
-        self.items.close(); self.space_gate.close()
+        self._put_lock.close(); self._get_lock.close()
+        self._items.close(); self._space_gate.close()
 
     def unlink(self) -> None:
-        try: self.state.shm.unlink()
+        try: self._state.shm.unlink()
         except Exception: pass
         try: self.buf.unlink()
         except Exception: pass
-        self.put_lock.unlink(); self.get_lock.unlink()
-        self.items.unlink(); self.space_gate.unlink()
+        self._put_lock.unlink(); self._get_lock.unlink()
+        self._items.unlink(); self._space_gate.unlink()
 
     def __getstate__(self) -> dict:
         return {
-            "base": self.base,
+            "base": self._base,
             "state_name": self._state_name,
             "buf_name": self._buf_name,
-            "locks": (self.put_lock.__getstate__(), self.get_lock.__getstate__()),
-            "items": self.items.__getstate__(),
-            "space_gate": self.space_gate.__getstate__(),
+            "locks": (self._put_lock.__getstate__(), self._get_lock.__getstate__()),
+            "items": self._items.__getstate__(),
+            "space_gate": self._space_gate.__getstate__(),
             "auto_unlink": self._auto_unlink,
             "cap": self.cap,
         }
 
     def __setstate__(self, s: dict) -> None:
         self.__dict__.clear()
-        self.base = s["base"]; self._state_name = s["state_name"]; self._buf_name = s["buf_name"]; self.cap = s["cap"]
-        self.state = shared_memory.ShareableList(name=self._state_name)
+        self._base = s["base"]; self._state_name = s["state_name"]; self._buf_name = s["buf_name"]; self.cap = s["cap"]
+        self._state = shared_memory.ShareableList(name=self._state_name)
         self.buf = shared_memory.SharedMemory(name=self._buf_name)
-        self.put_lock = NamedLock(s["locks"][0]["name"], create=False)
-        self.get_lock = NamedLock(s["locks"][1]["name"], create=False)
-        self.items = NamedSemaphore(s["items"]["name"], create=False)
-        self.space_gate = NamedSemaphore(s["space_gate"]["name"], create=False)
+        self._put_lock = NamedLock(s["locks"][0]["name"], create=False)
+        self._get_lock = NamedLock(s["locks"][1]["name"], create=False)
+        self._items = NamedSemaphore(s["items"]["name"], create=False)
+        self._space_gate = NamedSemaphore(s["space_gate"]["name"], create=False)
         self._owns_state = False; self._owns_buf = False
         self._auto_unlink = bool(s.get("auto_unlink", False))
         weakref.finalize(self, NamedByteRing._finalize, self._state_name, self._buf_name,
@@ -645,7 +658,7 @@ class PicklableDejaQueue(NamedByteRing):
 
         deadline = None if timeout is None else (time.time() + float(timeout))
         while True:
-            with self.put_lock:
+            with self._put_lock:
                 if self._avail_space() >= need:
                     self._write_bytes(hdr)
                     for s in segs: self._write_bytes(s)
@@ -653,21 +666,27 @@ class PicklableDejaQueue(NamedByteRing):
                 else:
                     ok = False
             if ok:
-                self.items.release(1); return True
+                self._items.release(1); return True
             if deadline is None:
-                self.space_gate.acquire()
+                self._space_gate.acquire()
             else:
                 rem = deadline - time.time()
-                if rem <= 0 or not self.space_gate.acquire(timeout=rem): 
+                if rem <= 0 or not self._space_gate.acquire(timeout=rem): 
                     raise TimeoutError("Timeout waiting for space in queue.")
 
-    def get(self, timeout: float | None = None):
-        if not self.items.acquire(timeout=timeout): 
+    def get(self, timeout=None, peek_only=False):
+        """ Gets an item from the queue.
+
+        Args:
+            timeout (float | None): Maximum time to wait for an item. Default None (wait indefinitely).
+            peek_only (bool): If True, read the item without removing it from the queue. Default False.
+        """
+        if not self._items.acquire(timeout=timeout): 
             raise TimeoutError("Timeout waiting for item.")
 
-        with self.get_lock:
+        with self._get_lock:
             cap = self.cap
-            head0 = int(self.state[0])
+            head0 = int(self._state[0])
             buf = self.buf.buf
 
             def _copy_span(start, n):
@@ -692,9 +711,10 @@ class PicklableDejaQueue(NamedByteRing):
                 cursor += n
 
             obj = pickle.loads(segs[0], buffers=[m for m in segs[1:]])
-            self.state[0] = (head0 + total) % cap  # advance after loads()
+            if not peek_only:
+                self._state[0] = (head0 + total) % cap  # advance after loads()
 
-        self.space_gate.release(1)
+        self._space_gate.release(1)
         return obj
 
     def __iter__(self):
