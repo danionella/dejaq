@@ -494,7 +494,7 @@ class NamedByteRing:
             tail = self._state[1]
             with self._get_lock:
                 self._state[0] = tail  # head = tail
-        self._space_gate.release(self.cap)
+        self._space_gate.release(1)
     
     def _avail_space(self, head: int | None = None, tail: int | None = None) -> int:
         if head is None: head = int(self._state[0])
@@ -713,8 +713,10 @@ class PicklableDejaQueue(NamedByteRing):
             obj = pickle.loads(segs[0], buffers=[m for m in segs[1:]])
             if not peek_only:
                 self._state[0] = (head0 + total) % cap  # advance after loads()
+                self._space_gate.release(1)
+            else:
+                self._items.release(1)
 
-        self._space_gate.release(1)
         return obj
 
     def __iter__(self):
