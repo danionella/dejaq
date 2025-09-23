@@ -285,7 +285,7 @@ class _RemoteMethod:
         timeout: Optional[float] = None,
         noreply: bool = False,
         _use_cloudpickle=False,
-        _ensure_open=True,
+        _ensure_open=False,
         **kwargs,
     ):
         """Invoke the remote method.
@@ -302,6 +302,8 @@ class _RemoteMethod:
           • When `noreply=True`, remote exceptions are not propagated.
           • Use this for high-throughput paths where acknowledgement is unnecessary.
         """
+        if _ensure_open:
+            self._actor._ensure_open()
         cid = self._actor._send(
             "call",
             self._name,
@@ -309,7 +311,6 @@ class _RemoteMethod:
             kwargs,
             expect_reply=not noreply,
             _use_cloudpickle=_use_cloudpickle,
-            _ensure_open=_ensure_open,
         )
         if noreply:
             return None
@@ -351,7 +352,7 @@ class Actor:
         self._mbox = _Mailbox(self._rep)
         self._req = PicklableDejaQueue(buffer_bytes=buffer_bytes, name=base + "_req", create=True)  # requests
         ctx = mp.get_context(start_method)
-        pkl = cloudpickle.dumps((cls, args, kwargs, self._req.base))
+        pkl = cloudpickle.dumps((cls, args, kwargs, self._req._base))
         logging.info(f"args: {args}, kwargs: {kwargs}, base: {base}")
         ps = [ctx.Process(target=_actor_server, args=(pkl,)) for _ in range(1)]
         [p.start() for p in ps]
@@ -366,7 +367,6 @@ class Actor:
             return (
                 pr.create_time() == _proc_meta["create_time"]
                 and pr.is_running()
-                and pr.status() != psutil.STATUS_ZOMBIE
             )
         except psutil.NoSuchProcess:
             return False
@@ -386,12 +386,9 @@ class Actor:
         *,
         expect_reply: bool = True,
         _use_cloudpickle: bool = False,
-        _ensure_open=True,
     ) -> str:
-        if _ensure_open:
-            self._ensure_open()
         cid = uuid.uuid4().hex
-        reply = self._rep.base if expect_reply else None
+        reply = self._rep._base if expect_reply else None
         self._req.put(_Req(cid, reply, kind, name, args, kwargs, cloudpickle_result=_use_cloudpickle))
         return cid
 
@@ -486,9 +483,11 @@ class Actor:
             # Timeout/errors during completion should not explode user typing
             return sorted(local)
 
-    def ping(self) -> Dict[str, float]:
+    def ping(self, _ensure_open=False) -> Dict[str, float]:
         """Liveness/latency probe. Returns timings in seconds."""
         t0 = time.time()
+        if _ensure_open:
+            self._ensure_open()
         cid = self._send("ping", "", (), {}, expect_reply=True)
         t1 = self._mbox.wait(cid, 2.0).payload
         t2 = time.time()
@@ -551,14 +550,14 @@ class RemoteFunc:
         except Exception:
             fn_ref = fn
 
-        self._ps = [ctx.Process(target=_func_worker, args=(fn_ref, self._req.base)) for _ in range(int(workers))]
+        self._ps = [ctx.Process(target=_func_worker, args=(fn_ref, self._req._base)) for _ in range(int(workers))]
         for p in self._ps:
             p.start()
 
     def __call__(self, *args, timeout: Optional[float] = None, **kwargs):
         """Apply fn(*args, **kwargs) and block for the result."""
         cid = uuid.uuid4().hex
-        self._req.put(_Req(cid, self._rep.base, "apply", "", args, kwargs))
+        self._req.put(_Req(cid, self._rep._base, "apply", "", args, kwargs))
         rep = self._mbox.wait(cid, timeout)
         if rep.ok:
             return rep.payload
@@ -568,7 +567,7 @@ class RemoteFunc:
     def submit(self, *args, **kwargs) -> Future:
         """Submit fn(*args, **kwargs) asynchronously; returns a Future."""
         cid = uuid.uuid4().hex
-        self._req.put(_Req(cid, self._rep.base, "apply", "", args, kwargs))
+        self._req.put(_Req(cid, self._rep._base, "apply", "", args, kwargs))
         return Future(self._mbox, cid)
 
     def map(self, iterable, *, timeout: Optional[float] = None):
@@ -576,7 +575,7 @@ class RemoteFunc:
         cids: List[str] = []
         for x in iterable:
             cid = uuid.uuid4().hex
-            self._req.put(_Req(cid, self._rep.base, "apply", "", (x,), {}))
+            self._req.put(_Req(cid, self._rep._base, "apply", "", (x,), {}))
             cids.append(cid)
         out: List[Any] = []
         for cid in cids:
@@ -592,7 +591,7 @@ class RemoteFunc:
         """Gracefully stop all workers."""
         for _ in self._ps:
             cid = uuid.uuid4().hex
-            self._req.put(_Req(cid, self._rep.base, "shutdown", "", (), {}))
+            self._req.put(_Req(cid, self._rep._base, "shutdown", "", (), {}))
         deadline = time.time() + timeout
         for p in self._ps:
             rem = max(0.0, deadline - time.time())
