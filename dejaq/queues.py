@@ -715,6 +715,8 @@ class PicklableDejaQueue(NamedByteRing):
                 self._state[0] = (head0 + total) % cap  # advance after loads()
 
         self._space_gate.release(1)
+        if peek_only:
+            self._items.release(1)
         return obj
 
     def __iter__(self):
