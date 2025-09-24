@@ -502,11 +502,12 @@ class NamedByteRing:
         if tail is None: tail = int(self._state[1])
         return (head - tail - 1) % self.cap
 
-    def _write_bytes(self, data: memoryview | bytes, tail: int | None = None) -> int:
+    def _write_bytes(self, data, tail=None, write_tail=True) -> int:
         """Write data at current tail; return new tail (mod cap). Caller holds put_lock."""
         if not isinstance(data, memoryview):
             data = memoryview(data)
-        n = len(data); cap = self.cap
+        n = len(data)
+        cap = self.cap
         tail = int(self._state[1]) if tail is None else tail
         end = tail + n
         if end <= cap:
@@ -515,10 +516,11 @@ class NamedByteRing:
         else:
             first = cap - tail
             self.buf.buf[tail:cap] = data[0:first]
-            self.buf.buf[0:n-first] = data[first:n]
+            self.buf.buf[0 : n - first] = data[first:n]
             new_tail = n - first
-        self._state[1] = int(new_tail)
-        return int(new_tail)
+        if write_tail:
+            self._state[1] = new_tail
+        return new_tail
 
     def _read_bytes(self, n: int, head: int | None = None) -> bytes:
         """Read n bytes from current head; advance head. Caller holds get_lock."""
@@ -661,13 +663,13 @@ class PicklableDejaQueue(NamedByteRing):
         while True:
             with self._put_lock:
                 if self._avail_space() >= need:
-                    self._write_bytes(hdr)
-                    for s in segs: self._write_bytes(s)
-                    ok = True
-                else:
-                    ok = False
-            if ok:
-                self._items.release(1); return True
+                    new_tail = self._write_bytes(hdr, write_tail=False)
+                    for s in segs:
+                        new_tail = self._write_bytes(s, tail=new_tail, write_tail=False)
+                    self._state[1] = new_tail
+                    self._items.release(1)
+                    return True
+
             if deadline is None:
                 self._space_gate.acquire()
             else:
