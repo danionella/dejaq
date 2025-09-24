@@ -7,6 +7,7 @@ import pickle
 import dataclasses
 from typing import Any
 import numpy as np
+import array
 
 IS_WIN = sys.platform.startswith("win")
 
@@ -484,7 +485,6 @@ class NamedByteRing:
         base = name or _safe_base("nq")
         self._base = base
         self._auto_unlink = bool(auto_unlink)
-
         # Shared state: head, tail, capacity, closed (0/1)
         st_name = ("NS_" + base) if IS_WIN else base + "_S"
         self._owns_state = False
@@ -503,18 +503,16 @@ class NamedByteRing:
 
         # Data buffer
         buf_name = ("NB_" + base) if IS_WIN else base + "_B"
-        total = int(buffer_bytes)
-        self.cap = int(self._state[2])
+        self.cap = buffer_bytes
         self._owns_buf = False
         if create:
             try:
-                self.buf = shared_memory.SharedMemory(name=buf_name, create=True, size=total)
+                self.buf = shared_memory.SharedMemory(name=buf_name, create=True, size=buffer_bytes)
                 self._owns_buf = True
-                _view = np.frombuffer(self.buf.buf, dtype="B", count=total)
+                _view = np.frombuffer(self.buf.buf, dtype="B", count=buffer_bytes)
                 _view[:] = 0
             except FileExistsError:
                 self.buf = shared_memory.SharedMemory(name=buf_name, create=False)
-
         else:
             self.buf = shared_memory.SharedMemory(name=buf_name, create=False)
         self._buf_name = buf_name
@@ -637,8 +635,10 @@ class NamedByteRing:
         return True, data
 
     def close(self) -> None:
+        del self._state
+        gc.collect()
         try:
-            self._state.shm.close()
+            self._state_mem.close()
         except Exception:
             pass
         try:
@@ -651,12 +651,16 @@ class NamedByteRing:
         self._space_gate.close()
 
     def unlink(self) -> None:
+        del self._state
+        gc.collect()
         try:
-            self._state.shm.unlink()
+            if self._owns_state:
+                self._state_mem.unlink()
         except Exception:
             pass
         try:
-            self.buf.unlink()
+            if self._owns_buf:
+                self.buf.unlink()
         except Exception:
             pass
         self._put_lock.unlink()
@@ -719,6 +723,13 @@ class NamedByteRing:
                 shm = shared_memory.SharedMemory(name=buf_name)
                 shm.unlink()
                 shm.close()
+        except Exception:
+            pass
+
+    def __del__(self):
+        try:
+            self.close()
+            self.unlink()
         except Exception:
             pass
 
@@ -794,7 +805,7 @@ class PicklableDejaQueue(NamedByteRing):
                 raise TimeoutError("Timeout waiting for item.")
 
             cap = self.cap
-            head0 = int(self._state[0])
+            head0 = self._state[0]
             buf = self.buf.buf
 
             def _copy_span(start, n):
