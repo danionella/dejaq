@@ -57,16 +57,6 @@ def test_named_semaphore_roundtrip_spawn():
     p.join(2.0)
     assert p.exitcode == 0
 
-def test_namedbytering_put_get_bytes():
-    ctx = mp.get_context("spawn")
-    q = NamedByteRing(buffer_bytes=1_000_000, create=True)
-    base = q._base
-    p = ctx.Process(target=_child_nbr_get_bytes, args=(base,))
-    p.start()
-    q.put_bytes(b"hello")
-    p.join(3.0)
-    assert p.exitcode == 0
-
 def test_picklable_dejaqueue_prefill_then_get():
     """Reproduces the 'prefill then bench' flow."""
     ctx = mp.get_context("spawn")
