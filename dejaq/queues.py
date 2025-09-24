@@ -759,8 +759,11 @@ class PicklableDejaQueue(NamedByteRing):
         deadline = None if timeout is None else (time.time() + float(timeout))
         while True:
             with self._put_lock:
-                if self._avail_space() >= need:
-                    new_tail = self._write_bytes(hdr, write_tail=False)
+                head = self._state[0]
+                tail = self._state[1]
+                _avail_space = (head - tail - 1) % self.cap
+                if _avail_space >= need:
+                    new_tail = self._write_bytes(hdr, tail=tail, write_tail=False)
                     for s in segs:
                         new_tail = self._write_bytes(s, tail=new_tail, write_tail=False)
                     self._state[1] = new_tail
