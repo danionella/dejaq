@@ -13,6 +13,14 @@ A fast alternative to `multiprocessing.Queue`. Faster, because it takes advantag
 
 The speed advantege of `DejaQueue` becomes substantial for items of > 1 MB size. It enables efficient inter-job communication in big-data processing pipelines, which can be implemented in a few lines of code with [`dejaq.Parallel`](#dejaqparallel).
 
+#### Features:
+- Fast, low-latency, high-throughput inter-process communication
+- Supports any picklable Python object, including numpy arrays and nested dictionaries
+- Zero-copy data transfer with pickle protocol 5 out-of-band data
+- Picklable queue instances (can be passed to child processes)
+- Peekable (non-destructive read)
+- Actor class for remote method calls and attribute access in a separate process (see [`dejaq.Actor`](#dejaqactor-and-actordecorator))
+
 Auto-generated (minimal) API documentation: https://danionella.github.io/dejaq
 
 
