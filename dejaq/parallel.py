@@ -3,7 +3,7 @@ import multiprocessing as mp
 
 import numpy as np
 
-from . import DejaQueue
+from . import LegacyDejaQueue
         
 
 class lazymap:
@@ -22,8 +22,8 @@ class lazymap:
 
     def __init__(self, fcn, it, n_workers=1, buffer_bytes=10e6, **kwargs):
         self._it = it
-        self._in_queue = DejaQueue(buffer_bytes)
-        self._out_queue = DejaQueue(buffer_bytes)
+        self._in_queue = LegacyDejaQueue(buffer_bytes)
+        self._out_queue = LegacyDejaQueue(buffer_bytes)
         self._k = mp.Value("l", 0)
         self._k_changed = mp.Condition()
         self._n_workers = n_workers
@@ -151,8 +151,8 @@ class OrderedStage:
         **kwargs: optional, being passed to fcn
     '''
     def __init__(self, fcn, n_workers=1, buffer_bytes=10e6, in_queue = None, start=True, **kwargs):
-        self._in_queue = in_queue or DejaQueue(buffer_bytes)
-        self._out_queue = DejaQueue(buffer_bytes)
+        self._in_queue = in_queue or LegacyDejaQueue(buffer_bytes)
+        self._out_queue = LegacyDejaQueue(buffer_bytes)
         self._k = mp.Value("l", 0)
         self._k_changed = mp.Condition()
         self._n_workers = n_workers
@@ -247,8 +247,8 @@ class Actor:
             **kwargs: Keyword arguments to be passed to the constructor of the class.
         """
         self._cls = cls
-        self._in_queue = DejaQueue()
-        self._out_queue = DejaQueue()
+        self._in_queue = LegacyDejaQueue()
+        self._out_queue = LegacyDejaQueue()
         self._process = mp.Process(target=self._run, args=(cls, self._in_queue, self._out_queue, args, kwargs))
         self._process.start()
         self._result_store = {}
