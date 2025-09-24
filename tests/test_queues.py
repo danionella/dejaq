@@ -5,7 +5,7 @@ import random
 import multiprocessing as mp
 import time
 
-from dejaq.queues import DejaQueue, PicklableDejaQueue, NamedSemaphore
+from dejaq.queues import LegacyDejaQueue, DejaQueue, NamedSemaphore
 
 def sema_acquire(name, result_list):
     sem = NamedSemaphore(name=name, create=False)
@@ -30,7 +30,6 @@ def test_namedsemaphore_across_processes():
     p.join(timeout=5)
 
     assert list(results) == [True], f"Semaphore was not acquired in child process: {results}"
-
 
 
 def producer(q, items, delay=0, stop=True):
@@ -59,7 +58,7 @@ def hash_it(item):
     else:
         return hashlib.sha256(repr(item).encode()).hexdigest()
 
-@pytest.mark.parametrize("QueueCls", [DejaQueue, PicklableDejaQueue])
+@pytest.mark.parametrize("QueueCls", [LegacyDejaQueue, DejaQueue])
 def test_queue_mp_basic(QueueCls):
     q = QueueCls(1024 * 1024)
     items = [b"foo", b"bar", b"baz", b"qux"]
@@ -73,7 +72,7 @@ def test_queue_mp_basic(QueueCls):
     p2.join()
     assert list(results) == hash_it(items)
 
-@pytest.mark.parametrize("QueueCls", [DejaQueue, PicklableDejaQueue])
+@pytest.mark.parametrize("QueueCls", [LegacyDejaQueue, DejaQueue])
 def test_queue_mp_numpy_arrays(QueueCls):
     q = QueueCls(2 * 1024 * 1024)
     arrays = [np.random.randn(1000) for _ in range(5)]
@@ -89,7 +88,7 @@ def test_queue_mp_numpy_arrays(QueueCls):
     for orig, got in zip(arrays_bytes, results):
         assert hash_it(orig) == got
 
-@pytest.mark.parametrize("QueueCls", [DejaQueue, PicklableDejaQueue])
+@pytest.mark.parametrize("QueueCls", [LegacyDejaQueue, DejaQueue])
 def test_queue_mp_race_condition(QueueCls):
     q = QueueCls(4 * 1024 * 1024)
     N = 50
@@ -105,7 +104,7 @@ def test_queue_mp_race_condition(QueueCls):
     p2.join()
     assert hashes == list(results)
 
-@pytest.mark.parametrize("QueueCls", [DejaQueue, PicklableDejaQueue])
+@pytest.mark.parametrize("QueueCls", [LegacyDejaQueue, DejaQueue])
 def test_queue_mp_multiple_producers_consumers(QueueCls):
     q = QueueCls(4 * 1024 * 1024)
     N = 100
@@ -128,7 +127,7 @@ def test_queue_mp_multiple_producers_consumers(QueueCls):
     assert len(results) == len(items)
     assert sorted(list(results)) == sorted(items)
 
-@pytest.mark.parametrize("QueueCls", [DejaQueue, PicklableDejaQueue])
+@pytest.mark.parametrize("QueueCls", [LegacyDejaQueue, DejaQueue])
 def test_queue_mp_stress(QueueCls):
     q = QueueCls(8 * 1024 * 1024)
     N = 500
@@ -147,7 +146,7 @@ def test_queue_mp_stress(QueueCls):
     assert sorted(list(results)) == sorted(hash_it(items))
 
 def test_picklabledejaqueue_mp_objects():
-    q = PicklableDejaQueue(2 * 1024 * 1024)
+    q = DejaQueue(2 * 1024 * 1024)
     objs = [
         123,
         "hello",
@@ -165,3 +164,25 @@ def test_picklabledejaqueue_mp_objects():
     p2.join()
     for orig, got in zip(objs, results):
         assert hash_it(orig) == got
+
+
+def test_picklabledejaqueue_peek_only_complex():
+    q = DejaQueue(1024 * 1024)
+    items = [{"x": np.arange(10), "y": "foo"}, [1, 2, 3, {"bar": 99}], b"bytes", np.random.randn(100), "string"]
+    for item in items:
+        q.put(item)
+    # Peek at the first item multiple times
+    for _ in range(3):
+        peeked = q.get(peek_only=True)
+        assert (
+            np.all(peeked["x"] == items[0]["x"]) if isinstance(peeked, dict) and "x" in peeked else peeked == items[0]
+        )
+    # Now consume all items and check order
+    for orig in items:
+        got = q.get()
+        if isinstance(orig, np.ndarray):
+            assert np.allclose(got, orig)
+        elif isinstance(orig, dict) and "x" in orig:
+            assert np.all(got["x"] == orig["x"]) and got["y"] == orig["y"]
+        else:
+            assert got == orig

@@ -15,7 +15,7 @@ from types import ModuleType
 
 import cloudpickle
 
-from dejaq.queues import PicklableDejaQueue
+from dejaq.queues import DejaQueue
 
 
 @dataclass
@@ -75,18 +75,18 @@ def _actor_server(pkl: bytes) -> None:
     (skipped entirely if `reply` is None). Designed to be module-level for Windows 'spawn'.
     """
     cls, actor_args, actor_kwargs, req_name = cloudpickle.loads(pkl)
-    req = PicklableDejaQueue(name=req_name, create=False)
+    req = DejaQueue(name=req_name, create=False)
     if isinstance(cls, ModuleType):
         obj = cls
     else:
         obj = cls(*actor_args, **actor_kwargs)
 
-    rep_cache: Dict[str, PicklableDejaQueue] = {}
+    rep_cache: Dict[str, DejaQueue] = {}
 
-    def repq(name: str) -> PicklableDejaQueue:
+    def repq(name: str) -> DejaQueue:
         q = rep_cache.get(name)
         if q is None:
-            q = PicklableDejaQueue(name=name, create=False)
+            q = DejaQueue(name=name, create=False)
             rep_cache[name] = q
         return q
 
@@ -180,13 +180,13 @@ def _func_worker(fn_ser: Tuple[str, str] | Callable, req_name: str) -> None:
         mod, name = fn_ser
         fn = getattr(__import__(mod, fromlist=[name]), name)
 
-    req = PicklableDejaQueue(name=req_name, create=False)
-    rep_cache: Dict[str, PicklableDejaQueue] = {}
+    req = DejaQueue(name=req_name, create=False)
+    rep_cache: Dict[str, DejaQueue] = {}
 
-    def repq(name: str) -> PicklableDejaQueue:
+    def repq(name: str) -> DejaQueue:
         q = rep_cache.get(name)
         if q is None:
-            q = PicklableDejaQueue(name=name, create=False)
+            q = DejaQueue(name=name, create=False)
             rep_cache[name] = q
         return q
 
@@ -223,7 +223,7 @@ class _Mailbox:
       rep_q: The reply/mailbox queue owned by this process.
     """
 
-    def __init__(self, rep_q: PicklableDejaQueue) -> None:
+    def __init__(self, rep_q: DejaQueue) -> None:
         self.q = rep_q
         self._buf: Dict[str, _Rep] = {}
 
@@ -348,9 +348,9 @@ class Actor:
     # --- construction ---
     def __init__(self, cls: type, *args, buffer_bytes: int = int(10e6), start_method: str = "spawn", **kwargs) -> None:
         base = f"act-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        self._rep = PicklableDejaQueue(buffer_bytes=buffer_bytes, name=base + "_mb", create=True)  # mailbox
+        self._rep = DejaQueue(buffer_bytes=buffer_bytes, name=base + "_mb", create=True)  # mailbox
         self._mbox = _Mailbox(self._rep)
-        self._req = PicklableDejaQueue(buffer_bytes=buffer_bytes, name=base + "_req", create=True)  # requests
+        self._req = DejaQueue(buffer_bytes=buffer_bytes, name=base + "_req", create=True)  # requests
         ctx = mp.get_context(start_method)
         pkl = cloudpickle.dumps((cls, args, kwargs, self._req._base))
         logging.info(f"args: {args}, kwargs: {kwargs}, base: {base}")
@@ -537,9 +537,9 @@ class RemoteFunc:
         self, fn: Callable, workers: int = 1, buffer_bytes: int = 8_000_000, start_method: str = "spawn"
     ) -> None:
         base = f"rf-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        self._rep = PicklableDejaQueue(buffer_bytes=buffer_bytes, name=base + "_mb", create=True)  # mailbox
+        self._rep = DejaQueue(buffer_bytes=buffer_bytes, name=base + "_mb", create=True)  # mailbox
         self._mbox = _Mailbox(self._rep)
-        self._req = PicklableDejaQueue(buffer_bytes=buffer_bytes, name=base + "_req", create=True)  # work queue
+        self._req = DejaQueue(buffer_bytes=buffer_bytes, name=base + "_req", create=True)  # work queue
         ctx = mp.get_context(start_method)
 
         # Prefer (module, name) reference for spawn-friendliness; fall back to pickled callable.
