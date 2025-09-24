@@ -489,13 +489,14 @@ class NamedByteRing:
         return self._avail_space() == self.cap - 1
     
     def purge(self) -> None:
-        """ Clear all items from the queue. """
-        with self._put_lock:
-            tail = self._state[1]
-            with self._get_lock:
-                self._state[0] = tail  # head = tail
-        self._space_gate.release(1)
-    
+        with self._put_lock, self._get_lock:
+            self._state[0] = 0
+            self._state[1] = 0
+            while self._items.acquire(timeout=0):
+                pass
+            self._space_gate.release(1)
+        # release all items
+
     def _avail_space(self, head: int | None = None, tail: int | None = None) -> int:
         if head is None: head = int(self._state[0])
         if tail is None: tail = int(self._state[1])
