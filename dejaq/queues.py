@@ -490,12 +490,15 @@ class NamedByteRing:
         self._owns_state = False
         if create:
             try:
-                self._state = shared_memory.ShareableList([0, 0, int(buffer_bytes), 0], name=st_name)
+                self._state_mem = shared_memory.SharedMemory(create=True, name=st_name, size=8 * 4)
                 self._owns_state = True
             except FileExistsError:
-                self._state = shared_memory.ShareableList(name=st_name)
+                self._state_mem = shared_memory.SharedMemory(name=st_name)
         else:
-            self._state = shared_memory.ShareableList(name=st_name)
+            self._state_mem = shared_memory.SharedMemory(name=st_name)
+        self._state = self._state_mem.buf.cast("q")
+        if create:
+            self._state[:] = array.array("q", [0, 0, buffer_bytes, 0])
         self._state_name = st_name
 
         # Data buffer
@@ -679,7 +682,8 @@ class NamedByteRing:
         self._state_name = s["state_name"]
         self._buf_name = s["buf_name"]
         self.cap = s["cap"]
-        self._state = shared_memory.ShareableList(name=self._state_name)
+        self._state_mem = shared_memory.SharedMemory(name=self._state_name)
+        self._state = self._state_mem.buf.cast("q")
         self.buf = shared_memory.SharedMemory(name=self._buf_name)
         self._put_lock = NamedLock(s["locks"][0]["name"], create=False)
         self._get_lock = NamedLock(s["locks"][1]["name"], create=False)
