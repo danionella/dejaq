@@ -2,6 +2,7 @@ from __future__ import annotations
 import os, sys, time, gc, weakref, struct
 import multiprocessing as mp
 from multiprocessing import shared_memory
+from copy import deepcopy
 import pickle
 import dataclasses
 from typing import Any
@@ -677,8 +678,8 @@ class PicklableDejaQueue(NamedByteRing):
                 if rem <= 0 or not self._space_gate.acquire(timeout=rem): 
                     raise TimeoutError("Timeout waiting for space in queue.")
 
-    def get(self, timeout=None, peek_only=False):
-        """ Gets an item from the queue.
+    def get(self, timeout=None, peek_only=False, callback=None):
+        """Gets an item from the queue.
 
         Args:
             timeout (float | None): Maximum time to wait for an item. Default None (wait indefinitely).
@@ -715,6 +716,11 @@ class PicklableDejaQueue(NamedByteRing):
                 cursor += n
 
             obj = pickle.loads(segs[0], buffers=[m for m in segs[1:]])
+            if callback is None:
+                out = deepcopy(obj)
+            else:
+                out = callback(obj)
+
             if not peek_only:
                 self._state[0] = (head0 + total) % cap  # advance after loads()
                 self._space_gate.release(1)
