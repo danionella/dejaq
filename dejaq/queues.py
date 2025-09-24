@@ -214,7 +214,7 @@ class NamedByteRing:
             self._state_mem = shared_memory.SharedMemory(name=st_name)
         self._state = self._state_mem.buf.cast("q")
         if create:
-            self._state[:] = memoryview(array.array("q", [0, 0, buffer_bytes, 0]))
+            self._state[0:4] = array.array("q", [0, 0, buffer_bytes, 0])
         self._state_name = st_name
 
         # Data buffer
