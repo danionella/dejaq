@@ -13,11 +13,11 @@ A fast alternative to `multiprocessing.Queue`. Faster, because it takes advantag
 
 The speed advantege of `DejaQueue` becomes substantial for items of > 1 MB size. It enables efficient inter-job communication in big-data processing pipelines, which can be implemented in a few lines of code with [`dejaq.Parallel`](#dejaqparallel).
 
-#### Features:
+### Features:
 - Fast, low-latency, high-throughput inter-process communication
 - Supports any picklable Python object, including numpy arrays and nested dictionaries
 - Zero-copy data transfer with pickle protocol 5 out-of-band data
-- Picklable queue instances (can be passed to child processes)
+- Picklable queue instances (queue object itself can be passed between processes)
 - Peekable (non-destructive read)
 - Actor class for remote method calls and attribute access in a separate process (see [`dejaq.Actor`](#dejaqactor-and-actordecorator))
 
@@ -58,6 +58,61 @@ for c in consumers:
     c.start()
 producer.start()
 ```
+
+## `dejaq.Actor` and `ActorDecorator`
+
+`dejaq.Actor` allows you to run a class instance in a separate process and call its methods or access its attributes remotely, as if it were local. This is useful for isolating heavy computations, stateful services, or legacy code in a separate process, while keeping a simple Pythonic interface.
+
+
+### Example: Using `Actor` directly
+
+```python
+from dejaq import Actor
+
+class Counter:
+    def __init__(self, start=0):
+        self.value = start
+    def increment(self, n=1):
+        self.value += n
+        return self.value
+    def get(self):
+        return self.value
+
+# Start the actor in a separate process
+counter = Actor(Counter, start=10)
+
+print(counter.get())         # 10
+print(counter.increment())   # 11
+print(counter.increment(5))  # 16
+print(counter.get())         # 16
+
+counter.close()  # Clean up the process
+```
+
+### Example: Using `ActorDecorator`
+
+```python
+from dejaq import ActorDecorator
+
+@ActorDecorator
+class Greeter:
+    def __init__(self, name):
+        self.name = name
+    def greet(self):
+        return f"Hello, {self.name}!"
+
+greeter = Greeter("Alice")
+print(greeter.greet())  # "Hello, Alice!"
+greeter.close()
+```
+
+### Features
+
+- **Remote method calls:** Call methods as if the object was local.
+- **Remote attribute access:** Get/set attributes of the remote object.
+- **Async support:** Call `method_async()` to get a `Future` for non-blocking calls.
+- **Tab completion:** Works in Jupyter and most IDEs.
+
 
 
 ### `dejaq.Parallel`
@@ -136,64 +191,6 @@ result = stage3.compute()
 # or:
 result = Consumer(1000)(Processor(10.0)(Producer(0.5)(input_iterable))).compute()
 ```
-
-
-## `dejaq.Actor` and `ActorDecorator`
-
-`dejaq.Actor` allows you to run a class instance in a separate process and call its methods or access its attributes remotely, as if it were local. This is useful for isolating heavy computations, stateful services, or legacy code in a separate process, while keeping a simple Pythonic interface.
-
-
-### Example: Using `Actor` directly
-
-```python
-from dejaq import Actor
-
-class Counter:
-    def __init__(self, start=0):
-        self.value = start
-    def increment(self, n=1):
-        self.value += n
-        return self.value
-    def get(self):
-        return self.value
-
-# Start the actor in a separate process
-counter = Actor(Counter, start=10)
-
-print(counter.get())         # 10
-print(counter.increment())   # 11
-print(counter.increment(5))  # 16
-print(counter.get())         # 16
-
-counter.close()  # Clean up the process
-```
-
-### Example: Using `ActorDecorator`
-
-```python
-from dejaq import ActorDecorator
-
-@ActorDecorator
-class Greeter:
-    def __init__(self, name):
-        self.name = name
-    def greet(self):
-        return f"Hello, {self.name}!"
-
-greeter = Greeter("Alice")
-print(greeter.greet())  # "Hello, Alice!"
-greeter.close()
-```
-
-### Features
-
-- **Remote method calls:** Call methods as if the object were local.
-- **Remote attribute access:** Get/set attributes transparently.
-- **Async support:** Call `method_async()` to get a `Future` for non-blocking calls.
-- **Tab completion:** Works in Jupyter and most IDEs.
-- **Graceful shutdown:** Use `.close()` or a context manager.
-
-
 
 
 # See also
