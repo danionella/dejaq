@@ -459,7 +459,7 @@ class DejaQueue(NamedByteRing):
 
     Example:
         >>> import pickle
-        >>> q = PicklableDejaQueue(buffer_bytes=1e7)
+        >>> q = DejaQueue(buffer_bytes=1e7)
         >>> pkl = pickle.dumps(q)
         >>> q2 = pickle.loads(pkl)
         >>> q.put({"a": 1, "b": [1,2,3]})
