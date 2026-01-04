@@ -289,13 +289,6 @@ class NamedByteRing:
                 pass
             self._space_gate.release(1)
 
-    # def _avail_space(self, head: int | None = None, tail: int | None = None) -> int:
-    #     if head is None:
-    #         head = int(self._state[0])
-    #     if tail is None:
-    #         tail = int(self._state[1])
-    #     return (head - tail - 1) % self.cap
-
     def _write_bytes(self, data, tail=None, write_tail=True) -> int:
         """Write data at current tail; return new tail (mod cap). Caller holds put_lock."""
         if not isinstance(data, memoryview):
