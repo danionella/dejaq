@@ -74,7 +74,7 @@ class lazymap:
             try:
                 res = item if fcn is None else fcn(item, **kwargs)
             except Exception as e:
-                tb = ''.join(traceback.format_exception(e.__class__, e, e.__traceback__))
+                tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
                 res = {"type":"exception","exc_type":str(type(e)), "exc_msg":str(e), "traceback":tb}
             out_sem[pid].acquire()
             _out_queue.put(res)
