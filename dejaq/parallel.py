@@ -9,6 +9,7 @@ import concurrent.futures
 
 import numpy as np
 import cloudpickle
+from .queues import DejaQueue
 
 ctx = mp.get_context("spawn")
 
