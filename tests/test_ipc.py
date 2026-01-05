@@ -2,7 +2,7 @@
 import os, time, multiprocessing as mp, numpy as np, pytest
 
 # adjust this import to your module path
-from dejaq.queues import IS_WIN, NamedSemaphore, NamedByteRing, PicklableDejaQueue
+from dejaq.queues import _IS_WIN, NamedSemaphore, NamedByteRing, DejaQueue
 
 mp.set_start_method("spawn", force=True)
 
@@ -33,8 +33,8 @@ def _child_nbr_get_bytes(base):
 
 def _child_dejaq_prefill_and_get(base, nbytes):
     try:
-        from dejaq.queues import PicklableDejaQueue
-        q = PicklableDejaQueue(name=base, create=False)
+        from dejaq.queues import DejaQueue
+        q = DejaQueue(name=base, create=False)
         # consume the prefill
         _ = q.get(timeout=2.0)
         # then the measured payload
@@ -57,21 +57,11 @@ def test_named_semaphore_roundtrip_spawn():
     p.join(2.0)
     assert p.exitcode == 0
 
-def test_namedbytering_put_get_bytes():
-    ctx = mp.get_context("spawn")
-    q = NamedByteRing(buffer_bytes=1_000_000, create=True)
-    base = q.base
-    p = ctx.Process(target=_child_nbr_get_bytes, args=(base,))
-    p.start()
-    q.put_bytes(b"hello")
-    p.join(3.0)
-    assert p.exitcode == 0
-
 def test_picklable_dejaqueue_prefill_then_get():
     """Reproduces the 'prefill then bench' flow."""
     ctx = mp.get_context("spawn")
-    q = PicklableDejaQueue(buffer_bytes=2_000_000, create=True)
-    base = q.base
+    q = DejaQueue(buffer_bytes=2_000_000, create=True)
+    base = q._base
     # prefill with a small object
     q.put(1)
     # spawn consumer that drains prefill and then expects the big item

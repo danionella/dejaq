@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dejaq"
-version = "0.3.0"
+version = "0.5.3"
 description = "Déjà Queue – A fast multiprocessing queue for Python"
 authors = [
     { name = "jlab.berlin" },
@@ -14,6 +14,8 @@ license = {text = "MIT"}
 requires-python = ">=3.8"
 dependencies = ["numpy", 
                 "tqdm", 
+                'psutil',
+                'cloudpickle',
                 'posix_ipc ; platform_system != "Windows"',
                 'pywin32 ; platform_system == "Windows"',
                 ]
