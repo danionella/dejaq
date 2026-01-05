@@ -538,29 +538,3 @@ class Ticker(Startable):
 
 #     def __dir__(self):
 #         """
-#         Returns the directory of attributes and methods of the wrapped object.
-
-#         Returns:
-#             list: A list of attributes and methods.
-#         """
-#         # self._in_queue.put(dict(type='method', method='__dir__', args=(), kwargs={}))
-#         # obj_attrs = self._out_queue.get() or []
-#         obj_attrs = self._txrx(dict(type='method', method='__dir__', args=[], kwargs={})) or []
-#         if isinstance(obj_attrs, dict) and obj_attrs['type'] == 'exception':
-#             self._raise_remote_exception(obj_attrs['exception'])
-#         return obj_attrs
-
-#     def __repr__(self):
-#         """
-#         Returns a string representation of the Actor, including the wrapped object's
-#         representation.
-
-#         Returns:
-#             str: A string representing the Actor and the wrapped object.
-#         """
-#         # self._in_queue.put(dict(type='method', method='__repr__', args=[], kwargs={}))
-#         # result = self._out_queue.get()
-#         result = self._txrx(dict(type='method', method='__repr__', args=[], kwargs={}))
-#         if isinstance(result, dict) and result['type'] == 'exception':
-#             return "<Actor (error fetching repr)>"
-#         return f"<Actor wrapping: {result}>"
