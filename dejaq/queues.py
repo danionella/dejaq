@@ -275,6 +275,13 @@ class NamedByteRing:
             head = int(self._state[0])
             tail = int(self._state[1])
         return head == tail
+    
+    @property
+    def bytes_available(self) -> int:
+        with self._state_lock:
+            head = int(self._state[0])
+            tail = int(self._state[1])
+        return (head - tail - 1) % self.cap
 
     def purge(self) -> None:
         """Clear all items from the queue."""
