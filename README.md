@@ -18,7 +18,7 @@ The speed advantage of `DejaQueue` becomes substantial for items of > 1 MB size.
 - Zero-copy data transfer with pickle protocol 5 out-of-band data
 - Picklable queue instances (queue object itself can be passed between processes)
 - Peekable (non-destructive read)
-- Actor class for remote method calls and attribute access in a separate process (see [`dejaq.Actor`](#dejaqactor-and-actordecorator))
+- Actor class for remote method calls and attribute access in a separate process (see [dejaq.Actor](#dejaqactor-and-actordecorator))
 
 Auto-generated (minimal) API documentation: https://danionella.github.io/dejaq
 
@@ -31,7 +31,7 @@ Auto-generated (minimal) API documentation: https://danionella.github.io/dejaq
 - for development, clone this repository, navigate to the root directory and type `pip install -e .`
 
 ## Examples
-### `dejaq.DejaQueue`
+### dejaq.DejaQueue
 ```python
 import numpy as np
 from multiprocessing import Process
@@ -58,7 +58,7 @@ for c in consumers:
 producer.start()
 ```
 
-## `dejaq.Actor` and `ActorDecorator`
+## dejaq.Actor and ActorDecorator
 
 `dejaq.Actor` allows you to run a class instance in a separate process and call its methods or access its attributes remotely, as if it were local. This is useful for isolating heavy computations, stateful services, or legacy code in a separate process, while keeping a simple Pythonic interface.
 
@@ -113,7 +113,7 @@ greeter.close()
 - **Tab completion:** Works in Jupyter and most IDEs.
 
 
-## `dejaq.stream` - Building Data Pipelines
+## dejaq.stream - Building Data Pipelines
 
 The `dejaq.stream` module provides a declarative API for building efficient multi-process data pipelines. Each pipeline stage is a “node”, and nodes run their work in separate process(es), communicating through fast `DejaQueue`-backed channels.
 
@@ -284,7 +284,7 @@ sink.wait()
 
 
 <!--
-### `dejaq.Parallel`
+### dejaq.Parallel
 The following examples show how to use `dejaq.Parallel` to parallelize a function or a class, and how to create job pipelines.
 
 Here we execute a function and map iterable inputs across 10 workers. To enable pipelining, the results of each stage are provided as iterable generator. Use `.run()` (or `.compute()` for backwards compatibility) to get the final result. Results are always ordered.
