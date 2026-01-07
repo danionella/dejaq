@@ -1,0 +1,29 @@
+{% extends "default/module.html.jinja2" %}
+
+{#
+Show full inherited member docs (signature + docstring) on subclasses.
+The default template only lists inherited members as links.
+#}
+{% defaultmacro inherited(cls) %}
+    {% for base, members in cls.inherited_members.items() %}
+        {% if base[0] not in all_modules %}
+            {# hide inherited members from modules that are not in the documentation #}
+            {% continue %}
+        {% endif %}
+
+        {% set member_html %}
+            {% for m in members if is_public(m) | trim %}
+                <dd id="{{ m.qualname }}" class="classattr inherited {{ m.kind }}">
+                    {{ member(m) }}
+                </dd>
+            {% endfor %}
+        {% endset %}
+
+        {% if member_html | trim %}
+            <div>
+                <dt>{{ base | link }}</dt>
+                {{ member_html }}
+            </div>
+        {% endif %}
+    {% endfor %}
+{% enddefaultmacro %}
