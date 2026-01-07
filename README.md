@@ -115,7 +115,9 @@ greeter.close()
 
 ## `dejaq.stream` - Building Data Pipelines
 
-The `dejaq.stream` module provides a declarative API for building efficient multi-process data pipelines. It enables you to chain operations like `map`, `tee`, and `zip` to create complex data flows with minimal boilerplate.
+The `dejaq.stream` module provides a declarative API for building efficient multi-process data pipelines. Each pipeline stage is a “node”, and nodes run their work in separate process(es), communicating through fast `DejaQueue`-backed channels.
+
+You can build nodes from either **functions** (executed in worker processes for each item) or **classes** (instantiated once inside a worker process, then called remotely for each item). This makes it easy to compose stateful processors (classes) and stateless transforms (functions) in the same pipeline.
 
 
 ### Simple self-explanatory example:
