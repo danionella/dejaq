@@ -1,6 +1,7 @@
 import pytest
 import numpy as np
 import time
+import concurrent.futures
 from dejaq.stream import Source
 
 
@@ -176,6 +177,23 @@ class TestZip:
         
         results = list(combined)
         assert results == [(1, 'a', 10), (2, 'b', 20)]
+
+    def test_zip_sync_with_tee_lazy_start(self):
+        """Zip(sync) should not deadlock with tee when start_mode='lazy'.
+
+        This covers the case where only the primary branch would otherwise start,
+        leaving the tee worker waiting for readiness from all outputs.
+        """
+        src = Source(it=range(20), start_mode="lazy")
+        a, b = src.tee(2)
+
+        left = a.map(fcn=lambda x: x, n_workers=2)  # primary
+        right = b.map(fcn=lambda x: x * 10, n_workers=1)
+        joined = left.zip(right, mode="sync")
+
+        fut = joined.submit(keep_outputs=True, ndarray=False)
+        results = fut.result(timeout=3)
+        assert results == [(i, i * 10) for i in range(20)]
 
 
 class TestSink:

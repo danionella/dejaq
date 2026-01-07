@@ -336,6 +336,8 @@ class MapNode(BaseNode):
         """Returns an iterator over the results of fcn(item) for each item in it"""
         if self._sink:
             raise TypeError("Sink nodes are terminal and cannot be iterated over.")
+        if self._start_mode == "lazy":
+            self._start_event.set()
         return self._lazymap_generator()
 
     def _worker_fcn(self, wid, pkl, _out_queue, _n_workers, in_sem, out_sem, cancel_event, **kwargs):
@@ -412,8 +414,6 @@ class MapNode(BaseNode):
 
     def _lazymap_generator(self):
         res = None
-        if self._start_mode == 'lazy':
-            self._start_event.set()
         while True:
             item = self._out_queue.get()
             if isinstance(item, dict) and item.get("type") == "exception":
@@ -591,8 +591,10 @@ class ManualSource(MapNode):
 
 
 def _tee_worker(it, queues, cancel_event, start_events):
-    for start_event in start_events:
+    for k, start_event in enumerate(start_events):
+        logging.info(f"Waiting for start event {k}")
         start_event.wait()
+        logging.info(f"Start event {k} received")
     logging.info(f"Tee worker (PID: {os.getpid()}, input: {it}) started.")
     try:
         for item in it:
