@@ -195,11 +195,22 @@ Split and combine streams:
 
 ```python
 stream1, stream2 = node.tee(count=2)                         # split into 2 independent streams
-combined = node1.zip(node2, node3)                           # yields (item1, item2, item3) tuples
+stream1_processed = stream1.map(fcn=lambda x: x * 2)
+recombined = stream1_processed.zip(stream2)     # yields (item1, item2) tuples
 ```
 
 > [!IMPORTANT]
 > When working with multiple sources or split streams, make sure to eventually consume all outputs.
+
+
+#### `.tqdm()`
+
+Add a progress bar:
+
+```python
+node = node.tqdm(desc="Processing items", total=1000)
+```
+
 
 #### `.sink(fcn=None, factory=None, ...)` and `.run()`
 
@@ -225,6 +236,53 @@ src.start()          # start a source (required for Source nodes)
 src.stop()           # signal cancellation
 node.is_running()    # check if node's workers are alive
 ```
+
+### Advanced Example with multiple branches and custom classes
+
+This example shows how to branch a stream with `tee()`, process each branch differently (one branch using a plain function, the other using a stateful class instantiated in a worker), and then recombine branches with `zip()`.
+
+```python
+import numpy as np
+from dejaq.stream import Source
+
+
+class RunningMean:
+    """Stateful processor: instantiated once inside a worker."""
+
+    def __init__(self):
+        self.n = 0
+        self.mean = 0.0
+
+    def __call__(self, x: float) -> dict:
+        self.n += 1
+        self.mean += (x - self.mean) / self.n
+        return {"x": x, "mean": self.mean}
+
+
+# Finite input source
+rng = np.random.default_rng(0)
+src = Source(it=rng.normal(size=1000))
+
+# Branch the stream
+a, b = src.tee(2)
+
+# Branch A: stateless function (runs per-item in worker processes)
+abs_x = a.map(fcn=lambda x: float(abs(x)), n_workers=4)
+
+# Branch B: stateful class (instantiated in a worker, then called per item)
+stats = b.map(cls=RunningMean, n_workers=1)
+
+# Recombine: primary drives output timing
+joined = abs_x.zip(stats, mode="sync")
+
+# Terminal sink: consume the stream (runs eagerly)
+sink = joined.sink(fcn=lambda pair: None)
+
+# Wait for the sink workers to finish consuming the finite source
+sink.wait()
+```
+
+
 <!--
 ### `dejaq.Parallel`
 The following examples show how to use `dejaq.Parallel` to parallelize a function or a class, and how to create job pipelines.
