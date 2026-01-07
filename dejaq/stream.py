@@ -94,6 +94,14 @@ class BaseNode(abc.ABC):
     _mapped = False
     _iterated = False
 
+    def _retain(self, *nodes):
+        """Keep downstream nodes alive as long as this node is referenced."""
+        if not nodes:
+            return
+        if not hasattr(self, "_children"):
+            self._children = []
+        self._children.extend([n for n in nodes if n is not None])
+
     def map(self, fcn=None, cls=None, start_mode='lazy', cls_fcn=lambda obj, item: obj(item), init_kwargs=None, **kwargs):
         """Creates a map node that applies a function or class method to each item in the stream, depending on the type of arg provided.
 
@@ -113,10 +121,14 @@ class BaseNode(abc.ABC):
         # check if arg is class or class factory:
         if cls is not None:
             assert type(cls) == type or callable(cls), "cls must be a class or a callable factory function with signature cls(**init_kwargs)."
-            return MapNode.from_class(cls=cls, cls_fcn=cls_fcn, it=self, init_kwargs=init_kwargs, **kwargs)
+            node = MapNode.from_class(cls=cls, cls_fcn=cls_fcn, it=self, init_kwargs=init_kwargs, **kwargs)
+            self._retain(node)
+            return node
         elif fcn is not None:
             assert callable(fcn), "fcn must be a callable function with signature fcn(item)."
-            return MapNode(it=self, fcn=fcn, start_mode=start_mode, **kwargs)
+            node = MapNode(it=self, fcn=fcn, start_mode=start_mode, **kwargs)
+            self._retain(node)
+            return node
 
     def map_class(self, cls=None, cls_fcn=lambda obj, item: obj(item), init_kwargs=None, **map_kwargs):
         """Create a MapNode that instantiates cls once and calls cls_method on it for each item.
@@ -128,7 +140,9 @@ class BaseNode(abc.ABC):
         """
         assert not self._mapped, "Node has already been mapped"
         self._mapped = True
-        return MapNode.from_class(cls=cls, cls_fcn=cls_fcn, it=self, init_kwargs=init_kwargs, **map_kwargs)
+        node = MapNode.from_class(cls=cls, cls_fcn=cls_fcn, it=self, init_kwargs=init_kwargs, **map_kwargs)
+        self._retain(node)
+        return node
 
     def tee(self, count=2, buffer_bytes=10e6):
         """Splits the stream into multiple independent streams.
@@ -142,7 +156,9 @@ class BaseNode(abc.ABC):
         """
         assert not self._mapped, "Node has already been mapped"
         self._mapped = True
-        return get_tee(self, count=count, buffer_bytes=buffer_bytes)
+        nodes = get_tee(self, count=count, buffer_bytes=buffer_bytes)
+        self._retain(*nodes)
+        return nodes
 
     def zip(self, *nodes, mode='sync'):
         """Zips multiple nodes together into a single node yielding tuples of items from each node.
@@ -157,7 +173,9 @@ class BaseNode(abc.ABC):
             assert not node._mapped, f"Node {node} has already been mapped"
         for node in [self, *nodes]:
             node._mapped = True
-        return ZipNode(self, *nodes, mode=mode)
+        out = ZipNode(self, *nodes, mode=mode)
+        self._retain(out)
+        return out
 
     def tqdm(self, **tqdm_kwargs):
         """Wraps the node with a tqdm progress bar.
@@ -181,7 +199,9 @@ class BaseNode(abc.ABC):
         assert not self._iterated, "Node has already been iterated"
         self._iterated = True
         assert not self._mapped, "Node has already been mapped"
-        return MapNode(self, *args, sink=True, start_mode='eager', **kwargs)
+        node = MapNode(self, *args, sink=True, start_mode='eager', **kwargs)
+        self._retain(node)
+        return node
 
     def run(self, *args, **kwargs):
         """Alias for :meth:`compute`."""
@@ -300,7 +320,7 @@ class MapNode(BaseNode):
         pkl = cloudpickle.dumps(fcn)
         worker_args = [pkl, self._out_queue, n_workers, self._in_sem, self._out_sem, self._cancel_event]
         _workers = [
-            _mp_ctx.Process(target=self._worker_fcn, args=(pid, *worker_args), kwargs=kwargs)
+            _mp_ctx.Process(target=self._worker_fcn, args=(pid, *worker_args), kwargs=kwargs, daemon=True)
             for pid in range(n_workers)
         ]
         [w.start() for w in _workers]
@@ -502,7 +522,7 @@ class NodeProxy:
 
 
 def Source(it=None, fcn=None, cls=None, call_fcn=lambda obj: obj(), init_kwargs=None,
-                 n_workers=1, buffer_bytes=10e6, rate=None, start_mode="lazy", **kwargs):
+                 n_workers=1, buffer_bytes=10e6, rate=None, start_mode="manual", **kwargs):
     """Returns a source dejaq.MapNode. Either an iterator, a callable function or an instance factory must be provided.
     If none are provided, a dejaq.stream.ManualSource is returned.
 
@@ -618,7 +638,7 @@ def get_tee(it, count=2, buffer_bytes=10e6):
     queues = [DejaQueue(buffer_bytes) for _ in range(count)]
     cancel_event = _mp_ctx.Event()
 
-    p = _mp_ctx.Process(target=_tee_worker, args=(it, queues, cancel_event, start_events))
+    p = _mp_ctx.Process(target=_tee_worker, args=(it, queues, cancel_event, start_events), daemon=True)
     p.start()
 
     return tuple(_TeeOutputNode(queues[i], cancel_event, p.pid, start_events[i]) for i in range(count))
