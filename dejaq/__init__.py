@@ -9,3 +9,6 @@ logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s [%(name
 from .queues import LegacyDejaQueue, DejaQueue
 from .parallel import Parallel
 from .remote import Actor, RemoteFunc, ActorDecorator
+from .stream import Source, MapNode
+
+__all__ = ["DejaQueue", "Parallel", "Actor", "Source", "MapNode", "remote", "stream", "queues"]

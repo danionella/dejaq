@@ -1,4 +1,3 @@
-
 ![Python Version](https://img.shields.io/badge/python-3.8+-blue)
 [![PyPI - Version](https://img.shields.io/pypi/v/dejaq)](https://pypi.org/project/dejaq/)
 [![Conda Version](https://img.shields.io/conda/v/conda-forge/dejaq)](https://anaconda.org/conda-forge/dejaq)
@@ -11,7 +10,7 @@ A fast alternative to `multiprocessing.Queue`. Faster, because it takes advantag
 
 <img src="https://github.com/user-attachments/assets/00465436-47f8-4b2a-a236-d288ee34df28" width="100%">
 
-The speed advantege of `DejaQueue` becomes substantial for items of > 1 MB size. It enables efficient inter-job communication in big-data processing pipelines, which can be implemented in a few lines of code with [`dejaq.Parallel`](#dejaqparallel).
+The speed advantage of `DejaQueue` becomes substantial for items of > 1 MB size. It enables efficient inter-job communication in big-data processing pipelines using [`dejaq.Actor`](#dejaqactor-and-actordecorator) or [`dejaq.stream`](#dejaqstream---building-data-pipelines).
 
 ### Features:
 - Fast, low-latency, high-throughput inter-process communication
@@ -114,11 +113,121 @@ greeter.close()
 - **Tab completion:** Works in Jupyter and most IDEs.
 
 
+## `dejaq.stream` - Building Data Pipelines
 
+The `dejaq.stream` module provides a declarative API for building efficient multi-process data pipelines. It enables you to chain operations like `map`, `tee`, and `zip` to create complex data flows with minimal boilerplate.
+
+
+### Simple self-explanatory example:
+
+
+```python
+from dejaq.stream import Source
+import numpy as np
+from scipy.ndimage import gaussian_filter
+
+
+class CameraController:
+    def get_frame(self):
+        return np.random.randn(480, 640)
+
+class GaussianSmoother:
+    def __init__(self, sigma=2.0):
+        self.sigma = sigma
+        self.count = 0
+    
+    def __call__(self, frame):
+        self.count += 1
+        return gaussian_filter(frame, sigma=self.sigma)
+
+# Create a source that generates random frames at 30 fps
+src = Source(cls=CameraController, call_fcn=lambda cam: cam.get_frame(), rate=30)
+
+# Build a pipeline: preprocess -> detect -> save
+    
+pipeline = (
+    src 
+    .map(fcn = lambda frame: (frame - frame.min()) / (frame.max() - frame.min()), n_workers=4)  # normalize
+    .map(cls = lambda: GaussianSmoother(sigma=3.0))  # smooth with gaussian filter
+    .sink(fcn = lambda frame: print(f"Processed frame: mean={frame.mean():.3f}, std={frame.std():.3f}"))
+)
+
+# Start the source
+src.start()
+
+# Stop after some time
+import time
+time.sleep(5)
+src.stop()
+```
+
+> [!IMPORTANT]
+> Keep a reference to all source nodes. A bare expression like `Source(...).map(...).sink(...)` with no assignment can be garbage-collected immediately.
+
+### API Reference
+
+#### `Source(it=None, fcn=None, cls=None, call_fcn=..., init_kwargs=None, rate=None, ...)`
+
+Create a source node from an iterable, function, or class instance:
+
+```python
+Source(it=range(100))                                        # from iterable
+Source(fcn=lambda: get_data(), rate=30)                      # from function, rate-limited to 30 Hz
+Source(cls=Camera, call_fcn=lambda c: c.get_frame())         # from class instance
+Source()                                                     # manual source (use .put(some_data) and .stop())
+```
+
+#### `.map(fcn=None, cls=None, cls_fcn=..., init_kwargs=None, n_workers=1, ...)`
+
+Apply a function or class to each item:
+
+```python
+node.map(fcn=lambda x: x * 2, n_workers=4)                   # function with 4 workers
+node.map(cls=Processor)                                      # class (calls .__call__ on each item)
+node.map(cls=lambda: Proc(x=5), cls_fcn=lambda p, x: p.process(x))      # calls method "process" on each item
+```
+
+#### `.tee(count=2)` and `.zip(*nodes)`
+
+Split and combine streams:
+
+```python
+stream1, stream2 = node.tee(count=2)                         # split into 2 independent streams
+combined = node1.zip(node2, node3)                           # yields (item1, item2, item3) tuples
+```
+
+> [!IMPORTANT]
+> When working with multiple sources or split streams, make sure to eventually consume all outputs.
+
+#### `.sink(fcn=None, factory=None, ...)` and `.run()`
+
+Consume the stream:
+
+```python
+# using sink nodes (source is typically started after creating the sink)
+pipeline.sink(fcn=lambda x: print(x))                            # terminal node, no output
+# ...
+src.start()
+
+# using .run() to collect results (source should be started before calling .run())
+src.start()
+results = pipeline.run()                                         # collect all results (blocking)
+```
+> [!IMPORTANT]
+> When collecting results using `.run()` (blocking call), make sure the upstream sources have already been started (e.g. with `src.start()`). The pattern is to first start all sources, then call `.run()` on the terminal node(s). For `.sink()`, the source is usually started after creating the sink node.
+
+#### Control methods
+
+```python
+src.start()          # start a source (required for Source nodes)
+src.stop()           # signal cancellation
+node.is_running()    # check if node's workers are alive
+```
+<!--
 ### `dejaq.Parallel`
 The following examples show how to use `dejaq.Parallel` to parallelize a function or a class, and how to create job pipelines.
 
-Here we execute a function and map iterable inputs across 10 workers. To enable pipelining, the results of each stage are provided as iterable generator. Use the `.compute()` method to get the final result (note that each stage pre-fetches results from `n_workers` calls, so some of the execution already starts before `.compute`). Results are always ordered.
+Here we execute a function and map iterable inputs across 10 workers. To enable pipelining, the results of each stage are provided as iterable generator. Use `.run()` (or `.compute()` for backwards compatibility) to get the final result. Results are always ordered.
 
 ```python
 from time import sleep
@@ -131,7 +240,7 @@ def slow_function(arg):
 input_iterable = range(100)
 slow_function = Parallel(n_workers=10)(slow_function)
 stage = slow_function(input_iterable)
-result = stage.compute() # or list(stage)
+result = stage.run() # or list(stage)
 # or shorter: 
 result = Parallel(n_workers=10)(slow_function)(input_iterable).compute()
 ```
@@ -143,7 +252,7 @@ def slow_function_decorated(arg):
     sleep(1.0)
     return arg + 5
 
-result = slow_function_decorated(input_iterable).compute()
+result = slow_function_decorated(input_iterable).run()
 ```
 
 Similarly, you can decorate a class. It will be instantiated within a worker. Iterable items will be fed to the `__call__` method. Note how the additional init arguments are provided:
@@ -186,12 +295,12 @@ input_iterable = range(100)
 stage1 = Producer(0.5)(input_iterable)
 stage2 = Processor(10.0)(stage1)
 stage3 = Consumer(1000)(stage2)
-result = stage3.compute()
+result = stage3.run()
 
 # or:
-result = Consumer(1000)(Processor(10.0)(Producer(0.5)(input_iterable))).compute()
+result = Consumer(1000)(Processor(10.0)(Producer(0.5)(input_iterable))).run()
 ```
-
+-->
 
 # See also
 - [ArrayQueues](https://github.com/portugueslab/arrayqueues) 
