@@ -120,6 +120,7 @@ The `dejaq.stream` module provides a declarative API for building efficient mult
 
 ### Simple self-explanatory example:
 
+
 ```python
 from dejaq.stream import Source
 import numpy as np
@@ -159,6 +160,9 @@ import time
 time.sleep(5)
 src.stop()
 ```
+
+> [!IMPORTANT]
+> Keep a reference to all source nodes. A bare expression like `Source(...).map(...).sink(...)` with no assignment can be garbage-collected immediately.
 
 ### API Reference
 
