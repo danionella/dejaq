@@ -523,7 +523,7 @@ class NodeProxy:
 
 
 def Source(it=None, fcn=None, cls=None, call_fcn=lambda obj: obj(), init_kwargs=None,
-                 n_workers=1, buffer_bytes=10e6, rate=None, start_mode="manual", **kwargs):
+                 n_workers=1, buffer_bytes=10e6, rate=None, start_mode="lazy", **kwargs):
     """Returns a source dejaq.MapNode. Either an iterator, a callable function or an instance factory must be provided.
     If none are provided, a dejaq.stream.ManualSource is returned.
 
@@ -535,7 +535,7 @@ def Source(it=None, fcn=None, cls=None, call_fcn=lambda obj: obj(), init_kwargs=
         n_workers (int): number of workers (default: 1)
         buffer_bytes (int): size of the queue buffer (default: 10e6 bytes)
         rate (float): rate limit in Hz (items per second). If None, no rate limiting is applied.
-        start_mode (str): 'eager' (default), 'lazy' or 'manual', determining when the workers start processing.
+        start_mode (str): 'lazy' (default), 'eager' or 'manual', determining when the workers start processing.
         **kwargs: optional, being passed to fcn
 
     Returns:
