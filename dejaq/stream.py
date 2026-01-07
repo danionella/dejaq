@@ -242,7 +242,7 @@ class BaseNode(abc.ABC):
         if ndarray:
             try:
                 return np.array(out)
-            except:
+            except Exception:
                 return out
         return out
 
