@@ -140,14 +140,14 @@ class GaussianSmoother:
         return gaussian_filter(frame, sigma=self.sigma)
 
 # Create a source that generates random frames at 30 fps
-src = Source(factory=CameraController, call_fcn=lambda cam: cam.get_frame(), rate=30)
+src = Source(cls=CameraController, call_fcn=lambda cam: cam.get_frame(), rate=30)
 
 # Build a pipeline: preprocess -> detect -> save
     
 pipeline = (
     src 
     .map(fcn = lambda frame: (frame - frame.min()) / (frame.max() - frame.min()), n_workers=4)  # normalize
-    .map(factory = lambda: GaussianSmoother(sigma=3.0))  # smooth with gaussian filter
+    .map(cls = lambda: GaussianSmoother(sigma=3.0))  # smooth with gaussian filter
     .sink(fcn = lambda frame: print(f"Processed frame: mean={frame.mean():.3f}, std={frame.std():.3f}"))
 )
 
@@ -162,25 +162,25 @@ src.stop()
 
 ### API Reference
 
-#### `Source(it=None, fcn=None, factory=None, call_fcn=..., rate=None, ...)`
+#### `Source(it=None, fcn=None, cls=None, call_fcn=..., init_kwargs=None, rate=None, ...)`
 
 Create a source node from an iterable, function, or class instance:
 
 ```python
 Source(it=range(100))                                        # from iterable
 Source(fcn=lambda: get_data(), rate=30)                      # from function, rate-limited to 30 Hz
-Source(factory=Camera, call_fcn=lambda c: c.get_frame())     # from class instance
+Source(cls=Camera, call_fcn=lambda c: c.get_frame())         # from class instance
 Source()                                                     # manual source (use .put(some_data) and .stop())
 ```
 
-#### `.map(fcn=None, factory=None, call_fcn=..., n_workers=1, ...)`
+#### `.map(fcn=None, cls=None, cls_fcn=..., init_kwargs=None, n_workers=1, ...)`
 
 Apply a function or class to each item:
 
 ```python
 node.map(fcn=lambda x: x * 2, n_workers=4)                   # function with 4 workers
-node.map(factory=Processor)                                  # class (calls .__call__ on each item)
-node.map(factory=lambda: Proc(x=5), call_fcn=lambda p, x: p.process(x)) # calls method "process" on each item
+node.map(cls=Processor)                                      # class (calls .__call__ on each item)
+node.map(cls=lambda: Proc(x=5), cls_fcn=lambda p, x: p.process(x))      # calls method "process" on each item
 ```
 
 #### `.tee(count=2)` and `.zip(*nodes)`
