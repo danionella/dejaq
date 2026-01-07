@@ -91,8 +91,9 @@ class RateLimitedIterator:
 class BaseNode(abc.ABC):
     """Base class for all stream nodes."""
 
-    _mapped = False
-    _iterated = False
+    def __init__(self):
+        self._mapped = False
+        self._iterated = False
 
     def _retain(self, *nodes):
         """Keep downstream nodes alive as long as this node is referenced."""
@@ -304,7 +305,7 @@ class MapNode(BaseNode):
     """
 
     def __init__(self, it, fcn=lambda x: x, n_workers=1, buffer_bytes=10e6, start_mode="lazy", sink=False, **kwargs):
-
+        super().__init__()
         self._it = it
         self._start_mode = start_mode
         self._sink = sink
@@ -662,6 +663,7 @@ class ZipNode(BaseNode):
     """
 
     def __init__(self, primary_node, *secondary_nodes, mode="sync", maxlen=None):
+        super().__init__()
         assert mode in ("buffer", "latest", "sync"), "mode must be 'buffer', 'latest', or 'sync'"
         self._primary = primary_node
         self._secondaries = secondary_nodes
