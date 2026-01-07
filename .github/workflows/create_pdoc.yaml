@@ -32,7 +32,7 @@ jobs:
       - name: Install pdoc
         run: |
           conda activate docs
-          conda install pdoc
+          pip install pdoc
       - name: Install dejaq
         run: |
           pip install .
