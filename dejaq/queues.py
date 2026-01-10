@@ -4,12 +4,30 @@ import multiprocessing as mp
 from multiprocessing import shared_memory
 from copy import deepcopy
 import pickle
+import cloudpickle
 import dataclasses
 from typing import Any
 import numpy as np
 import array
 
+class _pickleall:
+    """Pickle backend that tries pickle first, then cloudpickle."""
+    def dumps(*args, **kwargs):
+        try:
+            return pickle.dumps(*args, **kwargs)
+        except pickle.PicklingError:
+            return cloudpickle.dumps(*args, **kwargs)
+
+    def loads(*args, **kwargs):
+        return pickle.loads(*args, **kwargs)
+    
+    def PickleBuffer(*args, **kwargs):
+        return pickle.PickleBuffer(*args, **kwargs)
+
+_pickle_backend = _pickleall
+
 _IS_WIN = sys.platform.startswith("win")
+_PICKLE_PROTOCOL = 5
 
 
 def _safe_base(prefix: str = "ns") -> str:
@@ -494,7 +512,7 @@ class DejaQueue(NamedByteRing):
 
     def put(self, obj, timeout: float | None = None) -> bool:
         bufs = []
-        p0 = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL, buffer_callback=bufs.append)
+        p0 = _pickle_backend.dumps(obj, protocol=_PICKLE_PROTOCOL, buffer_callback=bufs.append)
         segs = [p0] + [b.raw() for b in bufs]
         K = len(segs)
         lens = [len(s) for s in segs]
@@ -575,7 +593,7 @@ class DejaQueue(NamedByteRing):
                     segs.append(_copy_span(cursor, n))  # wrapped -> copy
                 cursor += n
 
-            obj = pickle.loads(segs[0], buffers=[m for m in segs[1:]])
+            obj = _pickle_backend.loads(segs[0], buffers=[m for m in segs[1:]])
 
             if callback is None:
                 out = deepcopy(obj)
@@ -791,7 +809,7 @@ class LegacyDejaQueue(ByteFIFO):
             timeout (float, optional): The maximum time to wait for available space in the queue.
         """
         buffers = []
-        pkl = pickle.dumps(obj, buffer_callback=buffers.append, protocol=pickle.HIGHEST_PROTOCOL)
+        pkl = _pickle_backend.dumps(obj, buffer_callback=buffers.append, protocol=_PICKLE_PROTOCOL)
         buffer_lengths = [len(pkl)] + [len(it.raw()) for it in buffers]
         nbytes_total = sum(buffer_lengths)
 
@@ -825,9 +843,9 @@ class LegacyDejaQueue(ByteFIFO):
             buffers = []
             offset = 0
             for length in buffer_lengths:
-                buffers.append(pickle.PickleBuffer(array_bytes[offset : offset + length]))
+                buffers.append(_pickle_backend.PickleBuffer(array_bytes[offset : offset + length]))
                 offset += length
-            obj = pickle.loads(buffers[0], buffers=buffers[1:])
+            obj = _pickle_backend.loads(buffers[0], buffers=buffers[1:])
             return obj
 
         obj = super().get(copy=False, callback=callback, **kwargs)
