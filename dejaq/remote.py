@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import time
 import uuid
 import traceback
@@ -12,10 +13,16 @@ import weakref
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Dict, Tuple, List
 from types import ModuleType
+import threading
 
 import cloudpickle
 
-from dejaq.queues import DejaQueue
+
+from .queues import DejaQueue
+
+logging.basicConfig(
+    level=logging.INFO, format="%(processName)s %(levelname)s: %(message)s", stream=sys.stdout, force=True
+)
 
 
 @dataclass
@@ -37,7 +44,6 @@ class _Req:
     name: str
     args: tuple
     kwargs: dict
-    cloudpickle_result: bool = False  # <-- whether to serialize the result with cloudpickle
 
 
 @dataclass
@@ -66,8 +72,6 @@ class RemoteError(RuntimeError):
 
 
 # ============================== Server/worker loops ==============================
-
-
 def _actor_server(pkl: bytes) -> None:
     """Actor loop: instantiates `cls` and services _Req from a request queue.
 
@@ -76,10 +80,44 @@ def _actor_server(pkl: bytes) -> None:
     """
     cls, actor_args, actor_kwargs, req_name = cloudpickle.loads(pkl)
     req = DejaQueue(name=req_name, create=False)
+
+    def _start_loop(self, loop_fcn, n=None, rate=None):
+        """Start a background loop that calls _loop_this repeatedly.
+        Args:
+            n (int): Number of iterations to run. If None, runs indefinitely.
+            loop_fcn (str): Method to call in each iteration.
+            rate (float): Time in seconds to wait between iterations.
+        """
+        assert not (hasattr(self, "_looping") and self._looping), "Loop already started"
+        limiter = RateLimiter(rate)
+        self._looping = True
+        def _loop():
+            logging.info("Starting actor background loop")
+            k = 0
+            while self._looping:
+                limiter.wait()
+                res = getattr(self, loop_fcn)()
+                for callback in self._subscriptions.get(loop_fcn, []):
+                    callback(res)
+                k += 1
+                time.sleep(0)
+                if n is not None and k >= n:
+                    break
+            self._looping = False
+            logging.info("Stopping actor background loop")
+        threading.Thread(target=_loop, daemon=True).start()
+
+    cls._subscriptions = dict()
+    cls._looping = False
+    cls._start_loop = _start_loop
+    cls._stop_loop = lambda self: setattr(self, "_looping", False)
+
     if isinstance(cls, ModuleType):
         obj = cls
     else:
         obj = cls(*actor_args, **actor_kwargs)
+
+    logging.info(f"Actor server started. ID: {req_name}, instance: {type(obj)}")
 
     rep_cache: Dict[str, DejaQueue] = {}
 
@@ -120,6 +158,7 @@ def _actor_server(pkl: bytes) -> None:
         msg: _Req = req.get()  # blocking
         if msg.kind == "shutdown":
             _maybe_reply(msg, _Rep(msg.call_id, True, None))
+            logging.info(f"Actor server shutdown. ID: {req_name}, instance: {type(obj)}")
             break
         try:
             if msg.kind == "ping":
@@ -127,8 +166,8 @@ def _actor_server(pkl: bytes) -> None:
                 _maybe_reply(msg, _Rep(msg.call_id, True, out))
             elif msg.kind == "call":
                 out = getattr(obj, msg.name)(*msg.args, **msg.kwargs)
-                if msg.cloudpickle_result:
-                    out = cloudpickle.dumps(out)
+                for callback in obj._subscriptions.get(msg.name, []):
+                    callback(out)
                 _maybe_reply(msg, _Rep(msg.call_id, True, out))
             elif msg.kind == "getattr":
                 out = getattr(obj, msg.name)
@@ -284,7 +323,6 @@ class _RemoteMethod:
         *args,
         timeout: Optional[float] = None,
         noreply: bool = False,
-        _use_cloudpickle=False,
         _ensure_open=False,
         **kwargs,
     ):
@@ -310,13 +348,12 @@ class _RemoteMethod:
             args,
             kwargs,
             expect_reply=not noreply,
-            _use_cloudpickle=_use_cloudpickle,
         )
         if noreply:
             return None
         rep = self._actor._mbox.wait(cid, timeout)
         if rep.ok:
-            return rep.payload if not _use_cloudpickle else cloudpickle.loads(rep.payload)
+            return rep.payload
         et, ea, tb = rep.payload
         raise RemoteError(et, ea, tb)
 
@@ -324,8 +361,28 @@ class _RemoteMethod:
         """Convenience: fire-and-forget call (equivalent to noreply=True)."""
         self(*args, noreply=True, **kwargs)
 
+    def get_subscriptions(self) -> List[Callable]:
+        """Return the list of registered subscriber callbacks for this method."""
+        return self._actor._subscriptions.get(self._name, [])
+    
+    def set_subscriptions(self, subs: List[Callable]) -> None:
+        """Set the list of registered subscriber callbacks for this method."""
+        _subscriptions = self._actor._subscriptions
+        _subscriptions.update({self._name: subs})
+        self._actor._subscriptions = _subscriptions
+
+    def add_subscription(self, fcn: Callable) -> None:
+        """Register a callback to be invoked with the method's return value after each call.
+
+        Args:
+          fcn: Callable with signature `fcn(result)`.
+        """
+        sub_list = self.get_subscriptions()
+        sub_list.append(fcn)
+        self.set_subscriptions(sub_list)
+
     def __repr__(self) -> str:
-        return f"<RemoteMethod {self._name}>"
+        return f"<RemoteMethod {self._name}{f" with {len(self.get_subscriptions())} subscription(s)" if self.get_subscriptions() else ""}>"
 
     __doc__ = "Remote method; call to execute in the actor process."
 
@@ -353,12 +410,11 @@ class Actor:
         self._req = DejaQueue(buffer_bytes=buffer_bytes, name=base + "_req", create=True)  # requests
         ctx = mp.get_context(start_method)
         pkl = cloudpickle.dumps((cls, args, kwargs, self._req._base))
-        logging.info(f"args: {args}, kwargs: {kwargs}, base: {base}")
         ps = [ctx.Process(target=_actor_server, args=(pkl,)) for _ in range(1)]
         [p.start() for p in ps]
-        logging.info(f"Actor: started process with PID {[p.pid for p in ps]}")
         self._proc_meta = [{"pid": p.pid, "create_time": psutil.Process(p.pid).create_time()} for p in ps]
         self._cache = {}  # Cache for resolved remote methods/attributes
+        self._cls_name = cls.__name__ if hasattr(cls, "__name__") else repr(cls)
 
     # --- internals ---
     def is_proc_alive(self, _proc_meta) -> bool:
@@ -385,11 +441,10 @@ class Actor:
         kwargs: dict,
         *,
         expect_reply: bool = True,
-        _use_cloudpickle: bool = False,
     ) -> str:
         cid = uuid.uuid4().hex
         reply = self._rep._base if expect_reply else None
-        self._req.put(_Req(cid, reply, kind, name, args, kwargs, cloudpickle_result=_use_cloudpickle))
+        self._req.put(_Req(cid, reply, kind, name, args, kwargs))
         return cid
 
     # --- dynamic attribute/method resolution ---
@@ -405,7 +460,7 @@ class Actor:
           AttributeError: If the remote object has no such attribute.
           RemoteError: If the remote getattr/resolve raised.
         """
-        if name.startswith("_") and name != "__call__":
+        if name.startswith("_") and name not in ["__call__", "_subscriptions", "_start_loop", "_stop_loop"]:
             raise AttributeError(name)
 
         # Check cache first
@@ -444,7 +499,7 @@ class Actor:
             et, ea, tb = rep.payload
             raise RemoteError(et, ea, tb)
         value = rep.payload
-        self._cache[name] = value
+        # self._cache[name] = value
         return value
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -455,9 +510,12 @@ class Actor:
 
         Private names (starting with "_") are set locally on the proxy.
         """
-        if name.startswith("_"):
+        if name.startswith("_") and name not in ["_subscriptions"]:
             object.__setattr__(self, name, value)
             return
+
+        self._cache.pop(name, None)  # invalidate cache
+
         cid = self._send("setattr", name, (), {"value": value}, expect_reply=True)
         rep = self._mbox.wait(cid, timeout=2.0)
         if not rep.ok:
@@ -511,6 +569,8 @@ class Actor:
     def __exit__(self, exc_type, exc, tb):
         self.close()
 
+    def __repr__(self) -> str:
+        return f"<Actor proxy (PID {[_['pid'] for _ in self._proc_meta]}) for instance of: {self._cls_name}>"
 
 class RemoteFunc:
     """Run a function in N worker processes (stateless pool).
@@ -653,3 +713,24 @@ class PickledObject:
 
     def load(self):
         return cloudpickle.loads(self._pkl)
+
+
+class RateLimiter:
+    """A rate limiter that enforces a minimum interval between calls."""
+
+    def __init__(self, rate):
+        """
+        Args:
+            rate (float): Maximum rate in Hz (calls per second). If None, no rate limiting is applied.
+        """
+        self.interval = 1.0 / rate if rate is not None else None
+        self.next_time = 0
+
+    def wait(self):
+        """Wait until the next allowed call time."""
+        if self.interval is None:
+            return
+        now = time.time()
+        if now < self.next_time:
+            time.sleep(self.next_time - now)
+        self.next_time = max(self.next_time, now) + self.interval
