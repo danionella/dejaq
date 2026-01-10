@@ -20,6 +20,9 @@ class _pickleall:
 
     def loads(*args, **kwargs):
         return pickle.loads(*args, **kwargs)
+    
+    def PickleBuffer(*args, **kwargs):
+        return pickle.PickleBuffer(*args, **kwargs)
 
 _pickle_backend = _pickleall
 
