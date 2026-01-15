@@ -108,6 +108,10 @@ def _actor_server(pkl: bytes) -> None:
         threading.Thread(target=_loop, daemon=True).start()
 
     cls._subscriptions = dict()
+    if "_idle_function" not in cls.__dict__:
+        cls._idle_function = None
+    if "_idle_timeout" not in cls.__dict__:
+        cls._idle_timeout = None
     cls._looping = False
     cls._start_loop = _start_loop
     cls._stop_loop = lambda self: setattr(self, "_looping", False)
@@ -155,7 +159,14 @@ def _actor_server(pkl: bytes) -> None:
         return {"names": names, "methods": methods, "attrs": attrs}
 
     while True:
-        msg: _Req = req.get()  # blocking
+        try: 
+            msg: _Req = req.get(timeout=obj._idle_timeout)  # blocking if _idle_timeout is None
+        except TimeoutError:
+            if obj._idle_function is not None:
+                res = getattr(obj, obj._idle_function)()
+                # for callback in obj._subscriptions.get(obj._idle_function, []):
+                #     callback(res)
+            continue
         if msg.kind == "shutdown":
             _maybe_reply(msg, _Rep(msg.call_id, True, None))
             logging.info(f"Actor server shutdown. ID: {req_name}, instance: {type(obj)}")
@@ -410,7 +421,7 @@ class Actor:
         self._req = DejaQueue(buffer_bytes=buffer_bytes, name=base + "_req", create=True)  # requests
         ctx = mp.get_context(start_method)
         pkl = cloudpickle.dumps((cls, args, kwargs, self._req._base))
-        ps = [ctx.Process(target=_actor_server, args=(pkl,)) for _ in range(1)]
+        ps = [ctx.Process(target=_actor_server, args=(pkl,), daemon=True) for _ in range(1)]
         [p.start() for p in ps]
         self._proc_meta = [{"pid": p.pid, "create_time": psutil.Process(p.pid).create_time()} for p in ps]
         self._cache = {}  # Cache for resolved remote methods/attributes
@@ -460,7 +471,7 @@ class Actor:
           AttributeError: If the remote object has no such attribute.
           RemoteError: If the remote getattr/resolve raised.
         """
-        if name.startswith("_") and name not in ["__call__", "_subscriptions", "_start_loop", "_stop_loop"]:
+        if name.startswith("_") and name not in ["__call__", "_subscriptions", "_start_loop", "_stop_loop", '_idle_function', '_idle_timeout']:
             raise AttributeError(name)
 
         # Check cache first
@@ -510,7 +521,7 @@ class Actor:
 
         Private names (starting with "_") are set locally on the proxy.
         """
-        if name.startswith("_") and name not in ["_subscriptions"]:
+        if name.startswith("_") and name not in ["_subscriptions", '_idle_function', '_idle_timeout']:
             object.__setattr__(self, name, value)
             return
 
@@ -704,15 +715,15 @@ def ActorDecorator(cls, **decorator_kwargs) -> Actor:
     return WrappedActor
 
 
-class PickledObject:
-    """Decorator to create a pickled object from a class definition."""
+# class PickledObject:
+#     """Decorator to create a pickled object from a class definition."""
 
-    def __init__(self, cls: type):
-        self._cls = cls
-        self._pkl = cloudpickle.dumps(cls)
+#     def __init__(self, cls: type):
+#         self._cls = cls
+#         self._pkl = cloudpickle.dumps(cls)
 
-    def load(self):
-        return cloudpickle.loads(self._pkl)
+#     def load(self):
+#         return cloudpickle.loads(self._pkl)
 
 
 class RateLimiter:
