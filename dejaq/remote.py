@@ -410,7 +410,7 @@ class Actor:
         self._req = DejaQueue(buffer_bytes=buffer_bytes, name=base + "_req", create=True)  # requests
         ctx = mp.get_context(start_method)
         pkl = cloudpickle.dumps((cls, args, kwargs, self._req._base))
-        ps = [ctx.Process(target=_actor_server, args=(pkl,)) for _ in range(1)]
+        ps = [ctx.Process(target=_actor_server, args=(pkl,), daemon=True) for _ in range(1)]
         [p.start() for p in ps]
         self._proc_meta = [{"pid": p.pid, "create_time": psutil.Process(p.pid).create_time()} for p in ps]
         self._cache = {}  # Cache for resolved remote methods/attributes
