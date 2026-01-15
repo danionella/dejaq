@@ -106,12 +106,30 @@ class NamedSemaphore:
             raise RuntimeError(f"WaitForSingleObject rc={rc}")
         else:
             import posix_ipc as P
-
-            try:
-                self._sem.acquire(timeout=None if timeout is None else float(timeout))
+            if timeout is None:
+                self._sem.acquire()
                 return True
-            except P.BusyError:
-                return False
+
+            timeout = max(0.0, float(timeout))
+
+            if P.SEMAPHORE_TIMEOUT_SUPPORTED:
+                try:
+                    self._sem.acquire(timeout=timeout)
+                    return True
+                except P.BusyError:
+                    return False
+            else: # polling hack for MACOS, which doesn't support timeout
+                deadline = time.monotonic() + timeout
+                sleep_s = 0.0005
+                while True:
+                    try: 
+                        self._sem.acquire(timeout=0)  # trywait
+                        return True
+                    except P.BusyError:
+                        if time.monotonic() >= deadline:
+                            return False
+                        time.sleep(sleep_s)
+                        sleep_s = min(0.01, sleep_s * 2)
 
     def release(self, n: int = 1) -> None:
         if _IS_WIN:
