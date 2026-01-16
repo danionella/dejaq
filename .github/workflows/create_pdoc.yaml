@@ -32,14 +32,14 @@ jobs:
       - name: Install pdoc
         run: |
           conda activate docs
-          conda install pdoc
+          pip install pdoc
       - name: Install dejaq
         run: |
           pip install .
       - name: Run pdoc
         run: |
           conda activate docs
-          pdoc --docformat google dejaq/ -o docs -t pdoc_templates
+          pdoc --docformat google dejaq/ -o docs #-t pdoc_templates
       - uses: actions/upload-pages-artifact@v3
         with:
           path: docs/

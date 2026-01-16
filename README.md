@@ -8,7 +8,7 @@
 
 A fast alternative to `multiprocessing.Queue`. Faster, because it takes advantage of a shared memory ring buffer (rather than slow pipes) and [pickle protocol 5 out-of-band data](https://peps.python.org/pep-0574/) to minimize copies. [`dejaq.DejaQueue`](#dejaqdejaqueue) supports any type of [picklable](https://docs.python.org/3/library/pickle.html#what-can-be-pickled-and-unpickled) Python object, including numpy arrays or nested dictionaries with mixed content.
 
-<img src="https://github.com/user-attachments/assets/00465436-47f8-4b2a-a236-d288ee34df28" width="100%">
+<img src="https://github.com/user-attachments/assets/837ca980-b225-45b7-8bf5-f0ce6cf7083c" width="100%">
 
 The speed advantage of `DejaQueue` becomes substantial for items of > 1 MB size. It enables efficient inter-job communication in big-data processing pipelines using [`dejaq.Actor`](#dejaqactor-and-actordecorator) or [`dejaq.stream`](#dejaqstream---building-data-pipelines).
 
@@ -18,7 +18,7 @@ The speed advantage of `DejaQueue` becomes substantial for items of > 1 MB size.
 - Zero-copy data transfer with pickle protocol 5 out-of-band data
 - Picklable queue instances (queue object itself can be passed between processes)
 - Peekable (non-destructive read)
-- Actor class for remote method calls and attribute access in a separate process (see [`dejaq.Actor`](#dejaqactor-and-actordecorator))
+- Actor class for remote method calls and attribute access in a separate process (see [dejaq.Actor](#dejaqactor-and-actordecorator))
 
 Auto-generated (minimal) API documentation: https://danionella.github.io/dejaq
 
@@ -31,7 +31,7 @@ Auto-generated (minimal) API documentation: https://danionella.github.io/dejaq
 - for development, clone this repository, navigate to the root directory and type `pip install -e .`
 
 ## Examples
-### `dejaq.DejaQueue`
+### dejaq.DejaQueue
 ```python
 import numpy as np
 from multiprocessing import Process
@@ -58,7 +58,7 @@ for c in consumers:
 producer.start()
 ```
 
-## `dejaq.Actor` and `ActorDecorator`
+## dejaq.Actor and ActorDecorator
 
 `dejaq.Actor` allows you to run a class instance in a separate process and call its methods or access its attributes remotely, as if it were local. This is useful for isolating heavy computations, stateful services, or legacy code in a separate process, while keeping a simple Pythonic interface.
 
@@ -113,9 +113,11 @@ greeter.close()
 - **Tab completion:** Works in Jupyter and most IDEs.
 
 
-## `dejaq.stream` - Building Data Pipelines
+## dejaq.stream - Building Data Pipelines
 
-The `dejaq.stream` module provides a declarative API for building efficient multi-process data pipelines. It enables you to chain operations like `map`, `tee`, and `zip` to create complex data flows with minimal boilerplate.
+The `dejaq.stream` module provides a declarative API for building efficient multi-process data pipelines. Each pipeline stage is a “node”, and nodes run their work in separate process(es), communicating through fast `DejaQueue`-backed channels.
+
+You can build nodes from either **functions** (executed in worker processes for each item) or **classes** (instantiated once inside a worker process, then called remotely for each item). This makes it easy to compose stateful processors (classes) and stateless transforms (functions) in the same pipeline.
 
 
 ### Simple self-explanatory example:
@@ -193,11 +195,22 @@ Split and combine streams:
 
 ```python
 stream1, stream2 = node.tee(count=2)                         # split into 2 independent streams
-combined = node1.zip(node2, node3)                           # yields (item1, item2, item3) tuples
+stream1_processed = stream1.map(fcn=lambda x: x * 2)
+recombined = stream1_processed.zip(stream2)     # yields (item1, item2) tuples
 ```
 
 > [!IMPORTANT]
 > When working with multiple sources or split streams, make sure to eventually consume all outputs.
+
+
+#### `.tqdm()`
+
+Add a progress bar:
+
+```python
+node = node.tqdm(desc="Processing items", total=1000)
+```
+
 
 #### `.sink(fcn=None, factory=None, ...)` and `.run()`
 
@@ -223,8 +236,55 @@ src.start()          # start a source (required for Source nodes)
 src.stop()           # signal cancellation
 node.is_running()    # check if node's workers are alive
 ```
+
+### Advanced Example with multiple branches and custom classes
+
+This example shows how to branch a stream with `tee()`, process each branch differently (one branch using a plain function, the other using a stateful class instantiated in a worker), and then recombine branches with `zip()`.
+
+```python
+import numpy as np
+from dejaq.stream import Source
+
+
+class RunningMean:
+    """Stateful processor: instantiated once inside a worker."""
+
+    def __init__(self):
+        self.n = 0
+        self.mean = 0.0
+
+    def __call__(self, x: float) -> dict:
+        self.n += 1
+        self.mean += (x - self.mean) / self.n
+        return {"x": x, "mean": self.mean}
+
+
+# Finite input source
+rng = np.random.default_rng(0)
+src = Source(it=rng.normal(size=1000))
+
+# Branch the stream
+a, b = src.tee(2)
+
+# Branch A: stateless function (runs per-item in worker processes)
+abs_x = a.map(fcn=lambda x: float(abs(x)), n_workers=4)
+
+# Branch B: stateful class (instantiated in a worker, then called per item)
+stats = b.map(cls=RunningMean, n_workers=1)
+
+# Recombine: primary drives output timing
+joined = abs_x.zip(stats, mode="sync")
+
+# Terminal sink: consume the stream (runs eagerly)
+sink = joined.sink(fcn=lambda pair: None)
+
+# Wait for the sink workers to finish consuming the finite source
+sink.wait()
+```
+
+
 <!--
-### `dejaq.Parallel`
+### dejaq.Parallel
 The following examples show how to use `dejaq.Parallel` to parallelize a function or a class, and how to create job pipelines.
 
 Here we execute a function and map iterable inputs across 10 workers. To enable pipelining, the results of each stage are provided as iterable generator. Use `.run()` (or `.compute()` for backwards compatibility) to get the final result. Results are always ordered.
