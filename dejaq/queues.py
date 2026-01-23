@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 import os, sys, time, gc, weakref, struct
 import multiprocessing as mp
 from multiprocessing import shared_memory
@@ -9,6 +10,8 @@ import dataclasses
 from typing import Any
 import numpy as np
 import array
+
+logger = logging.getLogger(__name__)
 
 class _pickleall:
     """Pickle backend that tries pickle first, then cloudpickle."""
@@ -59,7 +62,7 @@ class NamedSemaphore:
         initial: int = 0,
         maxcount: int | None = None,
         *,
-        auto_unlink: bool = False,
+        auto_unlink: bool = True,
     ) -> None:
         self.backend = "win32" if _IS_WIN else "posix"
         if _IS_WIN:
@@ -91,7 +94,8 @@ class NamedSemaphore:
             else:
                 self._sem = P.Semaphore(self.name)
         self._auto_unlink = bool(auto_unlink)
-        weakref.finalize(self, NamedSemaphore._finalize, self.backend, self.name, self._auto_unlink)
+        handle = self._h if _IS_WIN else self._sem
+        self._finalizer = weakref.finalize(self, NamedSemaphore._finalize, self.backend, self.name, self._auto_unlink, bool(create), handle)
 
     def acquire(self, timeout: float | None = None) -> bool:
         if _IS_WIN:
@@ -146,49 +150,52 @@ class NamedSemaphore:
                 self._sem.release()
 
     def close(self) -> None:
-        if _IS_WIN:
-            try:
-                __import__("win32event").CloseHandle(self._h)
-            except Exception:
-                pass
-        else:
-            try:
-                self._sem.close()
-            except Exception:
-                pass
+        self._finalizer()
 
     def unlink(self) -> None:
         if not _IS_WIN:
             import posix_ipc as P
-
             try:
                 P.unlink_semaphore(self.name)
             except Exception:
                 pass
 
     def __getstate__(self) -> dict:
-        return {"name": self.name, "backend": self.backend}
+        return {"name": self.name, "backend": self.backend, "auto_unlink": self._auto_unlink}
 
     def __setstate__(self, s: dict) -> None:
         self.__dict__.clear()
         self.backend = s["backend"]
-        self.__init__(s["name"], create=False)
+        auto_unlink = bool(s.get("auto_unlink", False))
+        self.__init__(s["name"], create=False, auto_unlink=auto_unlink)
 
     @staticmethod
-    def _finalize(backend: str, name: str, auto_unlink: bool) -> None:
-        if backend == "posix" and auto_unlink:
-            try:
-                import posix_ipc as P
-
-                P.unlink_semaphore(name)
-            except Exception:
-                pass
-
-    def __del__(self):
+    def _finalize(backend: str, name: str, auto_unlink: bool, owns: bool, handle: Any) -> None:
         try:
-            self.close()
+            if backend == "win32":
+                try:
+                    logger.debug(f"finalizer closing {name}")
+                    __import__("win32event").CloseHandle(handle)
+                except Exception:
+                    pass
+            else:
+                try:
+                    handle.close()
+                    logger.debug(f"finalizer closing {name}")
+                except Exception:
+                    pass
+                if auto_unlink and owns:
+                    try:
+                        import posix_ipc as P
+                        P.unlink_semaphore(name)
+                        logger.debug(f"finalizer unlinking {name}")
+                    except Exception:
+                        pass
         except Exception:
             pass
+
+    def __del__(self):
+        self._finalizer()
 
     def __enter__(self):
         self.acquire()
@@ -201,7 +208,7 @@ class NamedSemaphore:
 class NamedLock(NamedSemaphore):
     """Mutex from NamedSemaphore (maxcount=1). Detects over-release on POSIX."""
 
-    def __init__(self, name: str | None = None, create: bool = True, *, auto_unlink: bool = False) -> None:
+    def __init__(self, name: str | None = None, create: bool = True, *, auto_unlink: bool = True) -> None:
         super().__init__(name=name, create=create, initial=1, maxcount=1, auto_unlink=auto_unlink)
 
     def release(self) -> None:
@@ -239,13 +246,9 @@ class NamedByteRing:
         self._auto_unlink = bool(auto_unlink)
         # Shared state: head, tail, n_items, closed (0/1)
         st_name = ("NS_" + base) if _IS_WIN else base + "_S"
-        self._owns_state = False
+        self._owns = create
         if create:
-            try:
-                self._state_mem = shared_memory.SharedMemory(create=True, name=st_name, size=8 * 4)
-                self._owns_state = True
-            except FileExistsError:
-                self._state_mem = shared_memory.SharedMemory(name=st_name)
+            self._state_mem = shared_memory.SharedMemory(create=True, name=st_name, size=8 * 4)
         else:
             self._state_mem = shared_memory.SharedMemory(name=st_name)
         self._state = self._state_mem.buf.cast("q")
@@ -256,15 +259,10 @@ class NamedByteRing:
         # Data buffer
         buf_name = ("NB_" + base) if _IS_WIN else base + "_B"
         self.cap = buffer_bytes
-        self._owns_buf = False
         if create:
-            try:
-                self.buf = shared_memory.SharedMemory(name=buf_name, create=True, size=buffer_bytes)
-                self._owns_buf = True
-                _view = np.frombuffer(self.buf.buf, dtype="B", count=buffer_bytes)
-                _view[:] = 0
-            except FileExistsError:
-                self.buf = shared_memory.SharedMemory(name=buf_name, create=False)
+            self.buf = shared_memory.SharedMemory(name=buf_name, create=True, size=buffer_bytes)
+            _view = np.frombuffer(self.buf.buf, dtype="B", count=buffer_bytes)
+            _view[:] = 0
         else:
             self.buf = shared_memory.SharedMemory(name=buf_name, create=False)
         self._buf_name = buf_name
@@ -285,8 +283,7 @@ class NamedByteRing:
             NamedByteRing._finalize,
             self._state_name,
             self._buf_name,
-            self._owns_state,
-            self._owns_buf,
+            self._owns,
             self._auto_unlink,
         )
 
@@ -294,12 +291,12 @@ class NamedByteRing:
     def closed(self) -> bool:
         with self._state_lock:
             return bool(int(self._state[3]))
-        
+
     @closed.setter
     def closed(self, val: bool) -> None:
         with self._state_lock:
             self._state[3] = int(val)
-    
+
     @property
     def nitems(self) -> int:
         with self._state_lock:
@@ -311,7 +308,7 @@ class NamedByteRing:
             head = int(self._state[0])
             tail = int(self._state[1])
         return head == tail
-    
+
     @property
     def bytes_available(self) -> int:
         with self._state_lock:
@@ -408,39 +405,27 @@ class NamedByteRing:
 
     def close(self) -> None:
         """Close access to shared memory and semaphores."""
-        del self._state
-        gc.collect()
         try:
-            self._state_mem.close()
+            del self._state
+            gc.collect()
         except Exception:
             pass
-        try:
-            self.buf.close()
-        except Exception:
-            pass
-        self._put_lock.close()
-        self._get_lock.close()
-        self._items.close()
-        self._space_gate.close()
+        for obj in [self._state_mem, self.buf, self._put_lock, self._get_lock, self._state_lock, self._items, self._space_gate]:
+            try:
+                obj.close()
+            except Exception:
+                pass
 
     def unlink(self) -> None:
         """Unlink shared memory and semaphores. Only call after all processes are done using the queue."""
         del self._state
         gc.collect()
-        try:
-            if self._owns_state:
-                self._state_mem.unlink()
-        except Exception:
-            pass
-        try:
-            if self._owns_buf:
-                self.buf.unlink()
-        except Exception:
-            pass
-        self._put_lock.unlink()
-        self._get_lock.unlink()
-        self._items.unlink()
-        self._space_gate.unlink()
+        if self._owns:
+            for obj in [self._state_mem, self.buf, self._put_lock, self._get_lock, self._state_lock, self._items, self._space_gate]:
+                try:
+                    obj.unlink()
+                except Exception:
+                    pass
 
     def __getstate__(self) -> dict:
         return {
@@ -468,35 +453,31 @@ class NamedByteRing:
         self._state_lock = NamedLock(s["locks"][2]["name"], create=False)
         self._items = NamedSemaphore(s["items"]["name"], create=False)
         self._space_gate = NamedSemaphore(s["space_gate"]["name"], create=False)
-        self._owns_state = False
-        self._owns_buf = False
+        self._owns = False
         self._auto_unlink = bool(s.get("auto_unlink", False))
         weakref.finalize(
             self,
             NamedByteRing._finalize,
             self._state_name,
             self._buf_name,
-            self._owns_state,
-            self._owns_buf,
+            self._owns,
             self._auto_unlink,
         )
 
     @staticmethod
-    def _finalize(state_name: str, buf_name: str, owns_state: bool, owns_buf: bool, auto_unlink: bool) -> None:
+    def _finalize(state_name: str, buf_name: str, owns: bool, auto_unlink: bool) -> None:
         gc.collect()
-        if not auto_unlink:
-            return
         try:
             shm = shared_memory.SharedMemory(name=state_name)
             shm.close()
-            if owns_state:
+            if owns and auto_unlink:
                 shm.unlink()
         except Exception:
             pass
         try:
             shm = shared_memory.SharedMemory(name=buf_name)
             shm.close()
-            if owns_buf:
+            if owns and auto_unlink:
                 shm.unlink()
         except Exception:
             pass
@@ -504,7 +485,11 @@ class NamedByteRing:
     def __del__(self):
         try:
             self.close()
-            self.unlink()
+        except Exception:
+            pass
+        try:
+            if self._auto_unlink and self._owns:
+                self.unlink()
         except Exception:
             pass
 
