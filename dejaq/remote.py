@@ -14,9 +14,9 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, Dict, Tuple, List
 from types import ModuleType
 import threading
+import signal
 
 import cloudpickle
-
 
 from .queues import DejaQueue
 
@@ -81,47 +81,18 @@ def _actor_server(pkl: bytes) -> None:
     cls, actor_args, actor_kwargs, req_name = cloudpickle.loads(pkl)
     req = DejaQueue(name=req_name, create=False)
 
-    def _start_loop(self, loop_fcn, n=None, rate=None):
-        """Start a background loop that calls _loop_this repeatedly.
-        Args:
-            n (int): Number of iterations to run. If None, runs indefinitely.
-            loop_fcn (str): Method to call in each iteration.
-            rate (float): Time in seconds to wait between iterations.
-        """
-        assert not (hasattr(self, "_looping") and self._looping), "Loop already started"
-        limiter = RateLimiter(rate)
-        self._looping = True
-        def _loop():
-            logging.info("Starting actor background loop")
-            k = 0
-            while self._looping:
-                limiter.wait()
-                res = getattr(self, loop_fcn)()
-                for callback in self._subscriptions.get(loop_fcn, []):
-                    callback(res)
-                k += 1
-                time.sleep(0)
-                if n is not None and k >= n:
-                    break
-            self._looping = False
-            logging.info("Stopping actor background loop")
-        threading.Thread(target=_loop, daemon=True).start()
-
-    cls._subscriptions = dict()
-    if "_idle_function" not in cls.__dict__:
-        cls._idle_function = None
-    if "_idle_timeout" not in cls.__dict__:
-        cls._idle_timeout = None
-    cls._looping = False
-    cls._start_loop = _start_loop
-    cls._stop_loop = lambda self: setattr(self, "_looping", False)
-
     if isinstance(cls, ModuleType):
         obj = cls
     else:
         obj = cls(*actor_args, **actor_kwargs)
 
-    logging.info(f"Actor server started. ID: {req_name}, instance: {type(obj)}")
+    cls_name = (
+        cls.__wrapped__.__name__
+        if hasattr(cls, "__wrapped__")
+        else (cls.__name__ if hasattr(cls, "__name__") else repr(cls))
+    )
+
+    logging.info(f"Actor server started. ID: {req_name}, instance: {cls_name}")
 
     rep_cache: Dict[str, DejaQueue] = {}
 
@@ -158,27 +129,26 @@ def _actor_server(pkl: bytes) -> None:
                 attrs.append(n)
         return {"names": names, "methods": methods, "attrs": attrs}
 
-    while True:
-        try: 
-            msg: _Req = req.get(timeout=obj._idle_timeout)  # blocking if _idle_timeout is None
-        except TimeoutError:
-            if obj._idle_function is not None:
-                res = getattr(obj, obj._idle_function)()
-                # for callback in obj._subscriptions.get(obj._idle_function, []):
-                #     callback(res)
-            continue
-        if msg.kind == "shutdown":
-            _maybe_reply(msg, _Rep(msg.call_id, True, None))
-            logging.info(f"Actor server shutdown. ID: {req_name}, instance: {type(obj)}")
-            break
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda signum, frame: stop.set())
+
+    while not stop.is_set():
         try:
-            if msg.kind == "ping":
+            try: 
+                _idle_timeout = getattr(obj, "_idle_timeout", None)
+                msg: _Req = req.get(timeout=_idle_timeout)  # blocking if _idle_timeout is None
+            except TimeoutError:
+                # if obj._idle_function is not None:
+                if getattr(obj, "_idle_function", None) is not None:
+                    res = getattr(obj, obj._idle_function)()
+                continue
+            if msg.kind == "shutdown":
+                break
+            elif msg.kind == "ping":
                 out = time.time()
                 _maybe_reply(msg, _Rep(msg.call_id, True, out))
             elif msg.kind == "call":
                 out = getattr(obj, msg.name)(*msg.args, **msg.kwargs)
-                for callback in obj._subscriptions.get(msg.name, []):
-                    callback(out)
                 _maybe_reply(msg, _Rep(msg.call_id, True, out))
             elif msg.kind == "getattr":
                 out = getattr(obj, msg.name)
@@ -213,8 +183,16 @@ def _actor_server(pkl: bytes) -> None:
         except BaseException as e:
             if msg.reply is not None:  # Only attempt to send the error back if a reply was requested
                 _maybe_reply(msg, _Rep(msg.call_id, False, (type(e).__name__, e.args, traceback.format_exc())))
+                logging.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
             else:  # else: swallow — caller explicitly opted out of replies
                 logging.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
+
+    try: 
+        if hasattr(obj, "close"):
+            obj.close()
+    except Exception as e:
+        logging.error(f"Actor server close() caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
+    logging.info(f"Actor server shutdown. ID: {req_name}, instance: {cls_name}")
 
 
 def _func_worker(fn_ser: Tuple[str, str] | Callable, req_name: str) -> None:
@@ -366,34 +344,15 @@ class _RemoteMethod:
         if rep.ok:
             return rep.payload
         et, ea, tb = rep.payload
+        logging.error(f"Remote method '{self._name}' of {self._actor.__repr__()} raised: {et}{ea}\n{tb}")
         raise RemoteError(et, ea, tb)
 
     def send(self, *args, **kwargs) -> None:
         """Convenience: fire-and-forget call (equivalent to noreply=True)."""
         self(*args, noreply=True, **kwargs)
 
-    def get_subscriptions(self) -> List[Callable]:
-        """Return the list of registered subscriber callbacks for this method."""
-        return self._actor._subscriptions.get(self._name, [])
-    
-    def set_subscriptions(self, subs: List[Callable]) -> None:
-        """Set the list of registered subscriber callbacks for this method."""
-        _subscriptions = self._actor._subscriptions
-        _subscriptions.update({self._name: subs})
-        self._actor._subscriptions = _subscriptions
-
-    def add_subscription(self, fcn: Callable) -> None:
-        """Register a callback to be invoked with the method's return value after each call.
-
-        Args:
-          fcn: Callable with signature `fcn(result)`.
-        """
-        sub_list = self.get_subscriptions()
-        sub_list.append(fcn)
-        self.set_subscriptions(sub_list)
-
     def __repr__(self) -> str:
-        return f"<RemoteMethod {self._name}{f" with {len(self.get_subscriptions())} subscription(s)" if self.get_subscriptions() else ""}>"
+        return f"<RemoteMethod {self._name} of {self._actor.__repr__()}>" 
 
     __doc__ = "Remote method; call to execute in the actor process."
 
@@ -425,7 +384,8 @@ class Actor:
         [p.start() for p in ps]
         self._proc_meta = [{"pid": p.pid, "create_time": psutil.Process(p.pid).create_time()} for p in ps]
         self._cache = {}  # Cache for resolved remote methods/attributes
-        self._cls_name = cls.__name__ if hasattr(cls, "__name__") else repr(cls)
+        self._cls_name = cls.__wrapped__.__name__ if hasattr(cls, "__wrapped__") else (cls.__name__ if hasattr(cls, "__name__") else repr(cls))
+        self._finalizer = weakref.finalize(self, Actor._finalize, ps)
 
     # --- internals ---
     def is_proc_alive(self, _proc_meta) -> bool:
@@ -472,7 +432,7 @@ class Actor:
           RemoteError: If the remote getattr/resolve raised.
         """
         if name.startswith("_") and name not in ["__call__", "_subscriptions", "_start_loop", "_stop_loop", '_idle_function', '_idle_timeout']:
-            raise AttributeError(name)
+            return object.__getattribute__(self, name)
 
         # Check cache first
         if name in self._cache:
@@ -562,17 +522,21 @@ class Actor:
         t2 = time.time()
         return {"out_ms": (t1 - t0) * 1000, "back_ms": (t2 - t1) * 1000, "total_ms": (t2 - t0) * 1000}
 
-    def close(self, timeout: float = 2.0) -> None:
+    @staticmethod
+    def _finalize(ps, timeout=1.0):
+        """Finalize actor by closing its process."""
+        for p in ps:
+            try:             
+                p.join(timeout)
+            except Exception:
+                logging.warning("Actor.close: join failed!")
+                os.kill(p.pid, signal.SIGINT)
+
+    def close(self, timeout: float = 1.0) -> None:
         """Gracefully stop the actor process."""
-        try:
-            cid = self._send("shutdown", "", (), {}, expect_reply=True)
-            _ = self._mbox.wait(cid, timeout)
-        except Exception:
-            logging.warning("Actor.close: graceful shutdown failed!")
-        # self._p.join(timeout)
-        # if self._p.is_alive():
-        #     self._p.terminate()
-        #     self._p.join()
+        cid = self._send("shutdown", "", (), {}, expect_reply=False)
+        if self._finalizer is not None:
+            self._finalizer()
 
     def __enter__(self):
         return self
@@ -582,6 +546,15 @@ class Actor:
 
     def __repr__(self) -> str:
         return f"<Actor proxy (PID {[_['pid'] for _ in self._proc_meta]}) for instance of: {self._cls_name}>"
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_finalizer'] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
 
 class RemoteFunc:
     """Run a function in N worker processes (stateless pool).
@@ -713,35 +686,3 @@ def ActorDecorator(cls, **decorator_kwargs) -> Actor:
         return Actor(cls, *args, **kwargs)
 
     return WrappedActor
-
-
-# class PickledObject:
-#     """Decorator to create a pickled object from a class definition."""
-
-#     def __init__(self, cls: type):
-#         self._cls = cls
-#         self._pkl = cloudpickle.dumps(cls)
-
-#     def load(self):
-#         return cloudpickle.loads(self._pkl)
-
-
-class RateLimiter:
-    """A rate limiter that enforces a minimum interval between calls."""
-
-    def __init__(self, rate):
-        """
-        Args:
-            rate (float): Maximum rate in Hz (calls per second). If None, no rate limiting is applied.
-        """
-        self.interval = 1.0 / rate if rate is not None else None
-        self.next_time = 0
-
-    def wait(self):
-        """Wait until the next allowed call time."""
-        if self.interval is None:
-            return
-        now = time.time()
-        if now < self.next_time:
-            time.sleep(self.next_time - now)
-        self.next_time = max(self.next_time, now) + self.interval
