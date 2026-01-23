@@ -1,3 +1,179 @@
+"""
+
+> [!NOTE]  
+> This is still a work in progress.
+
+## dejaq.stream - Building Data Pipelines
+
+The `dejaq.stream` module provides a declarative API for building efficient multi-process data pipelines. Each pipeline stage is a “node”, and nodes run their work in separate process(es), communicating through fast `DejaQueue`-backed channels.
+
+You can build nodes from either **functions** (executed in worker processes for each item) or **classes** (instantiated once inside a worker process, then called remotely for each item). This makes it easy to compose stateful processors (classes) and stateless transforms (functions) in the same pipeline.
+
+
+### Simple self-explanatory example:
+
+
+```python
+from dejaq.stream import Source
+import numpy as np
+from scipy.ndimage import gaussian_filter
+
+
+class CameraController:
+    def get_frame(self):
+        return np.random.randn(480, 640)
+
+class GaussianSmoother:
+    def __init__(self, sigma=2.0):
+        self.sigma = sigma
+        self.count = 0
+    
+    def __call__(self, frame):
+        self.count += 1
+        return gaussian_filter(frame, sigma=self.sigma)
+
+# Create a source that generates random frames at 30 fps
+src = Source(cls=CameraController, call_fcn=lambda cam: cam.get_frame(), rate=30)
+
+# Build a pipeline: preprocess -> detect -> save
+    
+pipeline = (
+    src 
+    .map(fcn = lambda frame: (frame - frame.min()) / (frame.max() - frame.min()), n_workers=4)  # normalize
+    .map(cls = lambda: GaussianSmoother(sigma=3.0))  # smooth with gaussian filter
+    .sink(fcn = lambda frame: print(f"Processed frame: mean={frame.mean():.3f}, std={frame.std():.3f}"))
+)
+
+# Start the source
+src.start()
+
+# Stop after some time
+import time
+time.sleep(5)
+src.stop()
+```
+
+> [!IMPORTANT]
+> Keep a reference to all source nodes. A bare expression like `Source(...).map(...).sink(...)` with no assignment can be garbage-collected immediately.
+
+### API Reference
+
+#### `Source(it=None, fcn=None, cls=None, call_fcn=..., init_kwargs=None, rate=None, ...)`
+
+Create a source node from an iterable, function, or class instance:
+
+```python
+Source(it=range(100))                                        # from iterable
+Source(fcn=lambda: get_data(), rate=30)                      # from function, rate-limited to 30 Hz
+Source(cls=Camera, call_fcn=lambda c: c.get_frame())         # from class instance
+Source()                                                     # manual source (use .put(some_data) and .stop())
+```
+
+#### `.map(fcn=None, cls=None, cls_fcn=..., init_kwargs=None, n_workers=1, ...)`
+
+Apply a function or class to each item:
+
+```python
+node.map(fcn=lambda x: x * 2, n_workers=4)                   # function with 4 workers
+node.map(cls=Processor)                                      # class (calls .__call__ on each item)
+node.map(cls=lambda: Proc(x=5), cls_fcn=lambda p, x: p.process(x))      # calls method "process" on each item
+```
+
+#### `.tee(count=2)` and `.zip(*nodes)`
+
+Split and combine streams:
+
+```python
+stream1, stream2 = node.tee(count=2)                         # split into 2 independent streams
+stream1_processed = stream1.map(fcn=lambda x: x * 2)
+recombined = stream1_processed.zip(stream2)     # yields (item1, item2) tuples
+```
+
+> [!IMPORTANT]
+> When working with multiple sources or split streams, make sure to eventually consume all outputs.
+
+
+#### `.tqdm()`
+
+Add a progress bar:
+
+```python
+node = node.tqdm(desc="Processing items", total=1000)
+```
+
+
+#### `.sink(fcn=None, factory=None, ...)` and `.run()`
+
+Consume the stream:
+
+```python
+# using sink nodes (source is typically started after creating the sink)
+pipeline.sink(fcn=lambda x: print(x))                            # terminal node, no output
+# ...
+src.start()
+
+# using .run() to collect results (source should be started before calling .run())
+src.start()
+results = pipeline.run()                                         # collect all results (blocking)
+```
+> [!IMPORTANT]
+> When collecting results using `.run()` (blocking call), make sure the upstream sources have already been started (e.g. with `src.start()`). The pattern is to first start all sources, then call `.run()` on the terminal node(s). For `.sink()`, the source is usually started after creating the sink node.
+
+#### Control methods
+
+```python
+src.start()          # start a source (required for Source nodes)
+src.stop()           # signal cancellation
+node.is_running()    # check if node's workers are alive
+```
+
+### Advanced Example with multiple branches and custom classes
+
+This example shows how to branch a stream with `tee()`, process each branch differently (one branch using a plain function, the other using a stateful class instantiated in a worker), and then recombine branches with `zip()`.
+
+```python
+import numpy as np
+from dejaq.stream import Source
+
+
+class RunningMean:
+    """Stateful processor: instantiated once inside a worker."""
+
+    def __init__(self):
+        self.n = 0
+        self.mean = 0.0
+
+    def __call__(self, x: float) -> dict:
+        self.n += 1
+        self.mean += (x - self.mean) / self.n
+        return {"x": x, "mean": self.mean}
+
+
+# Finite input source
+rng = np.random.default_rng(0)
+src = Source(it=rng.normal(size=1000))
+
+# Branch the stream
+a, b = src.tee(2)
+
+# Branch A: stateless function (runs per-item in worker processes)
+abs_x = a.map(fcn=lambda x: float(abs(x)), n_workers=4)
+
+# Branch B: stateful class (instantiated in a worker, then called per item)
+stats = b.map(cls=RunningMean, n_workers=1)
+
+# Recombine: primary drives output timing
+joined = abs_x.zip(stats, mode="sync")
+
+# Terminal sink: consume the stream (runs eagerly)
+sink = joined.sink(fcn=lambda pair: None)
+
+# Wait for the sink workers to finish consuming the finite source
+sink.wait()
+```
+"""
+
+
 import multiprocessing as mp
 import os
 import sys
