@@ -1,4 +1,4 @@
-"""
+'''
 
 > [!NOTE]  
 > This is still a work in progress.
@@ -171,7 +171,7 @@ sink = joined.sink(fcn=lambda pair: None)
 # Wait for the sink workers to finish consuming the finite source
 sink.wait()
 ```
-"""
+'''
 
 
 import multiprocessing as mp
