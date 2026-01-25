@@ -340,7 +340,10 @@ class _RemoteMethod:
         )
         if noreply:
             return None
-        rep = self._actor._mbox.wait(cid, timeout)
+        try: 
+            rep = self._actor._mbox.wait(cid, timeout)
+        except TimeoutError:
+            raise RemoteError("TimeoutError", (f"Timeout during call of method {self._name!r} of {self._actor._cls_name!r}",), "")
         if rep.ok:
             return rep.payload
         et, ea, tb = rep.payload
@@ -451,7 +454,10 @@ class Actor:
 
         # classify safely via resolve
         cid = self._send("resolve", name, (), {}, expect_reply=True)
-        rep = self._mbox.wait(cid, timeout=2.0)
+        try: 
+            rep = self._mbox.wait(cid, timeout=2.0)
+        except TimeoutError:
+            raise RemoteError("TimeoutError", (f"Timeout during resolve of attribute {name!r} of {self._cls_name!r}",), "")
         if not rep.ok:
             et, ea, tb = rep.payload
             raise RemoteError(et, ea, tb)
@@ -465,7 +471,10 @@ class Actor:
 
         # non-callable attribute: fetch its value (this may execute properties by design)
         cid = self._send("getattr", name, (), {}, expect_reply=True)
-        rep = self._mbox.wait(cid, timeout=2.0)
+        try:
+            rep = self._mbox.wait(cid, timeout=2.0)
+        except TimeoutError:
+            raise RemoteError("TimeoutError", (f"Timeout during getattr of attribute {name!r} of {self._cls_name!r}",), "")
         if not rep.ok:
             et, ea, tb = rep.payload
             raise RemoteError(et, ea, tb)
@@ -488,7 +497,10 @@ class Actor:
         self._cache.pop(name, None)  # invalidate cache
 
         cid = self._send("setattr", name, (), {"value": value}, expect_reply=True)
-        rep = self._mbox.wait(cid, timeout=2.0)
+        try:
+            rep = self._mbox.wait(cid, timeout=2.0)
+        except TimeoutError:
+            raise RemoteError("TimeoutError", (f"Timeout during setattr of attribute {name!r} of {self._cls_name!r}",), "")
         if not rep.ok:
             et, ea, tb = rep.payload
             raise RemoteError(et, ea, tb)
