@@ -131,7 +131,7 @@ def _actor_server(pkl: bytes) -> None:
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda signum, frame: stop.set())
-
+    signal.signal(signal.SIGINT,  lambda signum, frame: stop.set())  # protect on Windows spawn
     while not stop.is_set():
         try:
             try: 
