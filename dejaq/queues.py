@@ -15,7 +15,7 @@ class _pickleall:
     def dumps(*args, **kwargs):
         try:
             return pickle.dumps(*args, **kwargs)
-        except pickle.PicklingError:
+        except (pickle.PicklingError, AttributeError):
             return cloudpickle.dumps(*args, **kwargs)
 
     def loads(*args, **kwargs):
