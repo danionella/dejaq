@@ -132,11 +132,15 @@ def _actor_server(pkl: bytes) -> None:
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda signum, frame: stop.set())
     signal.signal(signal.SIGINT,  lambda signum, frame: stop.set())  # protect on Windows spawn
+
+    msg: _Req | None = None
+    
     while not stop.is_set():
         try:
+            msg = None
             try: 
                 _idle_timeout = getattr(obj, "_idle_timeout", None)
-                msg: _Req = req.get(timeout=_idle_timeout)  # blocking if _idle_timeout is None
+                msg = req.get(timeout=_idle_timeout)  # blocking if _idle_timeout is None
             except TimeoutError:
                 # if obj._idle_function is not None:
                 if getattr(obj, "_idle_function", None) is not None:
@@ -181,11 +185,10 @@ def _actor_server(pkl: bytes) -> None:
             else:
                 raise ValueError(f"unknown kind {msg.kind!r}")
         except BaseException as e:
-            if msg.reply is not None:  # Only attempt to send the error back if a reply was requested
+            logging.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
+            if msg is not None and msg.reply is not None:
                 _maybe_reply(msg, _Rep(msg.call_id, False, (type(e).__name__, e.args, traceback.format_exc())))
-                logging.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
-            else:  # else: swallow — caller explicitly opted out of replies
-                logging.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
+
 
     try: 
         if hasattr(obj, "close"):
