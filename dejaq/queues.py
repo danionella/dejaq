@@ -244,16 +244,19 @@ class NamedByteRing:
         base = name or _safe_base("nq")
         self._base = base
         self._auto_unlink = bool(auto_unlink)
-        # Shared state: head, tail, n_items, closed (0/1)
+        # Shared state: head, tail, n_items, closed (0/1), cap
         st_name = ("NS_" + base) if _IS_WIN else base + "_S"
         self._owns = create
         if create:
-            self._state_mem = shared_memory.SharedMemory(create=True, name=st_name, size=8 * 4)
+            self._state_mem = shared_memory.SharedMemory(create=True, name=st_name, size=8 * 5)
         else:
             self._state_mem = shared_memory.SharedMemory(name=st_name)
         self._state = self._state_mem.buf.cast("q")
         if create:
-            self._state[0:4] = array.array("q", [0, 0, 0, 0])
+            self._state[0:5] = array.array("q", [0, 0, 0, 0, buffer_bytes])
+            self.cap = buffer_bytes
+        else:
+            self.cap = int(self._state[4])  # read cap stored by the creator
         self._state_name = st_name
 
         # Data buffer
@@ -264,7 +267,6 @@ class NamedByteRing:
             _view[:] = 0
         else:
             self.buf = shared_memory.SharedMemory(name=buf_name, create=False)
-        self.cap = self.buf.size  # use actual mapped size, not the parameter
         self._buf_name = buf_name
 
         # Sync: serialize producers/consumers + count items + wake producers
