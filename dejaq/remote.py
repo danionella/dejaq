@@ -6,10 +6,12 @@ import sys
 import time
 import uuid
 import traceback
+import warnings
 import psutil
 import inspect
 import multiprocessing as mp
 import weakref
+import numpy as np
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Dict, Tuple, List
 from types import ModuleType
@@ -133,61 +135,94 @@ def _actor_server(pkl: bytes) -> None:
     signal.signal(signal.SIGTERM, lambda signum, frame: stop.set())
     signal.signal(signal.SIGINT,  lambda signum, frame: stop.set())  # protect on Windows spawn
 
-    msg: _Req | None = None
-    
-    while not stop.is_set():
+    def _dispatch(msg: _Req):
+        """Called by req.get(callback=_dispatch) while shared memory is still pinned."""
+        ok = True
+        payload = None
+        shutdown = False
+
+        # snapshot refcounts of numpy array args so we can detect retained references
+        arrays = [a for a in msg.args if isinstance(a, np.ndarray)]
+        rcs_before = []
+        for _, a in enumerate(arrays):
+            rcs_before.append(sys.getrefcount(a))
+
         try:
-            msg = None
-            try: 
-                _idle_timeout = getattr(obj, "_idle_timeout", None)
-                msg = req.get(timeout=_idle_timeout)  # blocking if _idle_timeout is None
-            except TimeoutError:
-                # if obj._idle_function is not None:
-                if getattr(obj, "_idle_function", None) is not None:
-                    res = getattr(obj, obj._idle_function)()
-                continue
             if msg.kind == "shutdown":
-                break
+                shutdown = True
             elif msg.kind == "ping":
-                out = time.time()
-                _maybe_reply(msg, _Rep(msg.call_id, True, out))
+                payload = time.time()
             elif msg.kind == "call":
-                out = getattr(obj, msg.name)(*msg.args, **msg.kwargs)
-                _maybe_reply(msg, _Rep(msg.call_id, True, out))
+                payload = getattr(obj, msg.name)(*msg.args, **msg.kwargs)
             elif msg.kind == "getattr":
-                out = getattr(obj, msg.name)
-                _maybe_reply(msg, _Rep(msg.call_id, True, out))
+                payload = getattr(obj, msg.name)
             elif msg.kind == "setattr":
                 setattr(obj, msg.name, msg.kwargs.get("value"))
-                _maybe_reply(msg, _Rep(msg.call_id, True, True))
-            elif msg.kind == "resolve":  # classify *without* invoking descriptors/properties
+                payload = True
+            elif msg.kind == "resolve":
                 try:
                     v = inspect.getattr_static(obj, msg.name)
                 except AttributeError:
-                    try:  # Fallback to the unwrapped target (common for proxies)
+                    try:
                         v = inspect.getattr_static(inspect.unwrap(obj), msg.name)
                     except AttributeError:
-                        out = {"exists": False, "callable": False}
-                        _maybe_reply(msg, _Rep(msg.call_id, True, out))
-                        continue
+                        payload = {"exists": False, "callable": False}
+                        return msg.call_id, msg.reply, ok, payload, shutdown
                 if isinstance(v, (staticmethod, classmethod)):
                     v = v.__func__
                 is_prop = isinstance(v, property)
-                out = {
+                payload = {
                     "exists": True,
                     "callable": (callable(v) and not is_prop),
                     "signature": inspect.signature(v) if callable(v) else None,
                 }
-                _maybe_reply(msg, _Rep(msg.call_id, True, out))
             elif msg.kind == "dir":
-                out = _dir_payload()
-                _maybe_reply(msg, _Rep(msg.call_id, True, out))
+                payload = _dir_payload()
             else:
                 raise ValueError(f"unknown kind {msg.kind!r}")
         except BaseException as e:
             logging.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
-            if msg is not None and msg.reply is not None:
-                _maybe_reply(msg, _Rep(msg.call_id, False, (type(e).__name__, e.args, traceback.format_exc())))
+            ok = False
+            payload = (type(e).__name__, e.args, traceback.format_exc())
+
+        # warn if the user method retained a reference to a shared-memory-backed array
+        for i, a in enumerate(arrays):
+            rc = rcs_before[i]
+            extra = 1 if (payload is a) else 0
+            if sys.getrefcount(a) > rc + extra:
+                warnings.warn(
+                    f"Method {msg.name!r} retained a reference to a shared-memory input "
+                    "array. Call .copy() on any arrays you intend to keep beyond the call.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                break
+
+        return msg.call_id, msg.reply, ok, payload, shutdown
+
+    while not stop.is_set():
+        call_id = reply = None
+        try:
+            _idle_timeout = getattr(obj, "_idle_timeout", None)
+            try:
+                call_id, reply, ok, payload, shutdown = req.get(
+                    timeout=_idle_timeout, callback=_dispatch
+                )
+            except TimeoutError:
+                if getattr(obj, "_idle_function", None) is not None:
+                    getattr(obj, obj._idle_function)()
+                continue
+            if shutdown:
+                break
+            if reply is not None:
+                repq(reply).put(_Rep(call_id, ok, payload))
+        except BaseException as e:
+            logging.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
+            if call_id is not None and reply is not None:
+                try:
+                    repq(reply).put(_Rep(call_id, False, (type(e).__name__, e.args, traceback.format_exc())))
+                except Exception:
+                    pass
 
 
     try: 
