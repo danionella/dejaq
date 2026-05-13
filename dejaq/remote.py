@@ -20,9 +20,7 @@ import cloudpickle
 
 from .queues import DejaQueue
 
-logging.basicConfig(
-    level=logging.INFO, format="%(processName)s %(levelname)s: %(message)s", stream=sys.stdout, force=True
-)
+logging.basicConfig(level=logging.INFO, format="%(process)d %(levelname)s: %(message)s", stream=sys.stdout, force=True)
 
 
 @dataclass
@@ -81,12 +79,13 @@ def _actor_server(pkl: bytes) -> None:
     cls, actor_args, actor_kwargs, req_name = cloudpickle.loads(pkl)
     req = DejaQueue(name=req_name, create=False)
 
-    def _start_loop(self, loop_fcn, n=None, rate=None):
+    def _start_loop(self, loop_fcn, n=None, rate=None, **kwargs):
         """Start a background loop that calls _loop_this repeatedly.
         Args:
             n (int): Number of iterations to run. If None, runs indefinitely.
             loop_fcn (str): Method to call in each iteration.
             rate (float): Time in seconds to wait between iterations.
+            **kwargs: Keyword arguments to pass to loop_fcn
         """
         assert not (hasattr(self, "_looping") and self._looping), "Loop already started"
         limiter = RateLimiter(rate)
@@ -96,9 +95,12 @@ def _actor_server(pkl: bytes) -> None:
             k = 0
             while self._looping:
                 limiter.wait()
-                res = getattr(self, loop_fcn)()
+                res = getattr(self, loop_fcn)(**kwargs)
                 for callback in self._subscriptions.get(loop_fcn, []):
-                    callback(res)
+                    if isinstance(callback, _RemoteMethod):
+                        callback(res, noreply=True)
+                    else:
+                        callback(res)
                 k += 1
                 time.sleep(0)
                 if n is not None and k >= n:
@@ -117,7 +119,8 @@ def _actor_server(pkl: bytes) -> None:
     else:
         obj = cls(*actor_args, **actor_kwargs)
 
-    logging.info(f"Actor server started. ID: {req_name}, instance: {type(obj)}")
+    _cls_name = cls.__name__ if hasattr(cls, "__name__") else repr(cls)
+    logging.info(f"Started actor server (PID {os.getpid()}) for: {_cls_name}")
 
     rep_cache: Dict[str, DejaQueue] = {}
 
@@ -155,7 +158,11 @@ def _actor_server(pkl: bytes) -> None:
         return {"names": names, "methods": methods, "attrs": attrs}
 
     while True:
-        msg: _Req = req.get()  # blocking
+        try: 
+            msg: _Req = req.get()  # blocking
+        except BaseException as e:
+            logging.error(f"Actor server request fetch failed: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
+            raise e
         if msg.kind == "shutdown":
             _maybe_reply(msg, _Rep(msg.call_id, True, None))
             logging.info(f"Actor server shutdown. ID: {req_name}, instance: {type(obj)}")
@@ -167,7 +174,10 @@ def _actor_server(pkl: bytes) -> None:
             elif msg.kind == "call":
                 out = getattr(obj, msg.name)(*msg.args, **msg.kwargs)
                 for callback in obj._subscriptions.get(msg.name, []):
-                    callback(out)
+                    if isinstance(callback, _RemoteMethod):
+                        callback(out, noreply=True)
+                    else:
+                        callback(out)
                 _maybe_reply(msg, _Rep(msg.call_id, True, out))
             elif msg.kind == "getattr":
                 out = getattr(obj, msg.name)
@@ -201,6 +211,7 @@ def _actor_server(pkl: bytes) -> None:
                 raise ValueError(f"unknown kind {msg.kind!r}")
         except BaseException as e:
             if msg.reply is not None:  # Only attempt to send the error back if a reply was requested
+                logging.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
                 _maybe_reply(msg, _Rep(msg.call_id, False, (type(e).__name__, e.args, traceback.format_exc())))
             else:  # else: swallow — caller explicitly opted out of replies
                 logging.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
@@ -364,14 +375,14 @@ class _RemoteMethod:
     def get_subscriptions(self) -> List[Callable]:
         """Return the list of registered subscriber callbacks for this method."""
         return self._actor._subscriptions.get(self._name, [])
-    
+
     def set_subscriptions(self, subs: List[Callable]) -> None:
         """Set the list of registered subscriber callbacks for this method."""
         _subscriptions = self._actor._subscriptions
         _subscriptions.update({self._name: subs})
         self._actor._subscriptions = _subscriptions
 
-    def add_subscription(self, fcn: Callable) -> None:
+    def add_subscription(self, fcn: Callable, filter_none=True) -> None:
         """Register a callback to be invoked with the method's return value after each call.
 
         Args:
@@ -380,6 +391,20 @@ class _RemoteMethod:
         sub_list = self.get_subscriptions()
         sub_list.append(fcn)
         self.set_subscriptions(sub_list)
+
+    def loop(self, n = None, rate = None, **kwargs) -> None:
+        """Start a background loop that calls this method repeatedly.
+
+        Args:
+            n: Number of iterations to run. If None (default), runs indefinitely.
+            rate: Time in seconds to wait between iterations.
+            **kwargs: Keyword arguments to pass to the method.
+        """
+        self._actor._start_loop(self._name, n=n, rate=rate, **kwargs)
+
+    def stop_loop(self) -> None:
+        """Stop the background loop started by `loop()`."""
+        self._actor._stop_loop()
 
     def __repr__(self) -> str:
         return f"<RemoteMethod {self._name}{f" with {len(self.get_subscriptions())} subscription(s)" if self.get_subscriptions() else ""}>"
@@ -734,3 +759,105 @@ class RateLimiter:
         if now < self.next_time:
             time.sleep(self.next_time - now)
         self.next_time = max(self.next_time, now) + self.interval
+
+
+# ...existing code...
+# ...existing code...
+class ZipWorker:
+    """Flexible synchronization with standard reactive modes.
+
+    Args:
+        n_sources: Number of sources to synchronize.
+        mode: Synchronization strategy:
+            - "zip": Classical zip. Emits only when all sources have an item available (FIFO).
+                     Consumes 1 item from each source per emission.
+            - "combine_latest": Emits whenever ANY source yields an item.
+                     Uses the latest seen value from other sources. No buffering.
+            - "sample": Emits whenever the PRIMARY source (0) yields an item.
+                     Uses the latest seen value from other sources. No buffering.
+            - "batch": Emits on primary source arrival, flushing all buffered items (tuple of lists).
+        maxlen: Maximum buffer size per source (ignored for 'combine_latest' and 'sample').
+    """
+
+    def __init__(self, n_sources=2, mode="zip", maxlen=100):
+        valid_modes = ["zip", "combine_latest", "sample", "batch"]
+        assert mode in valid_modes, f"mode must be one of {valid_modes}"
+
+        self.n_sources = n_sources
+        self.mode = mode
+        self.maxlen = maxlen
+
+        # Initialize full state for consistency; usage depends on mode
+        self.buffers = [[] for _ in range(n_sources)]
+        self.latest = [None] * n_sources
+        self.has_data = [False] * n_sources
+        self.counters = [0 for _ in range(n_sources)]
+        self.output_subscriptions = []
+
+    def receive(self, item, source_id):
+        self.counters[source_id] += 1
+
+        # 1. Update Mode-Specific State
+        if self.mode in ["zip", "batch"]:
+            # Queue-based modes: accumulate in buffers, ignore 'latest' (avoids double reference)
+            if len(self.buffers[source_id]) >= self.maxlen:
+                if self.mode == "zip":
+                    logging.warning(f"ZipWorker buffer {source_id} full. Dropping oldest.")
+                self.buffers[source_id].pop(0)
+            self.buffers[source_id].append(item)
+        else:
+            # Snapshot-based modes: update latest value, ignore buffers
+            self.latest[source_id] = item
+            self.has_data[source_id] = True
+
+        # 2. Check Emission Logic based on Mode
+        result = None
+
+        if self.mode == "zip":
+            # Wait for ALL sources to have at least one item
+            if all(len(b) > 0 for b in self.buffers):
+                result = tuple(b.pop(0) for b in self.buffers)
+
+        elif self.mode == "combine_latest":
+            # Emit on ANY arrival, if we have data from all sources
+            if all(self.has_data):
+                result = tuple(self.latest)
+
+        elif self.mode == "sample":
+            # Emit on PRIMARY (0) arrival only
+            if source_id == 0 and all(self.has_data):
+                result = tuple(self.latest)
+
+        elif self.mode == "batch":
+            # Emit on PRIMARY, flush everything accumulated
+            if source_id == 0:
+                result = tuple(self.buffers[i][:] for i in range(self.n_sources))
+                self.buffers = [[] for _ in range(self.n_sources)]
+
+        # 3. Emit if generated
+        if result is not None:
+            for callback in self.output_subscriptions:
+                if isinstance(callback, _RemoteMethod):
+                    callback(result, noreply=True)
+                else:
+                    callback(result)
+            return result
+
+        return None
+
+    def add_subscription(self, fcn):
+        self.output_subscriptions.append(fcn)
+
+
+def Zip(n_sources=2, mode="zip", maxlen=100) -> Actor:
+    """Factory for a ZipWorker.
+
+    Args:
+        n_sources: Number of input streams.
+        mode: "zip", "combine_latest", "sample", or "batch".
+        maxlen: Buffer limits.
+    """
+    actor = Actor(ZipWorker, n_sources=n_sources, mode=mode, maxlen=maxlen)
+    receive = actor.receive      
+    actor.source = [lambda x, sid=i: receive(x, source_id=sid, noreply=True) for i in range(n_sources)]
+    return actor
