@@ -40,7 +40,7 @@ jobs:
       #   run: |
       #     echo "cache_key=${{ runner.os }}-${{ matrix.python-version }}-$(date +'%Y-%V')" >> $GITHUB_OUTPUT
 
-      - uses: mamba-org/setup-micromamba@v2
+      - uses: mamba-org/setup-micromamba@v3
         with:
           environment-name: tests
           init-shell: >-
