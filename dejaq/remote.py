@@ -20,9 +20,21 @@ import cloudpickle
 
 from .queues import DejaQueue
 
-logging.basicConfig(
-    level=logging.INFO, format="%(processName)s %(levelname)s: %(message)s", stream=sys.stdout, force=True
-)
+def _configure_logging():
+    handlers = []
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None:
+            handlers.append(logging.StreamHandler(stream))
+    if not handlers:
+        handlers.append(logging.NullHandler())
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(processName)s %(levelname)s: %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+
+_configure_logging()
 
 
 @dataclass
@@ -72,19 +84,26 @@ class RemoteError(RuntimeError):
 
 
 # ============================== Server/worker loops ==============================
-def _actor_server(pkl: bytes) -> None:
+def _actor_server(pkl: bytes, ready_q=None) -> None:
     """Actor loop: instantiates `cls` and services _Req from a request queue.
 
     The server replies to the mailbox specified by each request's `reply`
     (skipped entirely if `reply` is None). Designed to be module-level for Windows 'spawn'.
     """
-    cls, actor_args, actor_kwargs, req_name = cloudpickle.loads(pkl)
-    req = DejaQueue(name=req_name, create=False)
+    try:
+        cls, actor_args, actor_kwargs, req_name = cloudpickle.loads(pkl)
+        req = DejaQueue(name=req_name, create=False)
 
-    if isinstance(cls, ModuleType):
-        obj = cls
-    else:
-        obj = cls(*actor_args, **actor_kwargs)
+        if isinstance(cls, ModuleType):
+            obj = cls
+        else:
+            obj = cls(*actor_args, **actor_kwargs)
+    except BaseException:
+        tb = traceback.format_exc()
+        logging.error(f"Actor server failed to start:\n{tb}")
+        if ready_q is not None:
+            ready_q.put(tb)
+        return
 
     cls_name = (
         cls.__wrapped__.__name__
@@ -92,6 +111,8 @@ def _actor_server(pkl: bytes) -> None:
         else (cls.__name__ if hasattr(cls, "__name__") else repr(cls))
     )
 
+    if ready_q is not None:
+        ready_q.put(None)  # signal successful startup to parent
     logging.info(f"Actor server started. ID: {req_name}, instance: {cls_name}")
 
     rep_cache: Dict[str, DejaQueue] = {}
@@ -385,9 +406,13 @@ class Actor:
         self._mbox = _Mailbox(self._rep)
         self._req = DejaQueue(buffer_bytes=buffer_bytes, name=base + "_req", create=True)  # requests
         ctx = mp.get_context(start_method)
+        ready_q = ctx.SimpleQueue()
         pkl = cloudpickle.dumps((cls, args, kwargs, self._req._base))
-        ps = [ctx.Process(target=_actor_server, args=(pkl,), daemon=True) for _ in range(1)]
+        ps = [ctx.Process(target=_actor_server, args=(pkl, ready_q), daemon=True) for _ in range(1)]
         [p.start() for p in ps]
+        result = ready_q.get()  # blocks until server signals ready or startup failure
+        if result is not None:
+            raise RuntimeError(f"Actor failed to start:\n{result}")
         self._proc_meta = [{"pid": p.pid, "create_time": psutil.Process(p.pid).create_time()} for p in ps]
         self._cache = {}  # Cache for resolved remote methods/attributes
         self._cls_name = cls.__wrapped__.__name__ if hasattr(cls, "__wrapped__") else (cls.__name__ if hasattr(cls, "__name__") else repr(cls))
