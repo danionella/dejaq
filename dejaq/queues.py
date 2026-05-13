@@ -258,13 +258,13 @@ class NamedByteRing:
 
         # Data buffer
         buf_name = ("NB_" + base) if _IS_WIN else base + "_B"
-        self.cap = buffer_bytes
         if create:
             self.buf = shared_memory.SharedMemory(name=buf_name, create=True, size=buffer_bytes)
             _view = np.frombuffer(self.buf.buf, dtype="B", count=buffer_bytes)
             _view[:] = 0
         else:
             self.buf = shared_memory.SharedMemory(name=buf_name, create=False)
+        self.cap = self.buf.size  # use actual mapped size, not the parameter
         self._buf_name = buf_name
 
         # Sync: serialize producers/consumers + count items + wake producers
