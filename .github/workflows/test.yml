@@ -43,14 +43,6 @@ jobs:
       - uses: conda-incubator/setup-miniconda@v4
         with:
           environment-name: tests
-          init-shell: >-
-            bash
-            powershell
-          # cache-downloads: true
-          # cache-downloads-key: "download-${{ runner.os }}-${{ matrix.python-version }}"
-          # cache-environment: false
-          # #cache-environment-key: "env-${{ steps.cachekey.outputs.cache_key }}"
-          post-cleanup: 'all'
       
       - name: Install dependencies
         run: |
