@@ -244,21 +244,23 @@ class NamedByteRing:
         base = name or _safe_base("nq")
         self._base = base
         self._auto_unlink = bool(auto_unlink)
-        # Shared state: head, tail, n_items, closed (0/1)
+        # Shared state: head, tail, n_items, closed (0/1), cap
         st_name = ("NS_" + base) if _IS_WIN else base + "_S"
         self._owns = create
         if create:
-            self._state_mem = shared_memory.SharedMemory(create=True, name=st_name, size=8 * 4)
+            self._state_mem = shared_memory.SharedMemory(create=True, name=st_name, size=8 * 5)
         else:
             self._state_mem = shared_memory.SharedMemory(name=st_name)
         self._state = self._state_mem.buf.cast("q")
         if create:
-            self._state[0:4] = array.array("q", [0, 0, 0, 0])
+            self._state[0:5] = array.array("q", [0, 0, 0, 0, buffer_bytes])
+            self.cap = buffer_bytes
+        else:
+            self.cap = int(self._state[4])  # read cap stored by the creator
         self._state_name = st_name
 
         # Data buffer
         buf_name = ("NB_" + base) if _IS_WIN else base + "_B"
-        self.cap = buffer_bytes
         if create:
             self.buf = shared_memory.SharedMemory(name=buf_name, create=True, size=buffer_bytes)
             _view = np.frombuffer(self.buf.buf, dtype="B", count=buffer_bytes)
