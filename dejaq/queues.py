@@ -407,7 +407,7 @@ class NamedByteRing:
         """Close access to shared memory and semaphores."""
         try:
             del self._state
-            gc.collect()
+            gc.collect(0)
         except Exception:
             pass
         for obj in [self._state_mem, self.buf, self._put_lock, self._get_lock, self._state_lock, self._items, self._space_gate]:
@@ -419,7 +419,7 @@ class NamedByteRing:
     def unlink(self) -> None:
         """Unlink shared memory and semaphores. Only call after all processes are done using the queue."""
         del self._state
-        gc.collect()
+        gc.collect(0)
         if self._owns:
             for obj in [self._state_mem, self.buf, self._put_lock, self._get_lock, self._state_lock, self._items, self._space_gate]:
                 try:
