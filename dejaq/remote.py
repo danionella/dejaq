@@ -364,8 +364,11 @@ class _RemoteMethod:
           timeout: Seconds to wait for the result; ignored if `noreply` is True.
           noreply: If True, fire-and-forget — do not request or wait for a reply.
           deepcopy: If True (default), args are deep-copied before the method runs,
-            so retained numpy arrays are safe. Set to False for zero-copy dispatch;
-            a RuntimeWarning is emitted if any array is retained beyond the call.
+            so retained numpy arrays are safe. Set to False for zero-copy dispatch:
+            args reference shared memory and are only valid during the call —
+            do not store, return, or otherwise retain them; call `.copy()` if
+            you need to keep the data. A RuntimeWarning is emitted if a retained
+            reference is detected.
 
         Returns:
           The remote return value (when noreply=False). Returns None when noreply=True.
@@ -413,8 +416,10 @@ class Actor:
       • Remote method calls: `a.method(x)`, `a.method_async(x)`, `a.method(..., noreply=True)`
       • Zero-copy dispatch via `a.method(arr, deepcopy=False)`: skip the default
         deep-copy of args. The actor method then receives numpy arrays viewing
-        shared memory; a RuntimeWarning is emitted if any are retained beyond
-        the call.
+        shared memory — they are only valid during the call. Do not store, return,
+        or otherwise retain them (the underlying buffer is reused once the call
+        returns); call `arr.copy()` if you need to keep the data. A
+        RuntimeWarning is emitted if a retained reference is detected.
       • Jupyter tab completion: `__dir__` merges local + remote names
 
     Args:
