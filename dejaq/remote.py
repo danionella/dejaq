@@ -143,11 +143,6 @@ def _actor_server(pkl: bytes) -> None:
         payload = None
         shutdown = False
 
-        # snapshot refcounts of numpy array args so we can detect retained references
-        # (only for zero-copy "call" requests; deepcopy=True and non-call kinds are exempt)
-        arrays = [] if (msg.deepcopy or msg.kind != "call") else [a for a in msg.args if isinstance(a, np.ndarray)]
-        rcs_before = [sys.getrefcount(arrays[i]) for i in range(len(arrays))]
-
         try:
             if msg.kind == "shutdown":
                 shutdown = True
@@ -156,7 +151,22 @@ def _actor_server(pkl: bytes) -> None:
             elif msg.kind == "call":
                 call_args = copy.deepcopy(msg.args) if msg.deepcopy else msg.args
                 call_kwargs = copy.deepcopy(msg.kwargs) if msg.deepcopy else msg.kwargs
+                if not msg.deepcopy:
+                    all_vals = (*msg.args, *msg.kwargs.values())
+                    arrays = [a for a in all_vals if isinstance(a, np.ndarray)]
+                    rcs_before = [sys.getrefcount(arrays[i]) for i in range(len(arrays))]
                 payload = getattr(obj, msg.name)(*call_args, **call_kwargs)
+                if not msg.deepcopy:
+                    for i in range(len(arrays)):
+                        extra = 1 if (payload is arrays[i]) else 0
+                        if sys.getrefcount(arrays[i]) > rcs_before[i] + extra:
+                            warnings.warn(
+                                f"Method {msg.name!r} retained a reference to a shared-memory "
+                                "input array. Call .copy() on any arrays you intend to keep beyond the call.",
+                                RuntimeWarning,
+                                stacklevel=2,
+                            )
+                            break
             elif msg.kind == "getattr":
                 payload = getattr(obj, msg.name)
             elif msg.kind == "setattr":
@@ -187,18 +197,6 @@ def _actor_server(pkl: bytes) -> None:
             logging.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
             ok = False
             payload = (type(e).__name__, e.args, traceback.format_exc())
-
-        # warn if the user method retained a reference to a shared-memory-backed array
-        for i in range(len(arrays)):
-            extra = 1 if (payload is arrays[i]) else 0
-            if sys.getrefcount(arrays[i]) > rcs_before[i] + extra:
-                warnings.warn(
-                    f"Method {msg.name!r} retained a reference to a shared-memory input "
-                    "array. Call .copy() on any arrays you intend to keep beyond the call.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                break
 
         return msg.call_id, msg.reply, ok, payload, shutdown
 
