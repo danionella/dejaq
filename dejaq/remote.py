@@ -144,8 +144,8 @@ def _actor_server(pkl: bytes) -> None:
         shutdown = False
 
         # snapshot refcounts of numpy array args so we can detect retained references
-        # (only needed for zero-copy calls; deepcopy=True args are already independent)
-        arrays = [] if msg.deepcopy else [a for a in msg.args if isinstance(a, np.ndarray)]
+        # (only for zero-copy "call" requests; deepcopy=True and non-call kinds are exempt)
+        arrays = [] if (msg.deepcopy or msg.kind != "call") else [a for a in msg.args if isinstance(a, np.ndarray)]
         rcs_before = [sys.getrefcount(arrays[i]) for i in range(len(arrays))]
 
         try:
