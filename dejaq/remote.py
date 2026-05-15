@@ -170,7 +170,10 @@ def _actor_server(pkl: bytes) -> None:
             elif msg.kind == "getattr":
                 payload = getattr(obj, msg.name)
             elif msg.kind == "setattr":
-                setattr(obj, msg.name, msg.kwargs.get("value"))
+                value = msg.kwargs.get("value")
+                if msg.deepcopy:
+                    value = copy.deepcopy(value)
+                setattr(obj, msg.name, value)
                 payload = True
             elif msg.kind == "resolve":
                 try:
