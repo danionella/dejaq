@@ -110,7 +110,7 @@ greeter.close()
 - **Remote method calls:** Call methods as if the object was local.
 - **Remote attribute access:** Get/set attributes of the remote object.
 - **Async support:** Call `method_async()` to get a `Future` for non-blocking calls.
-- **Zero-copy fast path:** Pass `deepcopy=False` to skip the default deep-copy of numpy array arguments (e.g. `actor.process(arr, deepcopy=False)`). The remote method then operates on numpy arrays viewing shared memory directly; a `RuntimeWarning` is emitted if any input array is retained beyond the call.
+- **Zero-copy fast path:** Pass `deepcopy=False` to skip the default deep-copy of numpy array arguments (e.g. `actor.process(arr, deepcopy=False)`). The remote method then operates on numpy arrays viewing shared memory directly — they are only valid for the duration of the call. **Do not** store them (`self.foo = arr`), return them, hand them to async/background work, or otherwise retain a reference: the underlying buffer is reused by the queue once the call returns and any retained view will be silently overwritten. If you need to keep the data, call `arr.copy()` first. A `RuntimeWarning` is emitted if a retained reference is detected.
 - **Tab completion:** Works in Jupyter and most IDEs.
 
 
