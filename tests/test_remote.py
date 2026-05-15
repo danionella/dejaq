@@ -100,3 +100,29 @@ def test_actor_numpy_deepcopy_false_warns_on_retention(capfd):
         assert result == 10.0
     out = capfd.readouterr()
     assert "RuntimeWarning" in out.err and "retain" in out.err
+
+
+class Storage:
+    def __init__(self):
+        self.data = None
+    def get_data(self):
+        return self.data
+
+
+def test_actor_setattr_numpy_array_is_independent_of_shared_memory(capfd):
+    """Setting an actor attribute to a numpy array must store an independent copy.
+
+    If the stored value were a view into the request queue's shared memory,
+    subsequent queue activity would silently corrupt the attribute, and the
+    SharedMemory destructor in the server would raise
+    `BufferError: cannot close exported pointers exist` on shutdown.
+    """
+    original = (np.arange(100, dtype=np.float32) * 7.0)
+    with Actor(Storage) as a:
+        a.data = original
+        retrieved = a.get_data()
+        np.testing.assert_array_equal(retrieved, original)
+    # On clean shutdown the server's SharedMemory should release cleanly.
+    out = capfd.readouterr()
+    assert "BufferError" not in out.err
+    assert "cannot close exported pointers" not in out.err
