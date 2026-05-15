@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import sys
@@ -46,6 +47,7 @@ class _Req:
     name: str
     args: tuple
     kwargs: dict
+    deepcopy: bool = True
 
 
 @dataclass
@@ -142,7 +144,8 @@ def _actor_server(pkl: bytes) -> None:
         shutdown = False
 
         # snapshot refcounts of numpy array args so we can detect retained references
-        arrays = [a for a in msg.args if isinstance(a, np.ndarray)]
+        # (only needed for zero-copy calls; deepcopy=True args are already independent)
+        arrays = [] if msg.deepcopy else [a for a in msg.args if isinstance(a, np.ndarray)]
         rcs_before = []
         for _, a in enumerate(arrays):
             rcs_before.append(sys.getrefcount(a))
@@ -153,7 +156,9 @@ def _actor_server(pkl: bytes) -> None:
             elif msg.kind == "ping":
                 payload = time.time()
             elif msg.kind == "call":
-                payload = getattr(obj, msg.name)(*msg.args, **msg.kwargs)
+                call_args = copy.deepcopy(msg.args) if msg.deepcopy else msg.args
+                call_kwargs = copy.deepcopy(msg.kwargs) if msg.deepcopy else msg.kwargs
+                payload = getattr(obj, msg.name)(*call_args, **call_kwargs)
             elif msg.kind == "getattr":
                 payload = getattr(obj, msg.name)
             elif msg.kind == "setattr":
@@ -350,6 +355,7 @@ class _RemoteMethod:
         *args,
         timeout: Optional[float] = None,
         noreply: bool = False,
+        deepcopy: bool = True,
         _ensure_open=False,
         **kwargs,
     ):
@@ -359,6 +365,9 @@ class _RemoteMethod:
           *args, **kwargs: Forwarded to the remote method.
           timeout: Seconds to wait for the result; ignored if `noreply` is True.
           noreply: If True, fire-and-forget — do not request or wait for a reply.
+          deepcopy: If True (default), args are deep-copied before the method runs,
+            so retained numpy arrays are safe. Set to False for zero-copy dispatch;
+            a RuntimeWarning is emitted if any array is retained beyond the call.
 
         Returns:
           The remote return value (when noreply=False). Returns None when noreply=True.
@@ -375,6 +384,7 @@ class _RemoteMethod:
             args,
             kwargs,
             expect_reply=not noreply,
+            deepcopy=deepcopy,
         )
         if noreply:
             return None
@@ -453,10 +463,11 @@ class Actor:
         kwargs: dict,
         *,
         expect_reply: bool = True,
+        deepcopy: bool = True,
     ) -> str:
         cid = uuid.uuid4().hex
         reply = self._rep._base if expect_reply else None
-        self._req.put(_Req(cid, reply, kind, name, args, kwargs))
+        self._req.put(_Req(cid, reply, kind, name, args, kwargs, deepcopy=deepcopy))
         return cid
 
     # --- dynamic attribute/method resolution ---
