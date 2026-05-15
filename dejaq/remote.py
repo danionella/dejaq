@@ -411,6 +411,10 @@ class Actor:
 
     Supports:
       • Remote method calls: `a.method(x)`, `a.method_async(x)`, `a.method(..., noreply=True)`
+      • Zero-copy dispatch via `a.method(arr, deepcopy=False)`: skip the default
+        deep-copy of args. The actor method then receives numpy arrays viewing
+        shared memory; a RuntimeWarning is emitted if any are retained beyond
+        the call.
       • Jupyter tab completion: `__dir__` merges local + remote names
 
     Args:
