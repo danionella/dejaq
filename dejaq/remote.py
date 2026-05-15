@@ -146,9 +146,7 @@ def _actor_server(pkl: bytes) -> None:
         # snapshot refcounts of numpy array args so we can detect retained references
         # (only needed for zero-copy calls; deepcopy=True args are already independent)
         arrays = [] if msg.deepcopy else [a for a in msg.args if isinstance(a, np.ndarray)]
-        rcs_before = []
-        for _, a in enumerate(arrays):
-            rcs_before.append(sys.getrefcount(a))
+        rcs_before = [sys.getrefcount(arrays[i]) for i in range(len(arrays))]
 
         try:
             if msg.kind == "shutdown":
@@ -191,10 +189,9 @@ def _actor_server(pkl: bytes) -> None:
             payload = (type(e).__name__, e.args, traceback.format_exc())
 
         # warn if the user method retained a reference to a shared-memory-backed array
-        for i, a in enumerate(arrays):
-            rc = rcs_before[i]
-            extra = 1 if (payload is a) else 0
-            if sys.getrefcount(a) > rc + extra:
+        for i in range(len(arrays)):
+            extra = 1 if (payload is arrays[i]) else 0
+            if sys.getrefcount(arrays[i]) > rcs_before[i] + extra:
                 warnings.warn(
                     f"Method {msg.name!r} retained a reference to a shared-memory input "
                     "array. Call .copy() on any arrays you intend to keep beyond the call.",
