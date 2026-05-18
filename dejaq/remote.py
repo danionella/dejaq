@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import sys
 import time
 import uuid
 import traceback
+import warnings
 import psutil
 import inspect
 import multiprocessing as mp
 import weakref
+import numpy as np
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Dict, Tuple, List
 from types import ModuleType
@@ -44,6 +47,7 @@ class _Req:
     name: str
     args: tuple
     kwargs: dict
+    deepcopy: bool = True
 
 
 @dataclass
@@ -133,61 +137,95 @@ def _actor_server(pkl: bytes) -> None:
     signal.signal(signal.SIGTERM, lambda signum, frame: stop.set())
     signal.signal(signal.SIGINT,  lambda signum, frame: stop.set())  # protect on Windows spawn
 
-    msg: _Req | None = None
-    
-    while not stop.is_set():
+    def _dispatch(msg: _Req):
+        """Called by req.get(callback=_dispatch) while shared memory is still pinned."""
+        ok = True
+        payload = None
+        shutdown = False
+
         try:
-            msg = None
-            try: 
-                _idle_timeout = getattr(obj, "_idle_timeout", None)
-                msg = req.get(timeout=_idle_timeout)  # blocking if _idle_timeout is None
-            except TimeoutError:
-                # if obj._idle_function is not None:
-                if getattr(obj, "_idle_function", None) is not None:
-                    res = getattr(obj, obj._idle_function)()
-                continue
             if msg.kind == "shutdown":
-                break
+                shutdown = True
             elif msg.kind == "ping":
-                out = time.time()
-                _maybe_reply(msg, _Rep(msg.call_id, True, out))
+                payload = time.time()
             elif msg.kind == "call":
-                out = getattr(obj, msg.name)(*msg.args, **msg.kwargs)
-                _maybe_reply(msg, _Rep(msg.call_id, True, out))
+                call_args = copy.deepcopy(msg.args) if msg.deepcopy else msg.args
+                call_kwargs = copy.deepcopy(msg.kwargs) if msg.deepcopy else msg.kwargs
+                if not msg.deepcopy:
+                    all_vals = (*msg.args, *msg.kwargs.values())
+                    arrays = [a for a in all_vals if isinstance(a, np.ndarray)]
+                    rcs_before = [sys.getrefcount(arrays[i]) for i in range(len(arrays))]
+                payload = getattr(obj, msg.name)(*call_args, **call_kwargs)
+                if not msg.deepcopy:
+                    for i in range(len(arrays)):
+                        extra = 1 if (payload is arrays[i]) else 0
+                        if sys.getrefcount(arrays[i]) > rcs_before[i] + extra:
+                            warnings.warn(
+                                f"Method {msg.name!r} retained a reference to a shared-memory "
+                                "input array. Call .copy() on any arrays you intend to keep beyond the call.",
+                                RuntimeWarning,
+                                stacklevel=2,
+                            )
+                            break
             elif msg.kind == "getattr":
-                out = getattr(obj, msg.name)
-                _maybe_reply(msg, _Rep(msg.call_id, True, out))
+                payload = getattr(obj, msg.name)
             elif msg.kind == "setattr":
-                setattr(obj, msg.name, msg.kwargs.get("value"))
-                _maybe_reply(msg, _Rep(msg.call_id, True, True))
-            elif msg.kind == "resolve":  # classify *without* invoking descriptors/properties
+                value = msg.kwargs.get("value")
+                if msg.deepcopy:
+                    value = copy.deepcopy(value)
+                setattr(obj, msg.name, value)
+                payload = True
+            elif msg.kind == "resolve":
                 try:
                     v = inspect.getattr_static(obj, msg.name)
                 except AttributeError:
-                    try:  # Fallback to the unwrapped target (common for proxies)
+                    try:
                         v = inspect.getattr_static(inspect.unwrap(obj), msg.name)
                     except AttributeError:
-                        out = {"exists": False, "callable": False}
-                        _maybe_reply(msg, _Rep(msg.call_id, True, out))
-                        continue
+                        payload = {"exists": False, "callable": False}
+                        return msg.call_id, msg.reply, ok, payload, shutdown
                 if isinstance(v, (staticmethod, classmethod)):
                     v = v.__func__
                 is_prop = isinstance(v, property)
-                out = {
+                payload = {
                     "exists": True,
                     "callable": (callable(v) and not is_prop),
                     "signature": inspect.signature(v) if callable(v) else None,
                 }
-                _maybe_reply(msg, _Rep(msg.call_id, True, out))
             elif msg.kind == "dir":
-                out = _dir_payload()
-                _maybe_reply(msg, _Rep(msg.call_id, True, out))
+                payload = _dir_payload()
             else:
                 raise ValueError(f"unknown kind {msg.kind!r}")
         except BaseException as e:
             logging.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
-            if msg is not None and msg.reply is not None:
-                _maybe_reply(msg, _Rep(msg.call_id, False, (type(e).__name__, e.args, traceback.format_exc())))
+            ok = False
+            payload = (type(e).__name__, e.args, traceback.format_exc())
+
+        return msg.call_id, msg.reply, ok, payload, shutdown
+
+    while not stop.is_set():
+        call_id = reply = None
+        try:
+            _idle_timeout = getattr(obj, "_idle_timeout", None)
+            try:
+                call_id, reply, ok, payload, shutdown = req.get(
+                    timeout=_idle_timeout, callback=_dispatch
+                )
+            except TimeoutError:
+                if getattr(obj, "_idle_function", None) is not None:
+                    getattr(obj, obj._idle_function)()
+                continue
+            if shutdown:
+                break
+            if reply is not None:
+                repq(reply).put(_Rep(call_id, ok, payload))
+        except BaseException as e:
+            logging.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
+            if call_id is not None and reply is not None:
+                try:
+                    repq(reply).put(_Rep(call_id, False, (type(e).__name__, e.args, traceback.format_exc())))
+                except Exception:
+                    pass
 
 
     try: 
@@ -315,6 +353,7 @@ class _RemoteMethod:
         *args,
         timeout: Optional[float] = None,
         noreply: bool = False,
+        deepcopy: bool = True,
         _ensure_open=False,
         **kwargs,
     ):
@@ -324,6 +363,12 @@ class _RemoteMethod:
           *args, **kwargs: Forwarded to the remote method.
           timeout: Seconds to wait for the result; ignored if `noreply` is True.
           noreply: If True, fire-and-forget — do not request or wait for a reply.
+          deepcopy: If True (default), args are deep-copied before the method runs,
+            so retained numpy arrays are safe. Set to False for zero-copy dispatch:
+            args reference shared memory and are only valid during the call —
+            do not store, return, or otherwise retain them; call `.copy()` if
+            you need to keep the data. A RuntimeWarning is emitted if a retained
+            reference is detected.
 
         Returns:
           The remote return value (when noreply=False). Returns None when noreply=True.
@@ -340,6 +385,7 @@ class _RemoteMethod:
             args,
             kwargs,
             expect_reply=not noreply,
+            deepcopy=deepcopy,
         )
         if noreply:
             return None
@@ -368,6 +414,12 @@ class Actor:
 
     Supports:
       • Remote method calls: `a.method(x)`, `a.method_async(x)`, `a.method(..., noreply=True)`
+      • Zero-copy dispatch via `a.method(arr, deepcopy=False)`: skip the default
+        deep-copy of args. The actor method then receives numpy arrays viewing
+        shared memory — they are only valid during the call. Do not store, return,
+        or otherwise retain them (the underlying buffer is reused once the call
+        returns); call `arr.copy()` if you need to keep the data. A
+        RuntimeWarning is emitted if a retained reference is detected.
       • Jupyter tab completion: `__dir__` merges local + remote names
 
     Args:
@@ -418,10 +470,11 @@ class Actor:
         kwargs: dict,
         *,
         expect_reply: bool = True,
+        deepcopy: bool = True,
     ) -> str:
         cid = uuid.uuid4().hex
         reply = self._rep._base if expect_reply else None
-        self._req.put(_Req(cid, reply, kind, name, args, kwargs))
+        self._req.put(_Req(cid, reply, kind, name, args, kwargs, deepcopy=deepcopy))
         return cid
 
     # --- dynamic attribute/method resolution ---
