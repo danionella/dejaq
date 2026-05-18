@@ -1,3 +1,8 @@
+import os
+import signal
+import time
+import multiprocessing as mp
+import psutil
 import pytest
 import numpy as np
 from dejaq.remote import Actor, ActorDecorator
@@ -126,3 +131,61 @@ def test_actor_setattr_numpy_array_is_independent_of_shared_memory(capfd):
     out = capfd.readouterr()
     assert "BufferError" not in out.err
     assert "cannot close exported pointers" not in out.err
+
+
+# ---- child-spawning and parent-death tests ----
+
+class Parent:
+    """Actor that itself spawns a child Actor during __init__."""
+    def __init__(self):
+        self._child = Actor(Counter, 0)
+
+    def inc_child(self):
+        return self._child.inc()
+
+    def close(self):
+        self._child.close()
+
+
+def test_actor_can_spawn_child_actor():
+    """Non-daemon actors must be able to spawn their own child actors."""
+    with Actor(Parent) as p:
+        assert p.inc_child() == 1
+        assert p.inc_child() == 2
+
+
+def _actor_creator(conn):
+    """Spawned by test_parent_death_kills_actor: creates an Actor and reports its PID."""
+    a = Actor(Counter, 0)
+    conn.send({"pid": a._proc_meta[0]["pid"],
+               "ctime": psutil.Process(a._proc_meta[0]["pid"]).create_time()})
+    time.sleep(60)  # stay alive until killed
+
+
+def test_parent_death_kills_actor():
+    """When the creating process is SIGKILL-ed, the actor process must also exit."""
+    ctx = mp.get_context("spawn")
+    parent_conn, child_conn = mp.Pipe(duplex=False)
+    p = ctx.Process(target=_actor_creator, args=(child_conn,), daemon=False)
+    p.start()
+    child_conn.close()
+
+    info = parent_conn.recv()   # wait for actor to be up
+    parent_conn.close()
+    actor_pid = info["pid"]
+    actor_ctime = info["ctime"]
+
+    os.kill(p.pid, signal.SIGKILL)
+    p.join(timeout=5)
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            pr = psutil.Process(actor_pid)
+            if pr.create_time() != actor_ctime or not pr.is_running():
+                break
+        except psutil.NoSuchProcess:
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail("actor outlived its creating process by more than 5 seconds")

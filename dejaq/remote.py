@@ -76,7 +76,7 @@ class RemoteError(RuntimeError):
 
 
 # ============================== Server/worker loops ==============================
-def _actor_server(pkl: bytes) -> None:
+def _actor_server(pkl: bytes, alive_r) -> None:
     """Actor loop: instantiates `cls` and services _Req from a request queue.
 
     The server replies to the mailbox specified by each request's `reply`
@@ -136,6 +136,19 @@ def _actor_server(pkl: bytes) -> None:
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda signum, frame: stop.set())
     signal.signal(signal.SIGINT,  lambda signum, frame: stop.set())  # protect on Windows spawn
+
+    def _watch_parent():
+        try:
+            alive_r.recv()  # blocks until parent closes its write end (on any kind of exit)
+        except (EOFError, OSError):
+            pass
+        stop.set()
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)  # interrupts sem_wait on POSIX; terminates on Windows
+        except OSError:
+            pass
+
+    threading.Thread(target=_watch_parent, daemon=True).start()
 
     def _dispatch(msg: _Req):
         """Called by req.get(callback=_dispatch) while shared memory is still pinned."""
@@ -438,8 +451,10 @@ class Actor:
         self._req = DejaQueue(buffer_bytes=buffer_bytes, name=base + "_req", create=True)  # requests
         ctx = mp.get_context(start_method)
         pkl = cloudpickle.dumps((cls, args, kwargs, self._req._base))
-        ps = [ctx.Process(target=_actor_server, args=(pkl,), daemon=True) for _ in range(1)]
+        self._alive_r, self._alive_w = ctx.Pipe(duplex=False)
+        ps = [ctx.Process(target=_actor_server, args=(pkl, self._alive_r), daemon=False) for _ in range(1)]
         [p.start() for p in ps]
+        self._alive_r.close()  # parent only needs the write end; child holds the read end
         self._proc_meta = [{"pid": p.pid, "create_time": psutil.Process(p.pid).create_time()} for p in ps]
         self._cache = {}  # Cache for resolved remote methods/attributes
         self._cls_name = cls.__wrapped__.__name__ if hasattr(cls, "__wrapped__") else (cls.__name__ if hasattr(cls, "__name__") else repr(cls))
@@ -592,13 +607,25 @@ class Actor:
 
     @staticmethod
     def _finalize(ps, timeout=1.0):
-        """Finalize actor by closing its process."""
+        """Finalize actor by closing its process, recursively killing any descendants on timeout."""
         for p in ps:
-            try:             
+            try:
                 p.join(timeout)
+                if p.is_alive():
+                    try:
+                        proc = psutil.Process(p.pid)
+                        descendants = proc.children(recursive=True)
+                        for d in [proc] + descendants:
+                            try: d.terminate()
+                            except psutil.NoSuchProcess: pass
+                        gone, alive = psutil.wait_procs([proc] + descendants, timeout=timeout)
+                        for d in alive:
+                            try: d.kill()
+                            except psutil.NoSuchProcess: pass
+                    except psutil.NoSuchProcess:
+                        pass
             except Exception:
-                logging.warning("Actor.close: join failed!")
-                os.kill(p.pid, signal.SIGINT)
+                logging.warning("Actor.close: finalize failed!")
 
     def close(self, timeout: float = 1.0) -> None:
         """Gracefully stop the actor process."""
@@ -618,6 +645,8 @@ class Actor:
     def __getstate__(self):
         state = self.__dict__.copy()
         state['_finalizer'] = None
+        state['_alive_w'] = None  # Connection not portable via cloudpickle; only the creating process owns it
+        state['_alive_r'] = None
         return state
 
     def __setstate__(self, state):
