@@ -119,10 +119,9 @@ def test_queue_mp_multiple_producers_consumers(QueueCls):
     p1.start()
     p2.start()
     c1.start()
-    time.sleep(1)
-    q._signal_stop()  # signal stop after both producers are done
     p1.join()
     p2.join()
+    q._signal_stop()  # signal stop after both producers are done
     c1.join()
     assert len(results) == len(items)
     assert sorted(list(results)) == sorted(items)

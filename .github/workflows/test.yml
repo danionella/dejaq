@@ -23,6 +23,10 @@ jobs:
       matrix:
         platform: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.12"]
+        include:
+          # free-threaded build: guards against Windows dependencies without cp314t wheels (e.g. pywin32)
+          - platform: windows-latest
+            python-version: "3.14t"
 
     defaults:
       run:
@@ -51,6 +55,10 @@ jobs:
       - name: Install package
         run: |
           pip install -e .
+
+      - name: Check interpreter
+        run: |
+          python -c "import sys; print(sys.version); ft = '${{ matrix.python-version }}'.endswith('t'); assert ft == (not getattr(sys, '_is_gil_enabled', lambda: True)()), 'wrong interpreter build'"
 
       # this runs the platform-specific tests declared in tox.ini
       - name: Test with pytest
