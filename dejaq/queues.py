@@ -1,6 +1,6 @@
 from __future__ import annotations
 import logging
-import errno, os, sys, time, gc, weakref, struct, threading
+import errno, os, sys, time, weakref, struct, threading
 import multiprocessing as mp
 from multiprocessing import shared_memory
 import pickle
@@ -113,6 +113,15 @@ if _IS_WIN:
     _ReleaseSemaphore = _kernel32.ReleaseSemaphore
     _ReleaseSemaphore.argtypes = [_W.HANDLE, _W.LONG, ctypes.POINTER(_W.LONG)]
     _ReleaseSemaphore.restype = _W.BOOL
+    _CreateMutexW = _kernel32.CreateMutexW
+    _CreateMutexW.argtypes = [ctypes.c_void_p, _W.BOOL, _W.LPCWSTR]
+    _CreateMutexW.restype = _W.HANDLE
+    _OpenMutexW = _kernel32.OpenMutexW
+    _OpenMutexW.argtypes = [_W.DWORD, _W.BOOL, _W.LPCWSTR]
+    _OpenMutexW.restype = _W.HANDLE
+    _ReleaseMutex = _kernel32.ReleaseMutex
+    _ReleaseMutex.argtypes = [_W.HANDLE]
+    _ReleaseMutex.restype = _W.BOOL
     _WaitForSingleObject = _winapi.WaitForSingleObject  # raises OSError on WAIT_FAILED
     _CloseHandle = _winapi.CloseHandle
 
@@ -120,6 +129,8 @@ if _IS_WIN:
     _WAIT_OBJECT_0 = _winapi.WAIT_OBJECT_0
     _WAIT_TIMEOUT = _winapi.WAIT_TIMEOUT
     _SEMAPHORE_MODIFY_STATE = 0x0002
+    _MUTEX_MODIFY_STATE = 0x0001
+    _WAIT_ABANDONED = 0x80  # mutex acquired, but its previous owner exited without releasing it
     _SYNCHRONIZE = 0x00100000
     _ERROR_TOO_MANY_POSTS = 298
     _ERROR_ALREADY_EXISTS = 183
@@ -141,7 +152,7 @@ if _IS_WIN:
         def get(self) -> int:
             h = self.value
             if not h:
-                raise ValueError("operation on closed NamedSemaphore")
+                raise ValueError("operation on closed lock or semaphore")
             return h
 
 
@@ -194,6 +205,163 @@ def _attach_shm(name: str, cls=shared_memory.SharedMemory) -> shared_memory.Shar
         return cls(name=name)
     finally:
         _untracked.active = False
+
+
+def _tracker(action: str, name: str, rtype: str) -> None:
+    """Register/unregister a POSIX resource with this process's multiprocessing resource tracker, which
+    removes still-registered resources when the process tree's main process ends (also after a crash)."""
+    from multiprocessing import resource_tracker
+
+    try:
+        getattr(resource_tracker, action)(name, rtype)
+    except Exception:  # crash cleanup is best effort
+        pass
+
+
+# POSIX lock files live in a fixed directory (not $TMPDIR, which may differ between processes): every
+# process must find the same file. On Linux /dev/shm is a tmpfs, like POSIX shared memory itself.
+_LOCK_DIR = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
+# glibc's shm_unlink(name) removes /dev/shm/<name>, so on Linux the resource tracker can clean up lock
+# files registered as shared memory after a crash. Elsewhere, files of crashed queues remain (empty).
+_LOCK_FILES_TRACKABLE = sys.platform.startswith("linux") and _LOCK_DIR == "/dev/shm"
+
+
+class _RobustLock:
+    """Cross-process mutex that the operating system releases when its holder dies, however it dies.
+
+    POSIX: flock() on a lock file. flock locks belong to an open file description, so each object opens its
+    own (and reopens it in a forked child, which would otherwise share the parent's), and a threading.Lock
+    serializes threads sharing one object. Windows: a named mutex (released on exit as "abandoned").
+
+    The lock itself does not report whether a previous holder died; callers that need to know keep a flag
+    in shared memory (see DejaQueue.get).
+    """
+
+    _posix_instances: "weakref.WeakSet[_RobustLock]" = weakref.WeakSet()
+
+    def __init__(self, name: str, create: bool = True, *, auto_unlink: bool = True) -> None:
+        self.name = name
+        self._owner_pid = os.getpid() if create else None
+        self._tracked = [False]  # shared with the finalizer: registered with the resource tracker (POSIX)
+        if _IS_WIN:
+            nm = _win_name(name)
+            ctypes.set_last_error(0)
+            if create:
+                h = _CreateMutexW(None, False, nm)
+                if h and ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
+                    _CloseHandle(h)
+                    raise FileExistsError(errno.EEXIST, "lock already exists", nm)
+            else:
+                h = _OpenMutexW(_SYNCHRONIZE | _MUTEX_MODIFY_STATE, False, nm)
+            if not h:
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._h = _WinHandle(h)
+            handle = self._h
+        else:
+            self.path = _RobustLock._path_for(name)
+            flags = os.O_RDWR | (os.O_CREAT | os.O_EXCL if create else 0)
+            self._fd = [os.open(self.path, flags, 0o600)]  # a box: replaced after fork
+            self._tlock = threading.Lock()
+            if create and auto_unlink and _LOCK_FILES_TRACKABLE:
+                _tracker("register", "/" + os.path.basename(self.path), "shared_memory")
+                self._tracked[0] = True
+            _RobustLock._posix_instances.add(self)
+            handle = self._fd
+        self._finalizer = weakref.finalize(
+            self, _RobustLock._finalize, handle, getattr(self, "path", None), self._owner_pid, auto_unlink, self._tracked
+        )
+
+    @staticmethod
+    def _path_for(name: str) -> str:
+        safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name.lstrip("/"))
+        return os.path.join(_LOCK_DIR, "dejaq." + safe + ".lock")
+
+    def acquire(self) -> None:
+        if _IS_WIN:
+            rc = _WaitForSingleObject(self._h.get(), _INFINITE)
+            if rc != _WAIT_OBJECT_0 and rc != _WAIT_ABANDONED:
+                raise RuntimeError(f"WaitForSingleObject rc={rc}")
+            return
+        self._tlock.acquire()
+        try:
+            _flock(self._fd[0], _LOCK_EX)
+        except BaseException:
+            self._tlock.release()
+            raise
+
+    def release(self) -> None:
+        if _IS_WIN:
+            if not _ReleaseMutex(self._h.get()):
+                raise RuntimeError("release of a lock that is not held")
+            return
+        _flock(self._fd[0], _LOCK_UN)
+        self._tlock.release()  # raises RuntimeError if the lock was not held
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *_):
+        self.release()
+
+    def close(self) -> None:
+        if _IS_WIN:
+            self._h.close()
+        else:
+            fd, self._fd[0] = self._fd[0], -1
+            if fd >= 0:
+                os.close(fd)
+
+    def unlink(self) -> None:
+        """Remove the lock's name (POSIX: its file). Holders of the lock are not affected."""
+        _RobustLock._unlink(getattr(self, "path", None), self._owner_pid, self._tracked)
+
+    @staticmethod
+    def _unlink(path, owner_pid, tracked) -> None:
+        if path is None:  # Windows: the mutex disappears with its last handle
+            return
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        if tracked[0] and owner_pid == os.getpid():
+            tracked[0] = False
+            _tracker("unregister", "/" + os.path.basename(path), "shared_memory")
+
+    @staticmethod
+    def _finalize(handle, path, owner_pid, auto_unlink, tracked) -> None:
+        try:
+            if _IS_WIN:
+                handle.close()
+            else:
+                fd, handle[0] = handle[0], -1
+                if fd >= 0:
+                    os.close(fd)
+            if auto_unlink and owner_pid == os.getpid():
+                _RobustLock._unlink(path, owner_pid, tracked)
+        except Exception:
+            pass
+
+    @classmethod
+    def _after_fork_in_child(cls) -> None:
+        # The child got copies of the parent's file descriptors, which share the parent's open file
+        # descriptions and hence its flock locks. Give every object its own again.
+        for lk in list(cls._posix_instances):
+            try:
+                old = lk._fd[0]
+                if old >= 0:
+                    lk._fd[0] = os.open(lk.path, os.O_RDWR)
+                    os.close(old)
+            except OSError:
+                pass
+            lk._tlock = threading.Lock()  # may have been held by another thread of the parent
+
+
+if not _IS_WIN:
+    import fcntl
+
+    _flock, _LOCK_EX, _LOCK_UN = fcntl.flock, fcntl.LOCK_EX, fcntl.LOCK_UN
+    os.register_at_fork(after_in_child=_RobustLock._after_fork_in_child)
 
 
 class NamedSemaphore:
@@ -270,9 +438,14 @@ class NamedSemaphore:
         self._auto_unlink = bool(auto_unlink)
         handle = self._h if _IS_WIN else self._sem
         # only the creating process unlinks automatically (not e.g. a forked child that inherited the object)
-        owner_pid = os.getpid() if create else None
+        self._owner_pid = owner_pid = os.getpid() if create else None
+        # POSIX semaphores outlive crashed processes: let the resource tracker remove them in that case
+        self._tracked = [bool(create and self._auto_unlink and not _IS_WIN)]
+        if self._tracked[0]:
+            _tracker("register", self.name, "semaphore")
         self._finalizer = weakref.finalize(
-            self, NamedSemaphore._finalize, self.backend, self.name, self._auto_unlink, owner_pid, handle
+            self, NamedSemaphore._finalize, self.backend, self.name, self._auto_unlink, owner_pid, handle,
+            self._tracked,
         )
 
     def acquire(self, timeout: float | None = None) -> bool:
@@ -288,10 +461,10 @@ class NamedSemaphore:
                 return False
             raise RuntimeError(f"WaitForSingleObject rc={rc}")
         else:
-            import posix_ipc as P
             if timeout is None:
                 self._sem.acquire()
                 return True
+            import posix_ipc as P
 
             timeout = max(0.0, float(timeout))
 
@@ -325,19 +498,31 @@ class NamedSemaphore:
                     raise RuntimeError("Over-release of NamedSemaphore") from err
                 raise err
         else:
+            sem = self._sem
+            if n == 1:
+                sem.release()
+                return
             for _ in range(int(n)):
-                self._sem.release()
+                sem.release()
 
     def close(self) -> None:
         self._finalizer()
 
     def unlink(self) -> None:
         if not _IS_WIN:
-            import posix_ipc as P
-            try:
-                P.unlink_semaphore(self.name)
-            except Exception:
-                pass
+            NamedSemaphore._unlink(self.name, self._owner_pid, self._tracked)
+
+    @staticmethod
+    def _unlink(name: str, owner_pid: int | None, tracked: list) -> None:
+        import posix_ipc as P
+
+        try:
+            P.unlink_semaphore(name)
+        except Exception:
+            pass
+        if tracked[0] and owner_pid == os.getpid():
+            tracked[0] = False
+            _tracker("unregister", name, "semaphore")
 
     def __getstate__(self) -> dict:
         return {"name": self.name, "backend": self.backend, "auto_unlink": self._auto_unlink}
@@ -349,7 +534,9 @@ class NamedSemaphore:
         self.__init__(s["name"], create=False, auto_unlink=auto_unlink)
 
     @staticmethod
-    def _finalize(backend: str, name: str, auto_unlink: bool, owner_pid: int | None, handle: Any) -> None:
+    def _finalize(
+        backend: str, name: str, auto_unlink: bool, owner_pid: int | None, handle: Any, tracked: list
+    ) -> None:
         try:
             if backend == "win32":
                 try:
@@ -364,12 +551,8 @@ class NamedSemaphore:
                 except Exception:
                     pass
                 if auto_unlink and owner_pid == os.getpid():
-                    try:
-                        import posix_ipc as P
-                        P.unlink_semaphore(name)
-                        logger.debug(f"finalizer unlinking {name}")
-                    except Exception:
-                        pass
+                    NamedSemaphore._unlink(name, owner_pid, tracked)
+                    logger.debug(f"finalizer unlinking {name}")
         except Exception:
             pass
 
@@ -407,6 +590,26 @@ class NamedLock(NamedSemaphore):
             raise RuntimeError("Over-release of NamedLock on POSIX")
 
 
+class _StateLock(NamedSemaphore):
+    """Internal mutex for short critical sections: like NamedLock, but releasing is a single operation
+    (no over-release probe on POSIX; Windows still enforces maxcount=1). Only for strictly paired use."""
+
+    def __init__(self, name: str | None = None, create: bool = True, *, auto_unlink: bool = True) -> None:
+        super().__init__(name=name, create=create, initial=1, maxcount=1, auto_unlink=auto_unlink)
+
+    if not _IS_WIN:
+
+        def release(self) -> None:
+            self._sem.release()
+
+        def __enter__(self):
+            self._sem.acquire()
+            return self
+
+        def __exit__(self, *_):
+            self._sem.release()
+
+
 class _SharedMemory(shared_memory.SharedMemory):
     """SharedMemory that owns the views derived from it and releases them in close().
 
@@ -434,9 +637,68 @@ class _SharedMemory(shared_memory.SharedMemory):
 #   _WAITERS counts producers registered as waiting for space (see DejaQueue.put).
 #   _MAGIC identifies the layout of this block and of the items in the ring: processes sharing a queue
 #   must run compatible dejaq versions, and a mismatch is reported instead of corrupting data.
-_HEAD, _TAIL, _NITEMS, _CLOSED, _CAP, _WAITERS, _MAGIC = range(7)
-_STATE_SLOTS = 7
-_STATE_MAGIC = 0x64656A61710002  # "dejaq" + format version 2 (version 1: 5 slots, 32-bit item lengths)
+#   _GET_CLAIM is set while the get lock's holder holds a claimed item (see DejaQueue.get).
+_HEAD, _TAIL, _NITEMS, _CLOSED, _CAP, _WAITERS, _MAGIC, _GET_CLAIM = range(8)
+_STATE_SLOTS = 8
+_STATE_MAGIC = 0x64656A61710003  # "dejaq" + format version 3 (1: dejaq <= 0.8; 2: without _GET_CLAIM)
+
+
+def _untrack_shm(shm) -> None:
+    """Keep a segment beyond this process: the resource tracker would otherwise remove it at exit."""
+    if not _IS_WIN:
+        _tracker("unregister", shm._name, "shared_memory")
+
+
+def _unlink_shm(shm, tracked: bool) -> None:
+    if _IS_WIN:  # the segment disappears with its last handle
+        return
+    if tracked:
+        try:
+            shm.unlink()  # also unregisters it from the resource tracker
+        except FileNotFoundError:
+            _tracker("unregister", shm._name, "shared_memory")
+    else:
+        import _posixshmem
+
+        try:
+            _posixshmem.shm_unlink(shm._name)
+        except FileNotFoundError:
+            pass
+
+
+class _RingResources:
+    """Everything one ring object holds open. close() and unlink() are idempotent; finalize() runs once the
+    ring object is gone (or the queue is used as a context manager): it closes everything, and in the
+    creating process of a queue with auto_unlink it also removes the names."""
+
+    def __init__(self, shms, others, owner_pid, auto_unlink: bool, shm_tracked: bool) -> None:
+        self.shms, self.others = list(shms), list(others)
+        self.owner_pid, self.auto_unlink, self.shm_tracked = owner_pid, auto_unlink, shm_tracked
+        self.unlinked = False
+
+    def close(self) -> None:
+        for obj in (*self.shms, *self.others):
+            try:
+                obj.close()  # _SharedMemory.close also releases the views derived from it
+            except Exception:
+                pass
+
+    def unlink(self) -> None:
+        if self.unlinked:
+            return
+        self.unlinked = True
+        for shm in self.shms:
+            _unlink_shm(shm, self.shm_tracked)
+        for obj in self.others:
+            try:
+                obj.unlink()
+            except Exception:
+                pass
+
+    def finalize(self) -> None:
+        self.close()
+        if self.auto_unlink and self.owner_pid == os.getpid():  # not in a forked child, nor an attacher
+            self.unlink()
 
 
 def _pack_header(lens) -> bytes:
@@ -445,16 +707,24 @@ def _pack_header(lens) -> bytes:
 
 
 class NamedByteRing:
-    """Manager/Condition-free ring buffer queue (bytes) with named semaphores.
+    """Manager/Condition-free ring buffer queue (bytes) in shared memory.
        Pickleable across independently started processes.
+
+    A queue keeps working when a process using it dies, even while holding the put or get lock (the
+    operating system releases those locks). An item whose consumer died while reading it is delivered again.
 
     Args:
         buffer_bytes (int): Size of the ring buffer in bytes.
         name (str | None): Base name for shared memory and semaphores. If None (default), a random unique name is generated.
         create (bool): If True (default), create new shared memory and semaphores; raises FileExistsError if a
             queue with this name exists. If False, open an existing queue.
-        auto_unlink (bool): If True (default), the creating process unlinks the shared memory and semaphores once
-            its queue object is gone. Other processes must not attach after that.
+        auto_unlink (bool): If True (default), the queue is removed once the creating process's queue object is
+            gone (or that process ends, also by crashing): processes already using it can continue, but no new
+            process can attach. If False, the queue persists until ``unlink()`` is called (POSIX; on Windows a
+            queue always exists exactly as long as some process has it open).
+
+    Can be used as a context manager: ``with DejaQueue() as q: ...`` closes it at the end (and removes it, if
+    this object created it with auto_unlink).
     """
 
     def __init__(
@@ -474,86 +744,111 @@ class NamedByteRing:
                 except FileExistsError:  # random name already taken: try another
                     if attempt == _CREATE_ATTEMPTS - 1:
                         raise
-        self._register_finalizer()
+        self._finalizer = weakref.finalize(self, self._res.finalize)
 
     @staticmethod
     def _names(base: str):
-        """Names of (state shm, buffer shm, [put lock, get lock, state lock, items, space gate]) for a base name."""
-        if _IS_WIN:
-            return "NS_" + base, "NB_" + base, [p + base for p in ("NLp_", "NLg_", "NLs_", "NI_", "NG_")]
-        return _shm_name(base + "_S"), _shm_name(base + "_B"), [base + s for s in ("_Lp", "_Lg", "_Ls", "_I", "_G")]
+        """Names of (state shm, buffer shm, [put lock, get lock], [state lock, items, space gate]) for a base name."""
+        if _IS_WIN:  # mutexes and semaphores share one namespace: distinct prefixes
+            return ("NS_" + base, "NB_" + base, ["NXp_" + base, "NXg_" + base],
+                    [p + base for p in ("NLs_", "NI_", "NG_")])
+        return (_shm_name(base + "_S"), _shm_name(base + "_B"), [base + "_Lp", base + "_Lg"],
+                [base + s for s in ("_Ls", "_I", "_G")])
 
-    def _create_sem(self, cls, name: str):
+    def _create_named(self, cls, name: str):
         try:
             return cls(name, create=True, auto_unlink=self._auto_unlink)
         except FileExistsError:
             if _IS_WIN:
                 raise
-        # POSIX semaphores outlive the processes that created them, e.g. after a crash. The caller has just
-        # created this queue's shared memory exclusively, so a semaphore under its name can only belong to a
-        # dead queue: replace it. (Processes still attached to the dead queue keep their own semaphore.)
-        import posix_ipc as P
+        # POSIX semaphores and lock files outlive the processes that created them, e.g. after a crash. The
+        # caller has just created this queue's shared memory exclusively, so a semaphore or lock file under
+        # its name can only belong to a dead queue: replace it. (Processes still attached to the dead queue
+        # keep their own.)
+        if cls is _RobustLock:
+            try:
+                os.unlink(_RobustLock._path_for(name))
+            except OSError:
+                pass
+        else:
+            import posix_ipc as P
 
-        try:
-            P.unlink_semaphore(_posix_name(name))
-        except P.ExistentialError:
-            pass
+            try:
+                P.unlink_semaphore(_posix_name(name))
+            except P.ExistentialError:
+                pass
         return cls(name, create=True, auto_unlink=self._auto_unlink)
 
     def _create(self, base: str, buffer_bytes: int) -> None:
-        st_name, buf_name, sem_names = self._names(base)
-        created = []  # cleaned up again if any step fails
+        st_name, buf_name, lock_names, sem_names = self._names(base)
+        shms, others = [], []  # removed again if any step fails
         try:
             state_mem = _SharedMemory(create=True, name=st_name, size=8 * _STATE_SLOTS)
-            created.append(state_mem)
+            shms.append(state_mem)
             buf = shared_memory.SharedMemory(name=buf_name, create=True, size=buffer_bytes)
-            created.append(buf)
+            shms.append(buf)
+            if not self._auto_unlink:
+                for shm in shms:
+                    _untrack_shm(shm)
             _view = np.frombuffer(buf.buf, dtype="B", count=buffer_bytes)
             _view[:] = 0
             del _view
-            sems = []
-            for cls, nm in zip((NamedLock, NamedLock, NamedLock, NamedSemaphore, NamedSemaphore), sem_names):
-                sems.append(self._create_sem(cls, nm))
-                created.append(sems[-1])
+            for nm in lock_names:
+                others.append(self._create_named(_RobustLock, nm))
+            for cls, nm in zip((_StateLock, NamedSemaphore, NamedSemaphore), sem_names):
+                others.append(self._create_named(cls, nm))
             state = state_mem.cast("q")
-            state[0:_STATE_SLOTS] = array.array("q", [0, 0, 0, 0, buffer_bytes, 0, _STATE_MAGIC])
+            state[0:_STATE_SLOTS] = array.array("q", [0, 0, 0, 0, buffer_bytes, 0, _STATE_MAGIC, 0])
         except BaseException:
-            for obj in reversed(created):
-                for step in (obj.unlink, obj.close):
-                    try:
-                        step()
-                    except Exception:
-                        pass
+            res = _RingResources(shms, others, os.getpid(), True, self._auto_unlink)
+            res.close()
+            res.unlink()
             raise
         self._base = base
         self._state_mem, self._state, self.buf, self.cap = state_mem, state, buf, buffer_bytes
         self._state_name, self._buf_name = st_name, buf_name
-        self._put_lock, self._get_lock, self._state_lock, self._items, self._space_gate = sems
+        self._put_lock, self._get_lock, self._state_lock, self._items, self._space_gate = others
         self._owns = True
-        self._creator_pid = os.getpid()
+        self._res = _RingResources(shms, others, os.getpid(), self._auto_unlink, self._auto_unlink)
 
     def _open(self, base: str) -> None:
-        st_name, buf_name, sem_names = self._names(base)
+        st_name, buf_name, lock_names, sem_names = self._names(base)
         self._base = base
-        self._state_mem = _attach_shm(st_name, cls=_SharedMemory)
-        state = self._state_mem.cast("q")
-        if len(state) < _STATE_SLOTS or state[_MAGIC] != _STATE_MAGIC:
-            raise RuntimeError(
-                f"Queue {base!r} was created by an incompatible dejaq version; "
-                "all processes sharing a queue must use the same dejaq version."
-            )
-        self._state = state
+        shms, others = [], []
+        try:
+            try:
+                shms.append(_attach_shm(st_name, cls=_SharedMemory))
+            except FileNotFoundError:
+                hint = (
+                    "on Windows, a queue exists only while some process has it open"
+                    if _IS_WIN
+                    else "with auto_unlink=True (the default), a queue is removed when its creating object is "
+                    "garbage-collected"
+                )
+                raise FileNotFoundError(
+                    errno.ENOENT, f"DejaQueue {base!r} does not exist (any more): {hint}. Keep it alive while "
+                    "processes attach."
+                ) from None
+            state = shms[0].cast("q")
+            if len(state) < _STATE_SLOTS or state[_MAGIC] != _STATE_MAGIC:
+                raise RuntimeError(
+                    f"Queue {base!r} was created by an incompatible dejaq version; "
+                    "all processes sharing a queue must use the same dejaq version."
+                )
+            shms.append(_attach_shm(buf_name))
+            for nm in lock_names:
+                others.append(_RobustLock(nm, create=False))
+            others.append(_StateLock(sem_names[0], create=False))
+            for nm in sem_names[1:]:
+                others.append(NamedSemaphore(nm, create=False))
+        except BaseException:
+            _RingResources(shms, others, None, False, False).close()
+            raise
+        self._state_mem, self._state, self.buf = shms[0], state, shms[1]
         self.cap = int(state[_CAP])  # read cap stored by the creator
-        self.buf = _attach_shm(buf_name)
         self._state_name, self._buf_name = st_name, buf_name
-        self._put_lock, self._get_lock, self._state_lock = (NamedLock(nm, create=False) for nm in sem_names[:3])
-        self._items, self._space_gate = (NamedSemaphore(nm, create=False) for nm in sem_names[3:])
-
-    def _register_finalizer(self) -> None:
-        owner_pid = self._creator_pid if self._owns else None
-        weakref.finalize(
-            self, NamedByteRing._finalize, self._state_name, self._buf_name, owner_pid, self._auto_unlink
-        )
+        self._put_lock, self._get_lock, self._state_lock, self._items, self._space_gate = others
+        self._res = _RingResources(shms, others, None, False, False)
 
     @property
     def closed(self) -> bool:
@@ -602,13 +897,14 @@ class NamedByteRing:
 
     def _purge_locked(self) -> None:
         """Caller holds put_lock and get_lock."""
+        self._state[_GET_CLAIM] = 0  # all claims are void (and an abandoned one needs no repair)
         with self._state_lock:
             self._state[_HEAD] = 0
             self._state[_TAIL] = 0
             self._state[_NITEMS] = 0
             while self._items.acquire(timeout=0):
                 pass
-            # a consumer that claimed an item before this purge sees NITEMS == 0 and waits again (see get)
+            # counts handed back later by waiting consumers are spare: they are dropped (see get)
             self._wake_producers()
 
     def _write_bytes(self, data, tail=None, write_tail=True) -> int:
@@ -653,75 +949,29 @@ class NamedByteRing:
         return out
 
     def close(self) -> None:
-        """Close access to shared memory and semaphores."""
-        try:
-            del self._state
-            gc.collect(0)
-        except Exception:
-            pass
-        for obj in [self._state_mem, self.buf, self._put_lock, self._get_lock, self._state_lock, self._items, self._space_gate]:
-            try:
-                obj.close()
-            except Exception:
-                pass
+        """Close this object's access to the queue (other objects and processes are not affected)."""
+        self._res.close()
 
     def unlink(self) -> None:
-        """Unlink shared memory and semaphores. Only call after all processes are done using the queue."""
-        del self._state
-        gc.collect(0)
-        if self._owns:
-            for obj in [self._state_mem, self.buf, self._put_lock, self._get_lock, self._state_lock, self._items, self._space_gate]:
-                try:
-                    obj.unlink()
-                except Exception:
-                    pass
+        """Remove the queue's names, so that no further process can attach. Processes that already use the
+        queue can continue. Any process may call this, e.g. to remove a queue created with auto_unlink=False."""
+        self._res.unlink()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._finalizer()  # close, and remove the queue if this object created it with auto_unlink
 
     def __getstate__(self) -> dict:
-        return {
-            "base": self._base,
-            "state_name": self._state_name,
-            "buf_name": self._buf_name,
-            "locks": (self._put_lock.__getstate__(), self._get_lock.__getstate__(), self._state_lock.__getstate__()),
-            "items": self._items.__getstate__(),
-            "space_gate": self._space_gate.__getstate__(),
-            "auto_unlink": self._auto_unlink,
-            "cap": self.cap,
-        }
+        return {"base": self._base, "auto_unlink": self._auto_unlink, "cap": self.cap}
 
     def __setstate__(self, s: dict) -> None:
         self.__dict__.clear()
         self._owns = False
         self._auto_unlink = bool(s.get("auto_unlink", False))
         self._open(s["base"])  # all names derive deterministically from the base name
-        self._register_finalizer()
-
-    @staticmethod
-    def _finalize(state_name: str, buf_name: str, owner_pid: int | None, auto_unlink: bool) -> None:
-        gc.collect()
-        # Only the creating process unlinks (not an attacher, nor a forked child that inherited the object).
-        # Re-opening by name for anything else would be a no-op at best, and on POSIX < 3.13 would register
-        # the segment with an attacher's own resource tracker, which then unlinks it when that process exits.
-        if not (auto_unlink and owner_pid == os.getpid()):
-            return
-        for name in (state_name, buf_name):
-            try:
-                # Tracked open on purpose: unlink() then also drops the creator's registration.
-                shm = shared_memory.SharedMemory(name=name)
-                shm.close()
-                shm.unlink()
-            except Exception:
-                pass
-
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
-        try:
-            if self._auto_unlink and self._owns and getattr(self, "_creator_pid", None) == os.getpid():
-                self.unlink()
-        except Exception:
-            pass
+        self._finalizer = weakref.finalize(self, self._res.finalize)
 
 
 class DejaQueue(NamedByteRing):
@@ -817,34 +1067,42 @@ class DejaQueue(NamedByteRing):
                 Make sure the callback is fast, since it runs while holding the get_lock, and that it does not keep references
                 to the object (or its buffers), since the underlying memory may be overwritten.
         """
+        # The item count in the state block (read under the state lock) is the truth about available items.
+        # The _items semaphore, with one count per item, serves to wait for items; counts are only taken while
+        # holding the get lock, where a consumer that dies is noticed (_GET_CLAIM) and its count restored. Lost
+        # or spare counts are harmless: an item is taken whenever one is there, and a count without an item is
+        # dropped. So a get with a timeout never waits behind another consumer, and a consumer that dies
+        # (even holding the get lock: the OS releases it) cannot block the others.
         deadline = None if timeout is None else (time.monotonic() + max(0.0, float(timeout)))
+        items = self._items
         while True:
-            # Claim an item first, then take the get lock (as queue.Queue does). Nobody waits for an item while
-            # holding the lock, so a get with a timeout is never stuck behind another consumer's wait; the lock
-            # itself is only held while an item is read.
-            rem = None if deadline is None else max(0.0, deadline - time.monotonic())
-            if not self._items.acquire(timeout=rem):
-                raise TimeoutError("Timeout waiting for item.")
+            self._get_lock.acquire()
+            st = self._state  # hot path: literal slot indices
             try:
-                self._get_lock.acquire()
-            except BaseException:
-                self._items.release(1)  # give the claim back
-                raise
-            try:
-                st = self._state  # hot path: literal slot indices
+                if st[7]:  # _GET_CLAIM still set: the previous holder of the lock died holding a count
+                    items.release(1)  # restore it (wakes a waiting consumer for the item it left behind)
+                st[7] = 1  # set before taking a count: dying in between leaves a spare count, which is harmless
+                counted = items.acquire(timeout=0)
                 with self._state_lock:
                     nitems = st[2]  # _NITEMS
                     head0 = st[0]  # _HEAD
-                if nitems > 0:
-                    out = self._get_locked(head0, peek_only, callback)
+                if nitems > 0:  # (without a count if it was lost, or is being handed back by a waiting consumer)
+                    out = self._get_locked(head0, peek_only, callback, counted)
                     break
-                # Our claim predates a purge() that removed the item: wait for a new one.
+                # No item (a count without one is spare, e.g. after purge(): drop it).
             finally:
+                st[7] = 0
                 self._get_lock.release()
+            # Wait for an item without holding the lock. The count only signals that one arrived: hand it back
+            # at once and take the item under the lock. (Only a process dying right in between loses a count.)
+            rem = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if not items.acquire(timeout=rem):
+                raise TimeoutError("Timeout waiting for item.")
+            items.release(1)
         return out
 
-    def _get_locked(self, head0: int, peek_only: bool, callback):
-        """Read the item at head0. Caller holds get_lock and one count of _items."""
+    def _get_locked(self, head0: int, peek_only: bool, callback, counted: bool = True):
+        """Read the item at head0. Caller holds get_lock, and one count of _items if counted."""
         cap = self.cap
         buf = self.buf.buf
 
@@ -899,14 +1157,15 @@ class DejaQueue(NamedByteRing):
             # drops the item (as a successful get would); a failed peek, or an interrupt
             # (KeyboardInterrupt, SystemExit), leaves it in the queue.
             segs = obj = None  # release views of the ring before its space is reused
-            self._finish_get(head0, total, consume=isinstance(e, Exception) and not peek_only)
+            self._finish_get(head0, total, consume=isinstance(e, Exception) and not peek_only, counted=counted)
             raise
         segs = obj = None
-        self._finish_get(head0, total, consume=not peek_only)  # advance only after loads()
+        self._finish_get(head0, total, consume=not peek_only, counted=counted)  # advance only after loads()
         return out
 
-    def _finish_get(self, head0: int, total: int, consume: bool) -> None:
-        """Caller holds get_lock and one count of _items. Drop the item at head0, or put the count back."""
+    def _finish_get(self, head0: int, total: int, consume: bool, counted: bool = True) -> None:
+        """Caller holds get_lock (and one count of _items if counted). Drop the item at head0, or keep it
+        (and put the count back)."""
         if consume:
             st = self._state  # hot path: literal slot indices
             with self._state_lock:
@@ -914,7 +1173,7 @@ class DejaQueue(NamedByteRing):
                 st[2] -= 1  # _NITEMS
                 if st[5]:  # _WAITERS
                     self._wake_producers()
-        else:
+        elif counted:
             self._items.release(1)
 
     def __iter__(self):

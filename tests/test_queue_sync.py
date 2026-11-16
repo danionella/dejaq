@@ -38,7 +38,9 @@ def _assert_quiescent(q):
     assert _drain(q._space_gate) == 0
     claimable = _drain(q._items)
     q._items.release(claimable) if claimable else None
-    assert claimable == nitems
+    # one count per item, plus at most a few spare ones (a waiting consumer can hand back its count just
+    # after another consumer took the item without one; spare counts are dropped by the next get)
+    assert nitems <= claimable <= nitems + 4
 
 
 # ---------- names (unique, never shared by accident) ----------
@@ -96,7 +98,7 @@ def test_explicit_queue_name_that_exists_raises_and_keeps_the_queue():
 def test_failed_creation_cleans_up(monkeypatch):
     """If creating a queue fails halfway, what was created is removed again and the name is reusable."""
     name = "dq_test_" + os.urandom(5).hex()
-    real = queues.NamedByteRing._create_sem
+    real = queues.NamedByteRing._create_named
     calls = []
 
     def flaky(self, cls, nm):
@@ -105,10 +107,10 @@ def test_failed_creation_cleans_up(monkeypatch):
             raise OSError("simulated failure")
         return real(self, cls, nm)
 
-    monkeypatch.setattr(queues.NamedByteRing, "_create_sem", flaky)
+    monkeypatch.setattr(queues.NamedByteRing, "_create_named", flaky)
     with pytest.raises(OSError, match="simulated"):
         DejaQueue(4096, name=name)
-    monkeypatch.setattr(queues.NamedByteRing, "_create_sem", real)
+    monkeypatch.setattr(queues.NamedByteRing, "_create_named", real)
     q = DejaQueue(4096, name=name)  # FileExistsError if anything was left behind
     q.put(1)
     assert q.get(timeout=1) == 1
@@ -116,13 +118,17 @@ def test_failed_creation_cleans_up(monkeypatch):
 
 @pytest.mark.skipif(_IS_WIN, reason="Windows semaphores vanish with their last handle")
 def test_stale_semaphores_from_a_crashed_queue_are_replaced():
-    """POSIX semaphores outlive a crashed creator (the resource tracker only removes its shared memory)."""
+    """POSIX semaphores and lock files can outlive a crashed creator (e.g. when its resource tracker died too)."""
     import posix_ipc
 
     name = "dq_test_" + os.urandom(5).hex()
-    _, _, sem_names = queues.NamedByteRing._names(name)
+    _, _, lock_names, sem_names = queues.NamedByteRing._names(name)
     stale = [posix_ipc.Semaphore(queues._posix_name(nm), posix_ipc.O_CREX, initial_value=v)
-             for nm, v in zip(sem_names, (0, 0, 0, 3, 7))]  # locks "held", phantom items and wake-ups
+             for nm, v in zip(sem_names, (0, 3, 7))]  # state lock "held", phantom items and wake-ups
+    for nm in lock_names:
+        lk = queues._RobustLock(nm, auto_unlink=False)
+        lk._finalizer.detach()  # leave the file behind, as a crashed process would
+        lk.close()
     try:
         q = DejaQueue(4096, name=name)
         with pytest.raises(TimeoutError):
@@ -180,12 +186,31 @@ def test_get_timeout_is_honored_while_another_process_waits():
 
 def test_get_nonblocking_returns_available_item_despite_waiting_consumer():
     q = DejaQueue(10_000)
-    threading.Thread(target=lambda: q.get(timeout=1), daemon=True).start()  # takes the first item
-    time.sleep(0.1)
+    got = []
+    t = threading.Thread(target=lambda: got.append(q.get(timeout=2)), daemon=True)
+    t.start()
+    time.sleep(0.1)  # the thread waits for an item
     q.put(1)
     q.put(2)
-    time.sleep(0.1)
-    assert q.get(timeout=0) == 2
+    mine = q.get(timeout=0)  # an item is there: must not time out, whatever the waiting consumer does
+    t.join(2)
+    assert sorted(got + [mine]) == [1, 2]
+    _assert_quiescent(q)
+
+
+def test_lost_item_counts_do_not_block_consumers():
+    """Counts lost with a process that died (or spare ones) must not hide or invent items."""
+    q = DejaQueue(10_000)
+    for i in range(3):
+        q.put(i)
+    assert _drain(q._items) == 3  # as if three consumers had died holding counts
+    assert [q.get(timeout=1) for _ in range(3)] == [0, 1, 2]
+    q._items.release(2)  # spare counts without items
+    with pytest.raises(TimeoutError):
+        q.get(timeout=0.1)
+    q.put("x")
+    assert q.get(timeout=1) == "x"
+    _assert_quiescent(q)
 
 
 # ---------- purge ----------
@@ -393,7 +418,7 @@ def test_attaching_to_a_previous_version_queue_fails_clearly():
     from multiprocessing import shared_memory
 
     base = "dq_test_" + os.urandom(5).hex()
-    st_name, buf_name, _ = queues.NamedByteRing._names(base)
+    st_name, buf_name, _, _ = queues.NamedByteRing._names(base)
     old = shared_memory.SharedMemory(name=st_name, create=True, size=40)
     old.buf.cast("q")[4] = 4096  # cap
     try:
