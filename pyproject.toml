@@ -17,7 +17,6 @@ dependencies = ["numpy",
                 'psutil',
                 'cloudpickle',
                 'posix_ipc ; platform_system != "Windows"',
-                'pywin32 ; platform_system == "Windows"',
                 ]
 keywords = ["multiprocessing", "queue"]
 readme = "README.md"
