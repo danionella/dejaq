@@ -85,8 +85,42 @@ def test_named_lock_over_release():
 
 
 def test_named_semaphore_open_missing():
-    with pytest.raises(Exception):
+    if _IS_WIN:
+        expected = FileNotFoundError
+    else:
+        import posix_ipc
+        expected = posix_ipc.ExistentialError
+    with pytest.raises(expected):
         NamedSemaphore("dejaq_does_not_exist_" + os.urandom(4).hex(), create=False)
+
+
+@pytest.mark.skipif(not _IS_WIN, reason="Windows handle semantics")
+def test_named_semaphore_use_after_close():
+    a = NamedSemaphore(initial=0)
+    a.close()
+    a.close()  # idempotent
+    others = [NamedSemaphore(initial=0) for _ in range(8)]  # likely to reuse a's old handle value
+    with pytest.raises(ValueError):
+        a.release()
+    with pytest.raises(ValueError):
+        a.acquire(timeout=0)
+    assert not any(o.acquire(timeout=0) for o in others)  # no other semaphore was touched
+    for o in others:
+        o.close()
+
+
+@pytest.mark.skipif(not _IS_WIN, reason="Windows enforces 32-bit LONG counts")
+def test_named_semaphore_count_range():
+    s = NamedSemaphore(initial=0, maxcount=10)
+    for bad in (0, -1, 2**31, 2**32 + 1):
+        with pytest.raises(ValueError):
+            s.release(bad)
+    assert not s.acquire(timeout=0)  # nothing was released by the rejected calls
+    with pytest.raises(ValueError):
+        NamedSemaphore(maxcount=2**31)
+    with pytest.raises(ValueError):
+        NamedSemaphore(initial=5, maxcount=2)
+    s.close()
 
 
 def test_picklable_dejaqueue_prefill_then_get():

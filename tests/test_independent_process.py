@@ -2,7 +2,7 @@
 
 The queue is handed over only as its pickle (i.e. the names of its shared memory and named
 semaphores), which the other process uses to attach. Set DEJAQ_OTHER_PYTHON to the path of a
-different interpreter (e.g. a free-threaded build) to also run the child with that interpreter.
+different interpreter build (e.g. free-threaded vs. regular) to also run the child with that one.
 """
 
 import os
@@ -21,13 +21,19 @@ _CHILD = r"""
 import pickle, sys
 import numpy as np
 q_in, q_out = pickle.loads(sys.stdin.buffer.read())
+q_out.put((sys.version, getattr(sys, "_is_gil_enabled", lambda: True)()))  # same as _build() below
 while True:
     item = q_in.get(timeout=20)
     if item is Ellipsis:
         break
-    q_out.put({"echo": item, "sum": float(np.sum(item["data"])), "gil": getattr(sys, "_is_gil_enabled", lambda: True)()})
+    q_out.put({"echo": item, "sum": float(np.sum(item["data"]))})
 q_out.put(Ellipsis)
 """
+
+
+def _build():
+    return (sys.version, getattr(sys, "_is_gil_enabled", lambda: True)())
+
 
 _PYTHONS = [pytest.param(sys.executable, id="same-python")]
 if os.environ.get("DEJAQ_OTHER_PYTHON"):
@@ -35,13 +41,23 @@ if os.environ.get("DEJAQ_OTHER_PYTHON"):
 
 
 @pytest.mark.parametrize("python", _PYTHONS)
-def test_dejaqueue_with_independent_process(python):
+def test_dejaqueue_with_independent_process(python, tmp_path):
     q_in = DejaQueue(buffer_bytes=4_000_000)
     q_out = DejaQueue(buffer_bytes=4_000_000)
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [_REPO_ROOT, os.environ.get("PYTHONPATH")])))
-    proc = subprocess.Popen(
-        [python, "-c", _CHILD], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
-    )
+    err_path = tmp_path / "child_stderr.txt"
+    with open(err_path, "wb") as err_file:  # a file, not a pipe: a chatty child can't block on a full pipe
+        proc = subprocess.Popen(
+            [python, "-c", _CHILD],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=err_file,
+            env=env,
+        )
+
+    def child_stderr():
+        return err_path.read_text(errors="replace")
+
     try:
         proc.stdin.write(pickle.dumps((q_in, q_out)))
         proc.stdin.close()
@@ -58,18 +74,20 @@ def test_dejaqueue_with_independent_process(python):
                 item = q_out.get(timeout=30)
             except TimeoutError:
                 proc.kill()
-                _, err = proc.communicate()
-                pytest.fail("no reply from child process:\n" + err.decode(errors="replace"))
+                proc.wait()
+                pytest.fail("no reply from child process:\n" + child_stderr())
             if item is Ellipsis:
                 break
             received.append(item)
 
-        _, err = proc.communicate(timeout=30)
-        assert proc.returncode == 0, err.decode(errors="replace")
+        assert proc.wait(timeout=30) == 0, child_stderr()
     finally:
         if proc.poll() is None:
             proc.kill()
 
+    child_build, received = received[0], received[1:]
+    if python != sys.executable:  # make sure the "other" interpreter really is a different build
+        assert child_build != _build(), f"DEJAQ_OTHER_PYTHON runs the same build as the parent: {child_build}"
     assert len(received) == len(sent)
     for s, r in zip(sent, received):
         assert r["echo"]["i"] == s["i"]
