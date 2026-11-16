@@ -15,11 +15,20 @@ logger = logging.getLogger(__name__)
 
 class _pickleall:
     """Pickle backend that tries pickle first, then cloudpickle."""
-    def dumps(*args, **kwargs):
+    def dumps(obj, protocol=None, *, buffer_callback=None):
+        # Out-of-band buffers are collected first and only handed on from the attempt that succeeded:
+        # pickle may emit some buffers before it fails, which would otherwise mix with cloudpickle's.
+        bufs = []
         try:
-            return pickle.dumps(*args, **kwargs)
-        except pickle.PicklingError:
-            return cloudpickle.dumps(*args, **kwargs)
+            data = pickle.dumps(obj, protocol=protocol, buffer_callback=bufs.append)
+        except (pickle.PicklingError, AttributeError, TypeError):
+            # lambdas and local functions/classes: PicklingError on 3.14+, AttributeError before
+            bufs = []
+            data = cloudpickle.dumps(obj, protocol=protocol, buffer_callback=bufs.append)
+        if buffer_callback is not None:
+            for b in bufs:
+                buffer_callback(b)
+        return data
 
     def loads(*args, **kwargs):
         return pickle.loads(*args, **kwargs)
@@ -37,15 +46,38 @@ def _safe_base(prefix: str = "ns") -> str:
     return f"{prefix}{os.getpid():x}{os.urandom(2).hex()}"
 
 
+# macOS limits on POSIX names, in bytes including the leading '/' (measured on macOS CI:
+# posix_ipc rejects 31-byte semaphore names; shm_open rejects 32-byte names)
+_DARWIN_SEM_NAME_MAX = 30
+_DARWIN_SHM_NAME_MAX = 31
+
+
+def _darwin_shorten(nm: str, max_len: int) -> str:
+    """On macOS, shorten a too-long '/'-prefixed name to a prefix plus a hash of the full name.
+
+    Different long names (e.g. a queue's '_Lp' and '_Lg' locks) stay distinct, every process
+    derives the same short name, and the result is a fixed point (shortening it again is a no-op).
+    Names that fit, and all names on other platforms, are returned unchanged, so processes running
+    different dejaq versions still agree on them.
+    """
+    if sys.platform != "darwin" or len(nm.encode()) <= max_len:
+        return nm
+    import hashlib
+
+    digest = hashlib.blake2s(nm.encode(), digest_size=6).hexdigest()  # 12 hex chars
+    keep = max_len - len(digest) - 1
+    return nm.encode()[:keep].decode("utf-8", "ignore") + "-" + digest
+
+
 def _posix_name(base: str) -> str:
-    """Return a POSIX-safe name (macOS ≤31 bytes including '/')."""
+    """Return a POSIX-safe semaphore name ('/'-prefixed; short enough for macOS)."""
     nm = "/" + "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in base)
-    if sys.platform == "darwin":
-        b = nm.encode()[:31]
-        nm = b.decode("ascii", "ignore")
-        if not nm.startswith("/"):
-            nm = "/" + nm.lstrip("/")
-    return nm
+    return _darwin_shorten(nm, _DARWIN_SEM_NAME_MAX)
+
+
+def _shm_name(name: str) -> str:
+    """Shared-memory name for SharedMemory (which adds the '/'), short enough for macOS."""
+    return _darwin_shorten("/" + name, _DARWIN_SHM_NAME_MAX)[1:]
 
 
 def _win_name(name: str) -> str:
@@ -376,7 +408,7 @@ class NamedByteRing:
         self._base = base
         self._auto_unlink = bool(auto_unlink)
         # Shared state: head, tail, n_items, closed (0/1), cap
-        st_name = ("NS_" + base) if _IS_WIN else base + "_S"
+        st_name = ("NS_" + base) if _IS_WIN else _shm_name(base + "_S")
         self._owns = create
         if create:
             self._state_mem = _SharedMemory(create=True, name=st_name, size=8 * 5)
@@ -391,7 +423,7 @@ class NamedByteRing:
         self._state_name = st_name
 
         # Data buffer
-        buf_name = ("NB_" + base) if _IS_WIN else base + "_B"
+        buf_name = ("NB_" + base) if _IS_WIN else _shm_name(base + "_B")
         if create:
             self.buf = shared_memory.SharedMemory(name=buf_name, create=True, size=buffer_bytes)
             _view = np.frombuffer(self.buf.buf, dtype="B", count=buffer_bytes)
@@ -728,22 +760,29 @@ class DejaQueue(NamedByteRing):
                     segs.append(_copy_span(cursor, n))  # wrapped -> copy
                 cursor += n
 
-            obj = _pickle_backend.loads(segs[0], buffers=[m for m in segs[1:]])
-
-            if callback is None:
-                out = deepcopy(obj)
-            else:
-                out = callback(obj)
-
-            if not peek_only:
-                with self._state_lock:
-                    self._state[0] = (head0 + total) % cap  # advance after loads()
-                    self._state[2] = int(self._state[2]) - 1
-                self._space_gate.release(1)
-            else:
-                self._items.release(1)
-
+            try:
+                obj = _pickle_backend.loads(segs[0], buffers=[m for m in segs[1:]])
+                out = deepcopy(obj) if callback is None else callback(obj)
+            except BaseException as e:
+                # Never leave a failing item at the head with its count consumed: every later get()
+                # would fail on it again. A get that fails while unpickling/copying/in the callback
+                # drops the item (as a successful get would); a failed peek, or an interrupt
+                # (KeyboardInterrupt, SystemExit), leaves it in the queue.
+                segs = obj = None  # release views of the ring before its space is reused
+                self._finish_get(head0, total, consume=isinstance(e, Exception) and not peek_only)
+                raise
+            self._finish_get(head0, total, consume=not peek_only)  # advance only after loads()
             return out
+
+    def _finish_get(self, head0: int, total: int, consume: bool) -> None:
+        """Caller holds get_lock and one count of _items. Drop the item at head0, or put the count back."""
+        if consume:
+            with self._state_lock:
+                self._state[0] = (head0 + total) % self.cap
+                self._state[2] = int(self._state[2]) - 1
+            self._space_gate.release(1)
+        else:
+            self._items.release(1)
 
     def __iter__(self):
         while True:
