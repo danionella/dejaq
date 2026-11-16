@@ -1,8 +1,8 @@
 # test_named_ipc.py
-import os, time, multiprocessing as mp, numpy as np, pytest
+import os, time, pickle, multiprocessing as mp, numpy as np, pytest
 
 # adjust this import to your module path
-from dejaq.queues import _IS_WIN, NamedSemaphore, NamedByteRing, DejaQueue
+from dejaq.queues import _IS_WIN, NamedSemaphore, NamedLock, NamedByteRing, DejaQueue
 
 mp.set_start_method("spawn", force=True)
 
@@ -56,6 +56,96 @@ def test_named_semaphore_roundtrip_spawn():
     s.release(1)
     p.join(2.0)
     assert p.exitcode == 0
+
+def test_named_semaphore_semantics():
+    s = NamedSemaphore(create=True, initial=1, maxcount=2)
+    assert s.acquire(timeout=0) is True
+    t0 = time.monotonic()
+    assert s.acquire(timeout=0.2) is False
+    assert time.monotonic() - t0 >= 0.15
+    s.release(2)  # back to maxcount
+    if _IS_WIN:  # maxcount is only enforced by Windows semaphores
+        with pytest.raises(RuntimeError):
+            s.release(1)  # over-release
+    s2 = pickle.loads(pickle.dumps(s))  # attach by name
+    assert s2.name == s.name
+    assert s2.acquire(timeout=0) and s.acquire(timeout=0)
+    assert not s2.acquire(timeout=0)
+    s2.close()
+    s.close()
+
+
+def test_named_lock_over_release():
+    lk = NamedLock(create=True)
+    with lk:
+        pass
+    with pytest.raises(RuntimeError):
+        lk.release()
+    lk.close()
+
+
+_EXIT_CHILD = """
+from dejaq.queues import DejaQueue, NamedByteRing
+q = DejaQueue(1_000_000)
+q.put({"a": 1})
+assert q.get() == {"a": 1}
+q2 = NamedByteRing(1_000_000)
+print("ok")
+"""  # queues deliberately left alive until interpreter shutdown
+
+
+def test_queue_alive_at_exit_closes_cleanly(tmp_path):
+    """No 'BufferError: cannot close exported pointers exist' when a queue lives until shutdown (seen on 3.14t)."""
+    import subprocess, sys
+
+    # run as a script file: with `python -c` the shutdown order differs and the bug does not show
+    script = tmp_path / "child.py"
+    script.write_text(_EXIT_CHILD)
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [repo_root, os.environ.get("PYTHONPATH")])))
+    r = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=60, env=env)
+    assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr
+    assert "BufferError" not in r.stderr and "Exception ignored" not in r.stderr, r.stderr
+
+
+def test_named_semaphore_open_missing():
+    if _IS_WIN:
+        expected = FileNotFoundError
+    else:
+        import posix_ipc
+        expected = posix_ipc.ExistentialError
+    with pytest.raises(expected):
+        NamedSemaphore("dejaq_does_not_exist_" + os.urandom(4).hex(), create=False)
+
+
+@pytest.mark.skipif(not _IS_WIN, reason="Windows handle semantics")
+def test_named_semaphore_use_after_close():
+    a = NamedSemaphore(initial=0)
+    a.close()
+    a.close()  # idempotent
+    others = [NamedSemaphore(initial=0) for _ in range(8)]  # likely to reuse a's old handle value
+    with pytest.raises(ValueError):
+        a.release()
+    with pytest.raises(ValueError):
+        a.acquire(timeout=0)
+    assert not any(o.acquire(timeout=0) for o in others)  # no other semaphore was touched
+    for o in others:
+        o.close()
+
+
+@pytest.mark.skipif(not _IS_WIN, reason="Windows enforces 32-bit LONG counts")
+def test_named_semaphore_count_range():
+    s = NamedSemaphore(initial=0, maxcount=10)
+    for bad in (0, -1, 2**31, 2**32 + 1):
+        with pytest.raises(ValueError):
+            s.release(bad)
+    assert not s.acquire(timeout=0)  # nothing was released by the rejected calls
+    with pytest.raises(ValueError):
+        NamedSemaphore(maxcount=2**31)
+    with pytest.raises(ValueError):
+        NamedSemaphore(initial=5, maxcount=2)
+    s.close()
+
 
 def test_picklable_dejaqueue_prefill_then_get():
     """Reproduces the 'prefill then bench' flow."""

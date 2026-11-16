@@ -52,6 +52,59 @@ def _win_name(name: str) -> str:
     return name if name.startswith(("Local\\", "Global\\")) else "Local\\" + name
 
 
+_LONG_MAX = 2_147_483_647  # semaphore counts are 32-bit LONGs on Windows
+
+if _IS_WIN:
+    # Kernel32 semaphore API without pywin32 (which has no free-threaded build). Waiting and closing
+    # use the stdlib's _winapi (C, releases the GIL, a bit faster than ctypes); creating, opening and
+    # releasing semaphores, which _winapi lacks, use ctypes. A private WinDLL instance (not
+    # ctypes.windll.kernel32) keeps these argtypes from clashing with other libraries.
+    import _winapi
+    import ctypes
+    from ctypes import wintypes as _W
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    _CreateSemaphoreW = _kernel32.CreateSemaphoreW
+    _CreateSemaphoreW.argtypes = [ctypes.c_void_p, _W.LONG, _W.LONG, _W.LPCWSTR]
+    _CreateSemaphoreW.restype = _W.HANDLE
+    _OpenSemaphoreW = _kernel32.OpenSemaphoreW
+    _OpenSemaphoreW.argtypes = [_W.DWORD, _W.BOOL, _W.LPCWSTR]
+    _OpenSemaphoreW.restype = _W.HANDLE
+    _ReleaseSemaphore = _kernel32.ReleaseSemaphore
+    _ReleaseSemaphore.argtypes = [_W.HANDLE, _W.LONG, ctypes.POINTER(_W.LONG)]
+    _ReleaseSemaphore.restype = _W.BOOL
+    _WaitForSingleObject = _winapi.WaitForSingleObject  # raises OSError on WAIT_FAILED
+    _CloseHandle = _winapi.CloseHandle
+
+    _INFINITE = _winapi.INFINITE
+    _WAIT_OBJECT_0 = _winapi.WAIT_OBJECT_0
+    _WAIT_TIMEOUT = _winapi.WAIT_TIMEOUT
+    _SEMAPHORE_MODIFY_STATE = 0x0002
+    _SYNCHRONIZE = 0x00100000
+    _ERROR_TOO_MANY_POSTS = 298
+
+    class _WinHandle:
+        """Owns a kernel handle; close() closes it once and zeroes it, so a closed handle is never
+        passed to the OS again (Windows reuses handle values, so a stale value may name another object)."""
+
+        __slots__ = ("value",)
+
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+        def close(self, _close=_CloseHandle) -> None:  # bound at definition: safe during shutdown
+            h, self.value = self.value, 0
+            if h:
+                _close(h)
+
+        def get(self) -> int:
+            h = self.value
+            if not h:
+                raise ValueError("operation on closed NamedSemaphore")
+            return h
+
+
 # On POSIX, SharedMemory(name=...) registers the segment with the calling process's
 # resource_tracker even when it only attaches to an existing segment. A process started
 # independently (e.g. via subprocess, not as a multiprocessing child) has its own tracker,
@@ -89,16 +142,16 @@ def _patch_register_once() -> None:
         _register_patched = True
 
 
-def _attach_shm(name: str) -> shared_memory.SharedMemory:
+def _attach_shm(name: str, cls=shared_memory.SharedMemory) -> shared_memory.SharedMemory:
     """Attach to existing shared memory without registering it with this process's resource tracker."""
     if _IS_WIN:
-        return shared_memory.SharedMemory(name=name)
+        return cls(name=name)
     if sys.version_info >= (3, 13):
-        return shared_memory.SharedMemory(name=name, track=False)
+        return cls(name=name, track=False)
     _patch_register_once()
     _untracked.active = True
     try:
-        return shared_memory.SharedMemory(name=name)
+        return cls(name=name)
     finally:
         _untracked.active = False
 
@@ -117,20 +170,21 @@ class NamedSemaphore:
     ) -> None:
         self.backend = "win32" if _IS_WIN else "posix"
         if _IS_WIN:
-            import win32event, win32con
-
-            MAX = int(maxcount if maxcount is not None else 2_147_483_647)
+            MAX = int(maxcount if maxcount is not None else _LONG_MAX)
             if create:
+                if not (1 <= MAX <= _LONG_MAX and 0 <= int(initial) <= MAX):
+                    raise ValueError(f"NamedSemaphore: need 0 <= initial <= maxcount <= {_LONG_MAX}")
                 nm = _win_name(name or _safe_base("ns"))
-                h = win32event.CreateSemaphore(None, int(initial), MAX, nm)
+                # opens the existing semaphore (ignoring initial/max) if the name already exists
+                h = _CreateSemaphoreW(None, int(initial), MAX, nm)
             else:
                 if not name:
                     raise ValueError("NamedSemaphore: name must be provided when create=False")
                 nm = _win_name(name)
-                h = win32event.OpenSemaphore(win32con.SEMAPHORE_MODIFY_STATE | win32con.SYNCHRONIZE, False, nm)
+                h = _OpenSemaphoreW(_SEMAPHORE_MODIFY_STATE | _SYNCHRONIZE, False, nm)
             if not h:
-                raise OSError("Create/OpenSemaphore failed")
-            self._h = h
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._h = _WinHandle(h)
             self.name = nm
         else:
             self.name = _posix_name(name.lstrip("/")) if name else _posix_name(_safe_base("ns"))
@@ -150,13 +204,14 @@ class NamedSemaphore:
 
     def acquire(self, timeout: float | None = None) -> bool:
         if _IS_WIN:
-            import win32event
-
-            ms = win32event.INFINITE if timeout is None else max(0, int(timeout * 1000))
-            rc = win32event.WaitForSingleObject(self._h, ms)
-            if rc == win32event.WAIT_OBJECT_0:
+            if timeout is None:
+                ms = _INFINITE
+            else:  # clamp to the largest finite DWORD timeout
+                ms = min(max(0, int(timeout * 1000)), _INFINITE - 1)
+            rc = _WaitForSingleObject(self._h.get(), ms)
+            if rc == _WAIT_OBJECT_0:
                 return True
-            if rc == win32event.WAIT_TIMEOUT:
+            if rc == _WAIT_TIMEOUT:
                 return False
             raise RuntimeError(f"WaitForSingleObject rc={rc}")
         else:
@@ -188,14 +243,14 @@ class NamedSemaphore:
 
     def release(self, n: int = 1) -> None:
         if _IS_WIN:
-            import win32event, pywintypes
-
-            try:
-                win32event.ReleaseSemaphore(self._h, int(n))
-            except pywintypes.error as e:
-                if getattr(e, "winerror", None) == 298:  # ERROR_TOO_MANY_POSTS
-                    raise RuntimeError("Over-release of NamedSemaphore") from e
-                raise
+            n = int(n)
+            if not 1 <= n <= _LONG_MAX:  # ctypes would silently truncate out-of-range counts
+                raise ValueError(f"NamedSemaphore.release: n must be in [1, {_LONG_MAX}], got {n}")
+            if not _ReleaseSemaphore(self._h.get(), n, None):
+                err = ctypes.WinError(ctypes.get_last_error())
+                if err.winerror == _ERROR_TOO_MANY_POSTS:
+                    raise RuntimeError("Over-release of NamedSemaphore") from err
+                raise err
         else:
             for _ in range(int(n)):
                 self._sem.release()
@@ -226,7 +281,7 @@ class NamedSemaphore:
             if backend == "win32":
                 try:
                     logger.debug(f"finalizer closing {name}")
-                    __import__("win32event").CloseHandle(handle)
+                    handle.close()
                 except Exception:
                     pass
             else:
@@ -246,7 +301,9 @@ class NamedSemaphore:
             pass
 
     def __del__(self):
-        self._finalizer()
+        finalizer = getattr(self, "_finalizer", None)  # absent if __init__ failed
+        if finalizer is not None:
+            finalizer()
 
     def __enter__(self):
         self.acquire()
@@ -277,6 +334,29 @@ class NamedLock(NamedSemaphore):
             raise RuntimeError("Over-release of NamedLock on POSIX")
 
 
+class _SharedMemory(shared_memory.SharedMemory):
+    """SharedMemory that owns the views derived from it and releases them in close().
+
+    A live derived view (e.g. ``buf.cast("q")``) keeps the mapping exported, so closing fails with
+    ``BufferError: cannot close exported pointers exist``. Normally the view is dropped first, but the
+    garbage collector may finalize the SharedMemory before its views (seen at interpreter shutdown on
+    free-threaded CPython 3.14t). Releasing owned views in close() makes the order irrelevant.
+    """
+
+    _views: tuple = ()
+
+    def cast(self, fmt: str) -> memoryview:
+        view = self.buf.cast(fmt)
+        self._views = (*self._views, view)
+        return view
+
+    def close(self) -> None:
+        views, self._views = self._views, ()
+        for view in views:
+            view.release()
+        super().close()
+
+
 class NamedByteRing:
     """Manager/Condition-free ring buffer queue (bytes) with named semaphores.
        Pickleable across independently started processes.
@@ -299,10 +379,10 @@ class NamedByteRing:
         st_name = ("NS_" + base) if _IS_WIN else base + "_S"
         self._owns = create
         if create:
-            self._state_mem = shared_memory.SharedMemory(create=True, name=st_name, size=8 * 5)
+            self._state_mem = _SharedMemory(create=True, name=st_name, size=8 * 5)
         else:
-            self._state_mem = _attach_shm(st_name)
-        self._state = self._state_mem.buf.cast("q")
+            self._state_mem = _attach_shm(st_name, cls=_SharedMemory)
+        self._state = self._state_mem.cast("q")
         if create:
             self._state[0:5] = array.array("q", [0, 0, 0, 0, buffer_bytes])
             self.cap = buffer_bytes
@@ -498,8 +578,8 @@ class NamedByteRing:
         self._state_name = s["state_name"]
         self._buf_name = s["buf_name"]
         self.cap = s["cap"]
-        self._state_mem = _attach_shm(self._state_name)
-        self._state = self._state_mem.buf.cast("q")
+        self._state_mem = _attach_shm(self._state_name, cls=_SharedMemory)
+        self._state = self._state_mem.cast("q")
         self.buf = _attach_shm(self._buf_name)
         self._put_lock = NamedLock(s["locks"][0]["name"], create=False)
         self._get_lock = NamedLock(s["locks"][1]["name"], create=False)
