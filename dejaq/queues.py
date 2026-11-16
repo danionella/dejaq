@@ -720,7 +720,8 @@ class NamedByteRing:
             queue with this name exists. If False, open an existing queue.
         auto_unlink (bool): If True (default), the queue is removed once the creating process's queue object is
             gone (or that process ends, also by crashing): processes already using it can continue, but no new
-            process can attach. If False, the queue persists until ``unlink()`` is called.
+            process can attach. If False, the queue persists until ``unlink()`` is called (POSIX; on Windows a
+            queue always exists exactly as long as some process has it open).
 
     Can be used as a context manager: ``with DejaQueue() as q: ...`` closes it at the end (and removes it, if
     this object created it with auto_unlink).
@@ -818,10 +819,15 @@ class NamedByteRing:
             try:
                 shms.append(_attach_shm(st_name, cls=_SharedMemory))
             except FileNotFoundError:
+                hint = (
+                    "on Windows, a queue exists only while some process has it open"
+                    if _IS_WIN
+                    else "with auto_unlink=True (the default), a queue is removed when its creating object is "
+                    "garbage-collected"
+                )
                 raise FileNotFoundError(
-                    errno.ENOENT,
-                    f"DejaQueue {base!r} does not exist (any more). With auto_unlink=True (the default), a queue "
-                    "is removed when its creating object is garbage-collected: keep it alive while processes attach",
+                    errno.ENOENT, f"DejaQueue {base!r} does not exist (any more): {hint}. Keep it alive while "
+                    "processes attach."
                 ) from None
             state = shms[0].cast("q")
             if len(state) < _STATE_SLOTS or state[_MAGIC] != _STATE_MAGIC:

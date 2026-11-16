@@ -198,6 +198,7 @@ print("ok")
 """
 
 
+@pytest.mark.skipif(_IS_WIN, reason="Windows removes kernel objects with their last handle")
 def test_auto_unlink_false_outlives_the_creating_process():
     name = "dq_test_" + os.urandom(5).hex()
     r = _run_python(_PERSISTENT_CHILD.replace("NAME", repr(name)))
