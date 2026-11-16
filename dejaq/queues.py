@@ -46,26 +46,38 @@ def _safe_base(prefix: str = "ns") -> str:
     return f"{prefix}{os.getpid():x}{os.urandom(2).hex()}"
 
 
-_DARWIN_NAME_MAX = 31  # macOS limit for POSIX semaphore names, including the leading '/'
+# macOS limits on POSIX names, in bytes including the leading '/' (measured on macOS CI:
+# posix_ipc rejects 31-byte semaphore names; shm_open rejects 32-byte names)
+_DARWIN_SEM_NAME_MAX = 30
+_DARWIN_SHM_NAME_MAX = 31
+
+
+def _darwin_shorten(nm: str, max_len: int) -> str:
+    """On macOS, shorten a too-long '/'-prefixed name to a prefix plus a hash of the full name.
+
+    Different long names (e.g. a queue's '_Lp' and '_Lg' locks) stay distinct, every process
+    derives the same short name, and the result is a fixed point (shortening it again is a no-op).
+    Names that fit, and all names on other platforms, are returned unchanged, so processes running
+    different dejaq versions still agree on them.
+    """
+    if sys.platform != "darwin" or len(nm.encode()) <= max_len:
+        return nm
+    import hashlib
+
+    digest = hashlib.blake2s(nm.encode(), digest_size=6).hexdigest()  # 12 hex chars
+    keep = max_len - len(digest) - 1
+    return nm.encode()[:keep].decode("utf-8", "ignore") + "-" + digest
 
 
 def _posix_name(base: str) -> str:
-    """Return a POSIX-safe name (macOS ≤31 bytes including '/').
-
-    Names that are too long for macOS are shortened to a prefix plus a hash of the full name, so
-    different long names (e.g. a queue's '_Lp' and '_Lg' locks) stay distinct, and every process
-    derives the same short name. The result is a fixed point: applying this again (e.g. after
-    unpickling a semaphore by its name) returns it unchanged. Names that fit are unchanged from
-    earlier versions, so processes running different dejaq versions still agree on them.
-    """
+    """Return a POSIX-safe semaphore name ('/'-prefixed; short enough for macOS)."""
     nm = "/" + "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in base)
-    if sys.platform == "darwin" and len(nm.encode()) > _DARWIN_NAME_MAX:
-        import hashlib
+    return _darwin_shorten(nm, _DARWIN_SEM_NAME_MAX)
 
-        digest = hashlib.blake2s(nm.encode(), digest_size=6).hexdigest()  # 12 hex chars
-        keep = _DARWIN_NAME_MAX - len(digest) - 1
-        nm = nm.encode()[:keep].decode("utf-8", "ignore") + "-" + digest
-    return nm
+
+def _shm_name(name: str) -> str:
+    """Shared-memory name for SharedMemory (which adds the '/'), short enough for macOS."""
+    return _darwin_shorten("/" + name, _DARWIN_SHM_NAME_MAX)[1:]
 
 
 def _win_name(name: str) -> str:
@@ -265,7 +277,7 @@ class NamedByteRing:
         self._base = base
         self._auto_unlink = bool(auto_unlink)
         # Shared state: head, tail, n_items, closed (0/1), cap
-        st_name = ("NS_" + base) if _IS_WIN else base + "_S"
+        st_name = ("NS_" + base) if _IS_WIN else _shm_name(base + "_S")
         self._owns = create
         if create:
             self._state_mem = shared_memory.SharedMemory(create=True, name=st_name, size=8 * 5)
@@ -280,7 +292,7 @@ class NamedByteRing:
         self._state_name = st_name
 
         # Data buffer
-        buf_name = ("NB_" + base) if _IS_WIN else base + "_B"
+        buf_name = ("NB_" + base) if _IS_WIN else _shm_name(base + "_B")
         if create:
             self.buf = shared_memory.SharedMemory(name=buf_name, create=True, size=buffer_bytes)
             _view = np.frombuffer(self.buf.buf, dtype="B", count=buffer_bytes)

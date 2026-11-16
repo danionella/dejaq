@@ -232,9 +232,9 @@ def test_threads_share_one_queue():
 
 # ---------- names and lifecycle ----------
 
-@pytest.mark.parametrize("length", [8, 28, 29])
+@pytest.mark.parametrize("length", [8, 27, 28, 29, 40])
 def test_named_queue_resources_are_distinct(length):
-    """User-chosen names: all semaphores must stay distinct (macOS truncates POSIX names at 31 bytes)."""
+    """User-chosen names: everything must stay distinct and fit macOS's ~30-byte POSIX name limits."""
     name = ("q" + os.urandom(16).hex())[:length]
     q = DejaQueue(10_000, name=name)
     sems = [q._put_lock, q._get_lock, q._state_lock, q._items, q._space_gate]
@@ -251,15 +251,18 @@ def test_macos_name_shortening(monkeypatch):
     monkeypatch.setattr(queues.sys, "platform", "darwin")
     short = "nq1a2b3c4d_Lp"
     assert queues._posix_name(short) == "/" + short  # names that fit are unchanged
+    assert queues._shm_name("nq1a2b3c4d_S") == "nq1a2b3c4d_S"
     base = "camera_frames_" + "x" * 20
-    names = [queues._posix_name(base + suffix) for suffix in ("_S", "_Lp", "_Lg", "_Ls", "_I", "_G")]
+    names = [queues._posix_name(base + suffix) for suffix in ("_Lp", "_Lg", "_Ls", "_I", "_G")]
     assert len(set(names)) == len(names), names
     for nm in names:
-        assert nm.startswith("/") and len(nm.encode()) <= 31
+        assert nm.startswith("/") and len(nm.encode()) <= 30  # posix_ipc limit on macOS
         assert queues._posix_name(nm.lstrip("/")) == nm  # fixed point: re-deriving after unpickling
-    assert queues._posix_name(base + "_Lp") == names[1]  # deterministic
+    assert queues._posix_name(base + "_Lp") == names[0]  # deterministic
+    shm = [queues._shm_name(base + suffix) for suffix in ("_S", "_B")]
+    assert shm[0] != shm[1] and all(not s.startswith("/") and len(s.encode()) <= 30 for s in shm)
     long_unicode = "kamera_ä" * 6
-    assert len(queues._posix_name(long_unicode).encode()) <= 31
+    assert len(queues._posix_name(long_unicode).encode()) <= 30
 
 
 def test_resources_are_released_when_creator_is_gone():
