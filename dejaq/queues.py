@@ -52,6 +52,55 @@ def _win_name(name: str) -> str:
     return name if name.startswith(("Local\\", "Global\\")) else "Local\\" + name
 
 
+class _Kernel32:
+    """Minimal ctypes bindings for the kernel32 semaphore API (Windows only).
+
+    Uses a private ``WinDLL`` instance (not ``ctypes.windll.kernel32``) so the argtypes/restype
+    declared here cannot clash with other libraries. ctypes releases the GIL during foreign calls,
+    so blocking waits do not stall other threads. Unlike pywin32, this works on free-threaded builds.
+    """
+
+    INFINITE = 0xFFFFFFFF
+    WAIT_OBJECT_0 = 0x00000000
+    WAIT_TIMEOUT = 0x00000102
+    SEMAPHORE_MODIFY_STATE = 0x0002
+    SYNCHRONIZE = 0x00100000
+    ERROR_TOO_MANY_POSTS = 298
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes as W
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.CreateSemaphoreW = k32.CreateSemaphoreW
+        self.CreateSemaphoreW.argtypes = [ctypes.c_void_p, W.LONG, W.LONG, W.LPCWSTR]
+        self.CreateSemaphoreW.restype = W.HANDLE
+        self.OpenSemaphoreW = k32.OpenSemaphoreW
+        self.OpenSemaphoreW.argtypes = [W.DWORD, W.BOOL, W.LPCWSTR]
+        self.OpenSemaphoreW.restype = W.HANDLE
+        self.ReleaseSemaphore = k32.ReleaseSemaphore
+        self.ReleaseSemaphore.argtypes = [W.HANDLE, W.LONG, ctypes.POINTER(W.LONG)]
+        self.ReleaseSemaphore.restype = W.BOOL
+        self.WaitForSingleObject = k32.WaitForSingleObject
+        self.WaitForSingleObject.argtypes = [W.HANDLE, W.DWORD]
+        self.WaitForSingleObject.restype = W.DWORD
+        self.CloseHandle = k32.CloseHandle
+        self.CloseHandle.argtypes = [W.HANDLE]
+        self.CloseHandle.restype = W.BOOL
+        self.get_last_error = ctypes.get_last_error
+        self.WinError = ctypes.WinError
+
+
+_k32_instance: _Kernel32 | None = None
+
+
+def _k32() -> _Kernel32:
+    global _k32_instance
+    if _k32_instance is None:
+        _k32_instance = _Kernel32()
+    return _k32_instance
+
+
 class NamedSemaphore:
     """Cross-process named counting semaphore (picklable, best-effort cleanup)."""
 
@@ -66,19 +115,19 @@ class NamedSemaphore:
     ) -> None:
         self.backend = "win32" if _IS_WIN else "posix"
         if _IS_WIN:
-            import win32event, win32con
-
+            k32 = _k32()
             MAX = int(maxcount if maxcount is not None else 2_147_483_647)
             if create:
                 nm = _win_name(name or _safe_base("ns"))
-                h = win32event.CreateSemaphore(None, int(initial), MAX, nm)
+                # opens the existing semaphore (ignoring initial/max) if the name already exists
+                h = k32.CreateSemaphoreW(None, int(initial), MAX, nm)
             else:
                 if not name:
                     raise ValueError("NamedSemaphore: name must be provided when create=False")
                 nm = _win_name(name)
-                h = win32event.OpenSemaphore(win32con.SEMAPHORE_MODIFY_STATE | win32con.SYNCHRONIZE, False, nm)
+                h = k32.OpenSemaphoreW(k32.SEMAPHORE_MODIFY_STATE | k32.SYNCHRONIZE, False, nm)
             if not h:
-                raise OSError("Create/OpenSemaphore failed")
+                raise k32.WinError(k32.get_last_error())
             self._h = h
             self.name = nm
         else:
@@ -99,15 +148,17 @@ class NamedSemaphore:
 
     def acquire(self, timeout: float | None = None) -> bool:
         if _IS_WIN:
-            import win32event
-
-            ms = win32event.INFINITE if timeout is None else max(0, int(timeout * 1000))
-            rc = win32event.WaitForSingleObject(self._h, ms)
-            if rc == win32event.WAIT_OBJECT_0:
+            k32 = _k32()
+            if timeout is None:
+                ms = k32.INFINITE
+            else:  # clamp to the largest finite DWORD timeout
+                ms = min(max(0, int(timeout * 1000)), k32.INFINITE - 1)
+            rc = k32.WaitForSingleObject(self._h, ms)
+            if rc == k32.WAIT_OBJECT_0:
                 return True
-            if rc == win32event.WAIT_TIMEOUT:
+            if rc == k32.WAIT_TIMEOUT:
                 return False
-            raise RuntimeError(f"WaitForSingleObject rc={rc}")
+            raise RuntimeError(f"WaitForSingleObject rc={rc} (error {k32.get_last_error()})")
         else:
             import posix_ipc as P
             if timeout is None:
@@ -137,14 +188,12 @@ class NamedSemaphore:
 
     def release(self, n: int = 1) -> None:
         if _IS_WIN:
-            import win32event, pywintypes
-
-            try:
-                win32event.ReleaseSemaphore(self._h, int(n))
-            except pywintypes.error as e:
-                if getattr(e, "winerror", None) == 298:  # ERROR_TOO_MANY_POSTS
-                    raise RuntimeError("Over-release of NamedSemaphore") from e
-                raise
+            k32 = _k32()
+            if not k32.ReleaseSemaphore(self._h, int(n), None):
+                err = k32.WinError(k32.get_last_error())
+                if err.winerror == k32.ERROR_TOO_MANY_POSTS:
+                    raise RuntimeError("Over-release of NamedSemaphore") from err
+                raise err
         else:
             for _ in range(int(n)):
                 self._sem.release()
@@ -175,7 +224,7 @@ class NamedSemaphore:
             if backend == "win32":
                 try:
                     logger.debug(f"finalizer closing {name}")
-                    __import__("win32event").CloseHandle(handle)
+                    _k32().CloseHandle(handle)
                 except Exception:
                     pass
             else:
@@ -195,7 +244,9 @@ class NamedSemaphore:
             pass
 
     def __del__(self):
-        self._finalizer()
+        finalizer = getattr(self, "_finalizer", None)  # absent if __init__ failed
+        if finalizer is not None:
+            finalizer()
 
     def __enter__(self):
         self.acquire()

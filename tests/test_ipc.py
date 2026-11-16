@@ -1,8 +1,8 @@
 # test_named_ipc.py
-import os, time, multiprocessing as mp, numpy as np, pytest
+import os, time, pickle, multiprocessing as mp, numpy as np, pytest
 
 # adjust this import to your module path
-from dejaq.queues import _IS_WIN, NamedSemaphore, NamedByteRing, DejaQueue
+from dejaq.queues import _IS_WIN, NamedSemaphore, NamedLock, NamedByteRing, DejaQueue
 
 mp.set_start_method("spawn", force=True)
 
@@ -56,6 +56,38 @@ def test_named_semaphore_roundtrip_spawn():
     s.release(1)
     p.join(2.0)
     assert p.exitcode == 0
+
+def test_named_semaphore_semantics():
+    s = NamedSemaphore(create=True, initial=1, maxcount=2)
+    assert s.acquire(timeout=0) is True
+    t0 = time.monotonic()
+    assert s.acquire(timeout=0.2) is False
+    assert time.monotonic() - t0 >= 0.15
+    s.release(2)  # back to maxcount
+    if _IS_WIN:  # maxcount is only enforced by Windows semaphores
+        with pytest.raises(RuntimeError):
+            s.release(1)  # over-release
+    s2 = pickle.loads(pickle.dumps(s))  # attach by name
+    assert s2.name == s.name
+    assert s2.acquire(timeout=0) and s.acquire(timeout=0)
+    assert not s2.acquire(timeout=0)
+    s2.close()
+    s.close()
+
+
+def test_named_lock_over_release():
+    lk = NamedLock(create=True)
+    with lk:
+        pass
+    with pytest.raises(RuntimeError):
+        lk.release()
+    lk.close()
+
+
+def test_named_semaphore_open_missing():
+    with pytest.raises(Exception):
+        NamedSemaphore("dejaq_does_not_exist_" + os.urandom(4).hex(), create=False)
+
 
 def test_picklable_dejaqueue_prefill_then_get():
     """Reproduces the 'prefill then bench' flow."""
