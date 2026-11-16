@@ -3,7 +3,6 @@ import logging
 import errno, os, sys, time, gc, weakref, struct, threading
 import multiprocessing as mp
 from multiprocessing import shared_memory
-from copy import deepcopy
 import pickle
 import cloudpickle
 import dataclasses
@@ -812,7 +811,9 @@ class DejaQueue(NamedByteRing):
             timeout (float | None): Maximum time to wait for an item. Default None (wait indefinitely).
             peek_only (bool): If True, read the item without removing it from the queue. Default False.
             callback (Callable, optional): If provided, a function to be called with the unpickled object
-                (pre-copy, potentially unsafe!). If None (default), a deepcopy of the object is returned.
+                (zero-copy: its numpy arrays view the queue's shared memory, potentially unsafe!) and whose return
+                value is returned. If None (default), the returned object owns all its memory (its numpy arrays are
+                copied out of the queue and writable).
                 Make sure the callback is fast, since it runs while holding the get_lock, and that it does not keep references
                 to the object (or its buffers), since the underlying memory may be overwritten.
         """
@@ -835,10 +836,12 @@ class DejaQueue(NamedByteRing):
                     nitems = st[2]  # _NITEMS
                     head0 = st[0]  # _HEAD
                 if nitems > 0:
-                    return self._get_locked(head0, peek_only, callback)
+                    out = self._get_locked(head0, peek_only, callback)
+                    break
                 # Our claim predates a purge() that removed the item: wait for a new one.
             finally:
                 self._get_lock.release()
+        return out
 
     def _get_locked(self, head0: int, peek_only: bool, callback):
         """Read the item at head0. Caller holds get_lock and one count of _items."""
@@ -854,32 +857,51 @@ class DejaQueue(NamedByteRing):
             out = b"".join((buf[start:cap], buf[0 : n - first]))
             return out
 
+        def _private(start, n):
+            """Writable private copy of a span (numpy-allocated: arrays built on it are writable and aligned)."""
+            out = np.empty(n, dtype=np.uint8)
+            dst = memoryview(out)
+            s = start % cap
+            if s + n <= cap:
+                dst[:] = buf[s : s + n]
+            else:
+                first = cap - s
+                dst[:first] = buf[s:cap]
+                dst[first:] = buf[0 : n - first]
+            dst.release()
+            return out
+
         # header
         K = struct.unpack("<Q", _copy_span(head0, 8))[0]
         lens = struct.unpack(f"<{K}Q", _copy_span(head0 + 8, 8 * K))
         total = 8 + 8 * K + sum(lens)
-        segs, cursor = [], head0 + 8 + 8 * K
+        start0 = head0 + 8 + 8 * K
 
-        for n in lens:
-            s = cursor % cap
-            e = s + n
-            if e <= cap:
-                segs.append(buf[s:e])
-            else:
-                segs.append(_copy_span(cursor, n))  # wrapped -> copy
-            cursor += n
-
+        segs, cursor = [], start0
         try:
-            obj = _pickle_backend.loads(segs[0], buffers=[m for m in segs[1:]])
-            out = deepcopy(obj) if callback is None else callback(obj)
+            for i, n in enumerate(lens):
+                s = cursor % cap
+                e = s + n
+                if callback is None and i > 0:
+                    segs.append(_private(cursor, n))  # out-of-band buffers (numpy data): private, writable copies
+                elif e <= cap:
+                    segs.append(buf[s:e])
+                else:
+                    segs.append(_copy_span(cursor, n))  # wrapped -> copy
+                cursor += n
+            obj = _pickle_backend.loads(segs[0], buffers=segs[1:])
+            # Without a callback, obj owns all its memory: in-band data is copied by unpickling, out-of-band
+            # buffers were copied above. With a callback, its buffers still view the ring.
+            out = obj if callback is None else callback(obj)
         except BaseException as e:
             # Never leave a failing item at the head with its count consumed: every later get()
-            # would fail on it again. A get that fails while unpickling/copying/in the callback
+            # would fail on it again. A get that fails while copying/unpickling/in the callback
             # drops the item (as a successful get would); a failed peek, or an interrupt
             # (KeyboardInterrupt, SystemExit), leaves it in the queue.
             segs = obj = None  # release views of the ring before its space is reused
             self._finish_get(head0, total, consume=isinstance(e, Exception) and not peek_only)
             raise
+        segs = obj = None
         self._finish_get(head0, total, consume=not peek_only)  # advance only after loads()
         return out
 
