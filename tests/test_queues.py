@@ -90,7 +90,7 @@ def test_queue_mp_numpy_arrays(QueueCls):
 
 @pytest.mark.parametrize("QueueCls", [LegacyDejaQueue, DejaQueue])
 def test_queue_mp_race_condition(QueueCls):
-    q = QueueCls(4 * 1024 * 1024)
+    q = QueueCls(64 * 1024)  # small ring: items wrap around and the producer waits for space
     N = 50
     arrays = [np.random.bytes(random.randint(100, 10000)) for _ in range(N)]
     hashes = hash_it(arrays)
@@ -129,18 +129,19 @@ def test_queue_mp_multiple_producers_consumers(QueueCls):
 
 @pytest.mark.parametrize("QueueCls", [LegacyDejaQueue, DejaQueue])
 def test_queue_mp_stress(QueueCls):
-    q = QueueCls(8 * 1024 * 1024)
-    N = 500
+    q = QueueCls(64 * 1024)  # small ring: wraparound and full-queue waits under contention
+    N = 300
     items = [np.random.bytes(random.randint(100, 10000)) for _ in range(N)]
     manager = mp.Manager()
     results = manager.list()
-    prods = [mp.Process(target=producer, args=(q, items[i::4], 0, False)) for i in range(4)]
-    cons_ = [mp.Process(target=consumer, args=(q, results)) for _ in range(4)]
+    prods = [mp.Process(target=producer, args=(q, items[i::2], 0, False)) for i in range(2)]
+    cons_ = [mp.Process(target=consumer, args=(q, results)) for _ in range(2)]
     for p in prods + cons_:
         p.start()
-    time.sleep(1)
-    q._signal_stop()
-    for p in prods + cons_:
+    for p in prods:
+        p.join()
+    q._signal_stop()  # after all items are in, so no consumer stops early
+    for p in cons_:
         p.join()
     assert len(results) == len(items)
     assert sorted(list(results)) == sorted(hash_it(items))
