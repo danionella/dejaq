@@ -283,6 +283,29 @@ class NamedLock(NamedSemaphore):
             raise RuntimeError("Over-release of NamedLock on POSIX")
 
 
+class _SharedMemory(shared_memory.SharedMemory):
+    """SharedMemory that owns the views derived from it and releases them in close().
+
+    A live derived view (e.g. ``buf.cast("q")``) keeps the mapping exported, so closing fails with
+    ``BufferError: cannot close exported pointers exist``. Normally the view is dropped first, but the
+    garbage collector may finalize the SharedMemory before its views (seen at interpreter shutdown on
+    free-threaded CPython 3.14t). Releasing owned views in close() makes the order irrelevant.
+    """
+
+    _views: tuple = ()
+
+    def cast(self, fmt: str) -> memoryview:
+        view = self.buf.cast(fmt)
+        self._views = (*self._views, view)
+        return view
+
+    def close(self) -> None:
+        views, self._views = self._views, ()
+        for view in views:
+            view.release()
+        super().close()
+
+
 class NamedByteRing:
     """Manager/Condition-free ring buffer queue (bytes) with named semaphores.
        Pickleable across independently started processes.
@@ -305,10 +328,10 @@ class NamedByteRing:
         st_name = ("NS_" + base) if _IS_WIN else base + "_S"
         self._owns = create
         if create:
-            self._state_mem = shared_memory.SharedMemory(create=True, name=st_name, size=8 * 5)
+            self._state_mem = _SharedMemory(create=True, name=st_name, size=8 * 5)
         else:
-            self._state_mem = shared_memory.SharedMemory(name=st_name)
-        self._state = self._state_mem.buf.cast("q")
+            self._state_mem = _SharedMemory(name=st_name)
+        self._state = self._state_mem.cast("q")
         if create:
             self._state[0:5] = array.array("q", [0, 0, 0, 0, buffer_bytes])
             self.cap = buffer_bytes
@@ -504,8 +527,8 @@ class NamedByteRing:
         self._state_name = s["state_name"]
         self._buf_name = s["buf_name"]
         self.cap = s["cap"]
-        self._state_mem = shared_memory.SharedMemory(name=self._state_name)
-        self._state = self._state_mem.buf.cast("q")
+        self._state_mem = _SharedMemory(name=self._state_name)
+        self._state = self._state_mem.cast("q")
         self.buf = shared_memory.SharedMemory(name=self._buf_name)
         self._put_lock = NamedLock(s["locks"][0]["name"], create=False)
         self._get_lock = NamedLock(s["locks"][1]["name"], create=False)
