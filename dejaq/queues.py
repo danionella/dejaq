@@ -15,11 +15,20 @@ logger = logging.getLogger(__name__)
 
 class _pickleall:
     """Pickle backend that tries pickle first, then cloudpickle."""
-    def dumps(*args, **kwargs):
+    def dumps(obj, protocol=None, *, buffer_callback=None):
+        # Out-of-band buffers are collected first and only handed on from the attempt that succeeded:
+        # pickle may emit some buffers before it fails, which would otherwise mix with cloudpickle's.
+        bufs = []
         try:
-            return pickle.dumps(*args, **kwargs)
-        except pickle.PicklingError:
-            return cloudpickle.dumps(*args, **kwargs)
+            data = pickle.dumps(obj, protocol=protocol, buffer_callback=bufs.append)
+        except (pickle.PicklingError, AttributeError, TypeError):
+            # lambdas and local functions/classes: PicklingError on 3.14+, AttributeError before
+            bufs = []
+            data = cloudpickle.dumps(obj, protocol=protocol, buffer_callback=bufs.append)
+        if buffer_callback is not None:
+            for b in bufs:
+                buffer_callback(b)
+        return data
 
     def loads(*args, **kwargs):
         return pickle.loads(*args, **kwargs)
@@ -37,14 +46,25 @@ def _safe_base(prefix: str = "ns") -> str:
     return f"{prefix}{os.getpid():x}{os.urandom(2).hex()}"
 
 
+_DARWIN_NAME_MAX = 31  # macOS limit for POSIX semaphore names, including the leading '/'
+
+
 def _posix_name(base: str) -> str:
-    """Return a POSIX-safe name (macOS ≤31 bytes including '/')."""
+    """Return a POSIX-safe name (macOS ≤31 bytes including '/').
+
+    Names that are too long for macOS are shortened to a prefix plus a hash of the full name, so
+    different long names (e.g. a queue's '_Lp' and '_Lg' locks) stay distinct, and every process
+    derives the same short name. The result is a fixed point: applying this again (e.g. after
+    unpickling a semaphore by its name) returns it unchanged. Names that fit are unchanged from
+    earlier versions, so processes running different dejaq versions still agree on them.
+    """
     nm = "/" + "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in base)
-    if sys.platform == "darwin":
-        b = nm.encode()[:31]
-        nm = b.decode("ascii", "ignore")
-        if not nm.startswith("/"):
-            nm = "/" + nm.lstrip("/")
+    if sys.platform == "darwin" and len(nm.encode()) > _DARWIN_NAME_MAX:
+        import hashlib
+
+        digest = hashlib.blake2s(nm.encode(), digest_size=6).hexdigest()  # 12 hex chars
+        keep = _DARWIN_NAME_MAX - len(digest) - 1
+        nm = nm.encode()[:keep].decode("utf-8", "ignore") + "-" + digest
     return nm
 
 
@@ -598,22 +618,29 @@ class DejaQueue(NamedByteRing):
                     segs.append(_copy_span(cursor, n))  # wrapped -> copy
                 cursor += n
 
-            obj = _pickle_backend.loads(segs[0], buffers=[m for m in segs[1:]])
-
-            if callback is None:
-                out = deepcopy(obj)
-            else:
-                out = callback(obj)
-
-            if not peek_only:
-                with self._state_lock:
-                    self._state[0] = (head0 + total) % cap  # advance after loads()
-                    self._state[2] = int(self._state[2]) - 1
-                self._space_gate.release(1)
-            else:
-                self._items.release(1)
-
+            try:
+                obj = _pickle_backend.loads(segs[0], buffers=[m for m in segs[1:]])
+                out = deepcopy(obj) if callback is None else callback(obj)
+            except BaseException as e:
+                # Never leave a failing item at the head with its count consumed: every later get()
+                # would fail on it again. A get that fails while unpickling/copying/in the callback
+                # drops the item (as a successful get would); a failed peek, or an interrupt
+                # (KeyboardInterrupt, SystemExit), leaves it in the queue.
+                segs = obj = None  # release views of the ring before its space is reused
+                self._finish_get(head0, total, consume=isinstance(e, Exception) and not peek_only)
+                raise
+            self._finish_get(head0, total, consume=not peek_only)  # advance only after loads()
             return out
+
+    def _finish_get(self, head0: int, total: int, consume: bool) -> None:
+        """Caller holds get_lock and one count of _items. Drop the item at head0, or put the count back."""
+        if consume:
+            with self._state_lock:
+                self._state[0] = (head0 + total) % self.cap
+                self._state[2] = int(self._state[2]) - 1
+            self._space_gate.release(1)
+        else:
+            self._items.release(1)
 
     def __iter__(self):
         while True:
