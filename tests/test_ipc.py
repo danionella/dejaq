@@ -84,6 +84,30 @@ def test_named_lock_over_release():
     lk.close()
 
 
+_EXIT_CHILD = """
+from dejaq.queues import DejaQueue, NamedByteRing
+q = DejaQueue(1_000_000)
+q.put({"a": 1})
+assert q.get() == {"a": 1}
+q2 = NamedByteRing(1_000_000)
+print("ok")
+"""  # queues deliberately left alive until interpreter shutdown
+
+
+def test_queue_alive_at_exit_closes_cleanly(tmp_path):
+    """No 'BufferError: cannot close exported pointers exist' when a queue lives until shutdown (seen on 3.14t)."""
+    import subprocess, sys
+
+    # run as a script file: with `python -c` the shutdown order differs and the bug does not show
+    script = tmp_path / "child.py"
+    script.write_text(_EXIT_CHILD)
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [repo_root, os.environ.get("PYTHONPATH")])))
+    r = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=60, env=env)
+    assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr
+    assert "BufferError" not in r.stderr and "Exception ignored" not in r.stderr, r.stderr
+
+
 def test_named_semaphore_open_missing():
     if _IS_WIN:
         expected = FileNotFoundError
