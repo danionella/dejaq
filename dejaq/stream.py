@@ -191,9 +191,7 @@ from tqdm.auto import tqdm
 
 from .queues import NamedSemaphore, DejaQueue
 
-logging.basicConfig(
-    level=logging.INFO, format="%(processName)s %(levelname)s: %(message)s", stream=sys.stdout, force=True
-)
+logger = logging.getLogger(__name__)
 
 _mp_ctx = mp.get_context("spawn")
 
@@ -522,7 +520,7 @@ class MapNode(BaseNode):
         fcn = cloudpickle.loads(pkl)
         nxt = (wid + 1) % _n_workers
         self._start_event.wait()
-        logging.info(f"Map worker (#: {wid}, PID: {os.getpid()}, input: {self._it}) started.")
+        logger.info(f"Map worker (#: {wid}, PID: {os.getpid()}, input: {self._it}) started.")
         in_sem[wid].acquire()
         iterator = iter(self._it)
         in_sem[wid].release()
@@ -557,7 +555,7 @@ class MapNode(BaseNode):
         out_sem[wid].acquire()
         _out_queue.put(_SENTINEL)
         out_sem[nxt].release()
-        logging.info(f"Map worker (#: {wid}, PID: {os.getpid()}, input: {self._it}) done.")
+        logger.info(f"Map worker (#: {wid}, PID: {os.getpid()}, input: {self._it}) done.")
 
     def stop(self):
         """Stop worker processes.
@@ -594,7 +592,7 @@ class MapNode(BaseNode):
             item = self._out_queue.get()
             if isinstance(item, dict) and item.get("type") == "exception":
                 self._out_queue.put(_SENTINEL)
-                logging.error("Exception in worker: %s: %s\nTraceback:\n%s", item['exc_type'], item['exc_msg'], item['traceback'])
+                logger.error("Exception in worker: %s: %s\nTraceback:\n%s", item['exc_type'], item['exc_msg'], item['traceback'])
                 raise RuntimeError(
                     f"Exception in worker: {item['exc_type']}: {item['exc_msg']}\nTraceback:\n{item['traceback']}"
                 )
@@ -768,10 +766,10 @@ class ManualSource(MapNode):
 
 def _tee_worker(it, queues, cancel_event, start_events):
     for k, start_event in enumerate(start_events):
-        logging.info(f"Waiting for start event {k}")
+        logger.info(f"Waiting for start event {k}")
         start_event.wait()
-        logging.info(f"Start event {k} received")
-    logging.info(f"Tee worker (PID: {os.getpid()}, input: {it}) started.")
+        logger.info(f"Start event {k} received")
+    logger.info(f"Tee worker (PID: {os.getpid()}, input: {it}) started.")
     try:
         for item in it:
             if cancel_event.is_set():
@@ -873,7 +871,7 @@ class ZipNode(BaseNode):
         """Worker function to collect items from a secondary node into a queue."""
         try:
             start_flag.wait()
-            logging.info(f"Zip thread (PID: {os.getpid()}, input: {node}) started.")
+            logger.info(f"Zip thread (PID: {os.getpid()}, input: {node}) started.")
             for item in node:
                 if stop_flag.is_set():
                     break
@@ -882,15 +880,15 @@ class ZipNode(BaseNode):
                 except _queue.Full:
                     pass  # Queue full, skip item if maxlen is set
         except Exception as e:
-            logging.error(f"Error in secondary node: {e}")
-        logging.info(f"Zip thread (PID: {os.getpid()}, input: {node}) done.")
+            logger.error(f"Error in secondary node: {e}")
+        logger.info(f"Zip thread (PID: {os.getpid()}, input: {node}) done.")
 
     @staticmethod
     def _update_latest(node, q, stop_flag, start_flag):
         """Worker function to update the latest item in queue."""
         try:
             start_flag.wait()
-            logging.info(f"Zip thread (PID: {os.getpid()}, input: {node}) started.")
+            logger.info(f"Zip thread (PID: {os.getpid()}, input: {node}) started.")
             for item in node:
                 if stop_flag.is_set():
                     break
@@ -902,8 +900,8 @@ class ZipNode(BaseNode):
                         break
                 q.put(item)
         except Exception as e:
-            logging.error(f"Error in secondary node: {e}")
-        logging.info(f"Zip thread (PID: {os.getpid()}, input: {node}) done.")
+            logger.error(f"Error in secondary node: {e}")
+        logger.info(f"Zip thread (PID: {os.getpid()}, input: {node}) done.")
 
     def _iter_buffer(self, stop_flags, queues, start_flag):
         """Buffer mode: collect all items from secondaries between primary emissions."""

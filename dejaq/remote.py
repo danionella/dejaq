@@ -23,9 +23,7 @@ import cloudpickle
 
 from .queues import DejaQueue
 
-logging.basicConfig(
-    level=logging.INFO, format="%(processName)s %(levelname)s: %(message)s", stream=sys.stdout, force=True
-)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -96,7 +94,7 @@ def _actor_server(pkl: bytes) -> None:
         else (cls.__name__ if hasattr(cls, "__name__") else repr(cls))
     )
 
-    logging.info(f"Actor server started. ID: {req_name}, instance: {cls_name}")
+    logger.info(f"Actor server started. ID: {req_name}, instance: {cls_name}")
 
     rep_cache: Dict[str, DejaQueue] = {}
 
@@ -197,7 +195,7 @@ def _actor_server(pkl: bytes) -> None:
             else:
                 raise ValueError(f"unknown kind {msg.kind!r}")
         except BaseException as e:
-            logging.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
+            logger.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
             ok = False
             payload = (type(e).__name__, e.args, traceback.format_exc())
 
@@ -220,7 +218,7 @@ def _actor_server(pkl: bytes) -> None:
             if reply is not None:
                 repq(reply).put(_Rep(call_id, ok, payload))
         except BaseException as e:
-            logging.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
+            logger.error(f"Actor server caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
             if call_id is not None and reply is not None:
                 try:
                     repq(reply).put(_Rep(call_id, False, (type(e).__name__, e.args, traceback.format_exc())))
@@ -232,8 +230,8 @@ def _actor_server(pkl: bytes) -> None:
         if hasattr(obj, "close"):
             obj.close()
     except Exception as e:
-        logging.error(f"Actor server close() caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
-    logging.info(f"Actor server shutdown. ID: {req_name}, instance: {cls_name}")
+        logger.error(f"Actor server close() caught: {type(e).__name__}{e.args}\n{traceback.format_exc()}")
+    logger.info(f"Actor server shutdown. ID: {req_name}, instance: {cls_name}")
 
 
 def _func_worker(fn_ser: Tuple[str, str] | Callable, req_name: str) -> None:
@@ -396,7 +394,7 @@ class _RemoteMethod:
         if rep.ok:
             return rep.payload
         et, ea, tb = rep.payload
-        logging.error(f"Remote method '{self._name}' of {self._actor.__repr__()} raised: {et}{ea}\n{tb}")
+        logger.error(f"Remote method '{self._name}' of {self._actor.__repr__()} raised: {et}{ea}\n{tb}")
         raise RemoteError(et, ea, tb)
 
     def send(self, *args, **kwargs) -> None:
@@ -597,7 +595,7 @@ class Actor:
             try:             
                 p.join(timeout)
             except Exception:
-                logging.warning("Actor.close: join failed!")
+                logger.warning("Actor.close: join failed!")
                 os.kill(p.pid, signal.SIGINT)
 
     def close(self, timeout: float = 1.0) -> None:

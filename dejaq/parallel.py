@@ -1,9 +1,7 @@
 import gc, sys, traceback, time, datetime
 import logging
-logging.basicConfig(level=logging.INFO)
 
 import multiprocessing as mp
-mp.set_start_method("spawn", force=True)
 import threading
 import concurrent.futures
 

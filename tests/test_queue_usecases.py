@@ -273,3 +273,58 @@ def test_resources_are_released_when_creator_is_gone():
     gc.collect()
     with pytest.raises((FileNotFoundError, OSError)):
         DejaQueue(name=name, create=False)
+
+
+# ---------- get() returns objects that own their memory ----------
+
+def test_returned_arrays_are_writable_and_independent_of_the_ring():
+    """get() copies numpy buffers out of the ring: results stay intact while the ring is reused."""
+    q = DejaQueue(20_000)
+    rng = np.random.default_rng(1)
+    kept = []
+    for i in range(40):  # sizes chosen so that buffers regularly wrap around the end of the ring
+        a = rng.standard_normal(int(rng.integers(1, 1200)))
+        q.put({"i": i, "a": a})
+        got = q.get(timeout=1)
+        assert got["a"].flags.writeable and got["a"].flags.aligned
+        got["a"][0] += 0  # writable in place
+        kept.append((a, got["a"]))
+    for sent, received in kept:  # nothing was overwritten by later items
+        assert np.array_equal(sent, received)
+
+
+def test_peek_returns_an_independent_copy():
+    q = DejaQueue(10_000)
+    q.put(np.arange(5.0))
+    first = q.get(peek_only=True, timeout=1)
+    first[:] = -1
+    assert np.array_equal(q.get(timeout=1), np.arange(5.0))
+
+
+def test_shared_references_within_an_item_are_preserved():
+    x = np.ones(3)
+    q = DejaQueue(10_000)
+    q.put([x, x, {"y": x}])
+    a, b, c = q.get(timeout=1)
+    assert a is b and c["y"] is a
+
+
+@pytest.mark.parametrize("exc, kept", [(MemoryError, False), (KeyboardInterrupt, True)])
+def test_failure_while_copying_keeps_queue_consistent(monkeypatch, exc, kept):
+    """An error while copying an item out drops it (like an unpickling error); an interrupt keeps it."""
+    q = DejaQueue(10_000)
+    q.put(np.arange(10))
+    q.put("next")
+    real_empty = np.empty
+
+    def failing_empty(*args, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(np, "empty", failing_empty)
+    with pytest.raises(exc):
+        q.get(timeout=1)
+    monkeypatch.setattr(np, "empty", real_empty)
+    if kept:
+        assert np.array_equal(q.get(timeout=1), np.arange(10))
+    assert q.get(timeout=1) == "next"
+    assert q.nitems == 0 and q.is_empty
