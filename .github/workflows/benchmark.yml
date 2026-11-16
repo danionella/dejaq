@@ -1,0 +1,62 @@
+# Compares the performance of a pull request (head) with its base branch on Linux, Windows and macOS.
+# Both versions run alternately on the same runner; the results table is in each job's summary.
+
+name: benchmark
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "dejaq/**"
+      - "benchmarks/**"
+      - ".github/workflows/benchmark.yml"
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Baseline to compare with (branch, tag or commit)"
+        default: "main"
+
+jobs:
+  benchmark:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: head
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || inputs.base }}
+          path: base
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install numpy cloudpickle psutil tqdm
+          if [ "$RUNNER_OS" != "Windows" ]; then pip install posix_ipc; fi
+
+      - name: Benchmark base vs head
+        run: python head/benchmarks/ab_bench.py --rounds 5 base=base head=head --markdown bench.md
+
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo "## ${{ matrix.platform }}"
+            python -c "import os, platform; print(f'{platform.platform()}, {platform.machine()}, {os.cpu_count()} CPUs, Python {platform.python_version()}')"
+            echo
+            cat bench.md 2>/dev/null || echo "no results"
+          } >> "$GITHUB_STEP_SUMMARY"
