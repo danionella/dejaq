@@ -3,8 +3,9 @@
 """
 __docformat__ = 'google'
 
-import logging, sys
-logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s [%(name)s:%(lineno)d] %(funcName)s: %(message)s", stream=sys.stdout)
+# Logging configuration is left to the application. dejaq logs to module loggers ("dejaq.*") and adds no
+# handler, so when the application has configured none, warnings and errors (e.g. from worker processes)
+# still reach stderr through logging's last-resort handler.
 
 from .queues import LegacyDejaQueue, DejaQueue
 from .parallel import Parallel
