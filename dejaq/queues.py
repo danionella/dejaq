@@ -1,6 +1,6 @@
 from __future__ import annotations
 import logging
-import os, sys, time, gc, weakref, struct
+import os, sys, time, gc, weakref, struct, threading
 import multiprocessing as mp
 from multiprocessing import shared_memory
 from copy import deepcopy
@@ -50,6 +50,57 @@ def _posix_name(base: str) -> str:
 
 def _win_name(name: str) -> str:
     return name if name.startswith(("Local\\", "Global\\")) else "Local\\" + name
+
+
+# On POSIX, SharedMemory(name=...) registers the segment with the calling process's
+# resource_tracker even when it only attaches to an existing segment. A process started
+# independently (e.g. via subprocess, not as a multiprocessing child) has its own tracker,
+# which unlinks every registered segment when that process exits -- destroying the
+# creator's queue for everyone else. Attachers must therefore not register; the creator
+# keeps its registration (and with it crash cleanup).
+_untracked = threading.local()
+_register_patch_lock = threading.Lock()
+_register_patched = False
+
+
+def _patch_register_once() -> None:
+    """Python < 3.13 (no ``track`` argument): let ``_attach_shm`` suppress registration.
+
+    Unregistering right after attaching is not an option: a multiprocessing child shares its
+    parent's tracker, so it would remove the creator's registration (and the creator's own
+    ``unlink()`` would later make the tracker raise KeyError). Instead, wrap
+    ``resource_tracker.register`` so that it is skipped only in the current thread while
+    ``_attach_shm`` runs; every other call passes through unchanged.
+    """
+    global _register_patched
+    with _register_patch_lock:
+        if _register_patched:
+            return
+        from multiprocessing import resource_tracker
+
+        orig = resource_tracker.register
+
+        def register(name, rtype):
+            if rtype == "shared_memory" and getattr(_untracked, "active", False):
+                return
+            return orig(name, rtype)
+
+        resource_tracker.register = register
+        _register_patched = True
+
+
+def _attach_shm(name: str) -> shared_memory.SharedMemory:
+    """Attach to existing shared memory without registering it with this process's resource tracker."""
+    if _IS_WIN:
+        return shared_memory.SharedMemory(name=name)
+    if sys.version_info >= (3, 13):
+        return shared_memory.SharedMemory(name=name, track=False)
+    _patch_register_once()
+    _untracked.active = True
+    try:
+        return shared_memory.SharedMemory(name=name)
+    finally:
+        _untracked.active = False
 
 
 class NamedSemaphore:
@@ -250,7 +301,7 @@ class NamedByteRing:
         if create:
             self._state_mem = shared_memory.SharedMemory(create=True, name=st_name, size=8 * 5)
         else:
-            self._state_mem = shared_memory.SharedMemory(name=st_name)
+            self._state_mem = _attach_shm(st_name)
         self._state = self._state_mem.buf.cast("q")
         if create:
             self._state[0:5] = array.array("q", [0, 0, 0, 0, buffer_bytes])
@@ -266,7 +317,7 @@ class NamedByteRing:
             _view = np.frombuffer(self.buf.buf, dtype="B", count=buffer_bytes)
             _view[:] = 0
         else:
-            self.buf = shared_memory.SharedMemory(name=buf_name, create=False)
+            self.buf = _attach_shm(buf_name)
         self._buf_name = buf_name
 
         # Sync: serialize producers/consumers + count items + wake producers
@@ -447,9 +498,9 @@ class NamedByteRing:
         self._state_name = s["state_name"]
         self._buf_name = s["buf_name"]
         self.cap = s["cap"]
-        self._state_mem = shared_memory.SharedMemory(name=self._state_name)
+        self._state_mem = _attach_shm(self._state_name)
         self._state = self._state_mem.buf.cast("q")
-        self.buf = shared_memory.SharedMemory(name=self._buf_name)
+        self.buf = _attach_shm(self._buf_name)
         self._put_lock = NamedLock(s["locks"][0]["name"], create=False)
         self._get_lock = NamedLock(s["locks"][1]["name"], create=False)
         self._state_lock = NamedLock(s["locks"][2]["name"], create=False)
@@ -469,20 +520,19 @@ class NamedByteRing:
     @staticmethod
     def _finalize(state_name: str, buf_name: str, owns: bool, auto_unlink: bool) -> None:
         gc.collect()
-        try:
-            shm = shared_memory.SharedMemory(name=state_name)
-            shm.close()
-            if owns and auto_unlink:
+        # Only the creator unlinks. Re-opening by name for anything else would be a no-op at
+        # best, and on POSIX < 3.13 would register the segment with an attacher's own
+        # resource tracker, which then unlinks it when that process exits.
+        if not (owns and auto_unlink):
+            return
+        for name in (state_name, buf_name):
+            try:
+                # Tracked open on purpose: unlink() then also drops the creator's registration.
+                shm = shared_memory.SharedMemory(name=name)
+                shm.close()
                 shm.unlink()
-        except Exception:
-            pass
-        try:
-            shm = shared_memory.SharedMemory(name=buf_name)
-            shm.close()
-            if owns and auto_unlink:
-                shm.unlink()
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     def __del__(self):
         try:
