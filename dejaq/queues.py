@@ -1,6 +1,6 @@
 from __future__ import annotations
 import logging
-import errno, numbers, os, sys, time, warnings, weakref, struct, threading
+import atexit, collections, contextlib, errno, gc, numbers, os, sys, time, warnings, weakref, struct, threading
 import queue as _stdqueue
 import multiprocessing as mp
 from multiprocessing import shared_memory
@@ -208,15 +208,57 @@ def _attach_shm(name: str, cls=shared_memory.SharedMemory) -> shared_memory.Shar
         _untracked.active = False
 
 
+# The resource tracker must not be called by a finalizer that the garbage collector runs while the tracker
+# itself is busy in this thread: Python >= 3.11.7 / 3.12.1 then skips the call with a warning, earlier
+# versions deadlock. So finalizers run by the garbage collector only queue their tracker calls, which are
+# sent with the next call from regular code (or at exit); and dejaq's own tracker calls pause the garbage
+# collector, so that it cannot run finalizers (of dejaq or anything else) inside them.
+_gc_running = False
+_tracker_backlog: "collections.deque" = collections.deque()
+
+
+def _note_gc(phase: str, info: dict) -> None:
+    global _gc_running
+    _gc_running = phase == "start"
+
+
+gc.callbacks.append(_note_gc)
+
+
+@contextlib.contextmanager
+def _gc_paused():
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+
+
 def _tracker(action: str, name: str, rtype: str) -> None:
     """Register/unregister a POSIX resource with this process's multiprocessing resource tracker, which
     removes still-registered resources when the process tree's main process ends (also after a crash)."""
+    _tracker_backlog.append((action, name, rtype))
+    if not _gc_running:
+        _flush_tracker_backlog()
+
+
+def _flush_tracker_backlog() -> None:
+    if not _tracker_backlog:
+        return
     from multiprocessing import resource_tracker
 
-    try:
-        getattr(resource_tracker, action)(name, rtype)
-    except Exception:  # crash cleanup is best effort
-        pass
+    with _gc_paused():
+        while _tracker_backlog:
+            action, name, rtype = _tracker_backlog.popleft()
+            try:
+                getattr(resource_tracker, action)(name, rtype)
+            except Exception:  # crash cleanup is best effort
+                pass
+
+
+atexit.register(_flush_tracker_backlog)  # calls queued by the last garbage collections
 
 
 # POSIX lock files live in a fixed directory (not $TMPDIR, which may differ between processes): every
@@ -653,18 +695,14 @@ def _untrack_shm(shm) -> None:
 def _unlink_shm(shm, tracked: bool) -> None:
     if _IS_WIN:  # the segment disappears with its last handle
         return
-    if tracked:
-        try:
-            shm.unlink()  # also unregisters it from the resource tracker
-        except FileNotFoundError:
-            _tracker("unregister", shm._name, "shared_memory")
-    else:
-        import _posixshmem
+    import _posixshmem
 
-        try:
-            _posixshmem.shm_unlink(shm._name)
-        except FileNotFoundError:
-            pass
+    try:
+        _posixshmem.shm_unlink(shm._name)  # (not shm.unlink(): it calls the resource tracker directly)
+    except FileNotFoundError:
+        pass
+    if tracked:
+        _tracker("unregister", shm._name, "shared_memory")
 
 
 class _RingResources:
@@ -821,10 +859,11 @@ class NamedByteRing:
         st_name, buf_name, lock_names, sem_names = self._names(base)
         shms, others = [], []  # removed again if any step fails
         try:
-            state_mem = _SharedMemory(create=True, name=st_name, size=8 * _STATE_SLOTS)
-            shms.append(state_mem)
-            buf = shared_memory.SharedMemory(name=buf_name, create=True, size=buffer_bytes)
-            shms.append(buf)
+            with _gc_paused():  # creating shared memory registers it with the resource tracker
+                state_mem = _SharedMemory(create=True, name=st_name, size=8 * _STATE_SLOTS)
+                shms.append(state_mem)
+                buf = shared_memory.SharedMemory(name=buf_name, create=True, size=buffer_bytes)
+                shms.append(buf)
             if not self._auto_unlink:
                 for shm in shms:
                     _untrack_shm(shm)

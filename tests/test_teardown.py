@@ -241,3 +241,32 @@ def test_attacher_exit_does_not_remove_the_queue(how):
     assert len(queue_leftovers(q._base)) == 7
     DejaQueue(name=q._base, create=False).put(1)  # new processes can still attach
     assert q.get(timeout=1) == 1
+
+
+_GC_INSIDE_TRACKER = """
+import gc, warnings
+from multiprocessing import resource_tracker
+from dejaq.queues import DejaQueue, NamedSemaphore
+warnings.simplefilter("always")
+
+def garbage():  # objects that only the garbage collector can free
+    q = DejaQueue(4096); q.put(1); q.get(); q.cycle = q
+    s = NamedSemaphore(); s.cycle = s
+
+tracker = resource_tracker._resource_tracker
+tracker.ensure_running()
+for _ in range(5):
+    garbage()
+    with tracker._lock:  # as if the collector ran while the tracker is busy in this thread
+        gc.collect()
+print("ok")
+"""
+
+
+@pytest.mark.skipif(_IS_WIN, reason="no resource tracker on Windows")
+def test_garbage_collection_while_resource_tracker_is_busy():
+    """Finalizers run by the garbage collector must not call into a busy resource tracker (Python >= 3.11.7:
+    skipped with a warning, so the tracker's records go stale; earlier versions: deadlock)."""
+    r = _run_python(_GC_INSIDE_TRACKER)
+    assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr
+    assert r.stderr.strip() == "", r.stderr  # no reentrancy warnings, no "leaked" warnings at exit
