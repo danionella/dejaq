@@ -534,53 +534,88 @@ class WorkerWrapper:
         return mapper
 
 
+def _ticks():
+    return iter(datetime.datetime.now, None)  # now() never returns None: endless
+
+
 class Startable:
-    """ Wrap an iterable so iteration blocks until .start() is called. Works across processes.
+    """ Wraps an iterable so that iteration waits until start() is called. Works across processes: it can be
+    the input of a stage (iterated in a worker) and be started, paused and stopped from the main process.
 
     Args:
-        source (iterable or callable): an iterable or a zero-arg factory function that produces
-        emit_one (bool): if True, iteration will pause after each item until .start() is called again
-        ctx (str): multiprocessing context (default: "spawn")
+        source (iterable or callable): an iterable, or a zero-argument function that returns one (called where
+            the Startable is first iterated, e.g. in a worker)
+        emit_one (bool): if False (default), items are emitted from start() until pause() or stop(); if True, each
+            start() lets one more item through
+
+    Call start(), pause() and stop() from one process (e.g. the one that created the Startable).
     """
     def __init__(self, source, emit_one=False):
-        self._start = ctx.Event()
-        self._done  = ctx.Event()
-        self._source = source      # iterable OR zero-arg factory
+        self._source = source  # iterable OR zero-arg factory
+        self._emit_one = bool(emit_one)
+        # continuous: the gate holds 1 count while running (each item passes it); emit_one: 1 count per item
+        self._gate = NamedSemaphore()
+        self._stopped = NamedSemaphore()  # holds 1 count once stopped
+        self._running = False  # (known in the controlling process)
+        self._lock = threading.Lock()
         self._it = None
-        self._emit_one = ctx.Value("b", emit_one)
 
     def start(self):
-        self._start.set()
+        with self._lock:
+            if self._emit_one:
+                self._gate.release()
+            elif not self._running:
+                self._gate.release()
+                self._running = True
         return self
 
     def pause(self):
-        self._start.clear()
+        with self._lock:
+            if self._emit_one:
+                while self._gate.acquire(timeout=0):  # withdraw items not yet emitted
+                    pass
+            elif self._running:
+                self._gate.acquire()
+                self._running = False
         return self
 
     def stop(self):
-        self._done.set()
-        self._start.set()          # release any waiters
+        self._stopped.release()
+        self._gate.release()  # wake a waiting consumer
         return self
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        self._start.wait()
-        if self._done.is_set():
+        self._gate.acquire()
+        if self._stopped.acquire(timeout=0):
+            self._stopped.release()  # stays stopped
+            self._gate.release()  # for the next consumer (or next call)
             raise StopIteration
+        if not self._emit_one:
+            self._gate.release()
         if self._it is None:
             src = self._source() if callable(self._source) else self._source
-            self._it = iter(src)   # created in the consumer process
-        if self._emit_one.value:
-            self._start.clear()
+            self._it = iter(src)  # created in the consumer process
         return next(self._it)
 
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state["_lock"] = None
+        state["_it"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+
+
 class Ticker(Startable):
-    """ An iterable that yields the current datetime when started.
+    """ An iterable that yields the current datetime while started (see Startable).
     """
     def __init__(self, emit_one=False):
-        super().__init__(iter(datetime.datetime.now, object()), emit_one=emit_one)
+        super().__init__(_ticks, emit_one=emit_one)
 
 def _tee_worker(pkl, queues, done):
     _exit_with_parent()

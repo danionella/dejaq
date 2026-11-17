@@ -198,8 +198,9 @@ def _pipe_1_4_1_mb(n=2_000):
 
 def _pipe_tee(n=20_000):
     def make():
-        a, b = _stage(_ident, range(n), 1).tee(2)
-        return [a, b, zip(a, b)]
+        up = _stage(_ident, range(n), 1)  # referenced: dejaq <= 0.8 lost a temporary stage
+        a, b = up.tee(2)
+        return [up, a, b, zip(a, b)]
     return _timed(make, n)
 
 

@@ -288,3 +288,61 @@ def test_unordered_errors_and_downstream_stages():
         Parallel(n_workers=3, ordered=False)(fails_at_3)(range(10)).run(progress=False)
     up = Parallel(n_workers=3, ordered=False)(add5)(range(20))
     assert sorted(Parallel(n_workers=2)(ident)(up).run(progress=False)) == [i + 5 for i in range(20)]
+
+
+# ---------- Startable and Ticker as the input of a stage ----------
+
+def test_startable_input_waits_for_start():
+    from dejaq.parallel import Startable
+    s = Startable(range(5))
+    stage = Parallel(n_workers=1)(add5)(s)
+    it = iter(stage)
+    time.sleep(1.0)
+    assert stage._out_queue.nitems == 0  # nothing before start()
+    s.start()
+    assert [next(it) for _ in range(5)] == [5, 6, 7, 8, 9]
+
+
+def test_startable_emit_one_and_stop_across_processes():
+    from dejaq.parallel import Startable
+    s = Startable(range(100), emit_one=True)
+    stage = Parallel(n_workers=2)(add5)(s)
+    it = iter(stage)
+    got = []
+    for _ in range(3):
+        s.start()
+        got.append(next(it))
+    time.sleep(0.5)
+    assert got == [5, 6, 7] and stage._out_queue.nitems == 0  # one item per start()
+    s.stop()
+    assert list(it) == []
+
+
+def test_startable_pause():
+    from dejaq.parallel import Startable
+    s = Startable(range(1000))
+    it = iter(s)
+    s.start()
+    assert next(it) == 0
+    s.pause()
+    import threading
+    out = []
+    t = threading.Thread(target=lambda: out.append(next(it)), daemon=True)
+    t.start()
+    t.join(0.5)
+    assert not out  # waits while paused
+    s.start()
+    t.join(5)
+    assert out == [1]
+
+
+def test_ticker_as_stage_input():
+    import datetime
+    from dejaq.parallel import Ticker
+    t = Ticker(emit_one=True)
+    stage = Parallel(n_workers=1)(ident)(t)
+    it = iter(stage)
+    t.start()
+    assert isinstance(next(it), datetime.datetime)
+    t.stop()
+    assert list(it) == []
