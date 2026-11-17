@@ -11,59 +11,31 @@ from .queues import DejaQueue, NamedSemaphore, ShutDown, Full, _pickle_backend
 
 ctx = mp.get_context("spawn")
 
-def passthrough(item):
-    return item
-
-def printer(*args, **kwargs):
-    print(args, kwargs)
-
-
 class WorkerError(RuntimeError):
     """A worker process failed: it died (e.g. killed by the out-of-memory killer), or raised an exception that
     could not be passed on (the original type and message are in the error message)."""
 
 
 class _RemoteTraceback(Exception):
-    """Carries a worker's traceback text; set as the __cause__ of a re-raised worker exception."""
+    """The worker's traceback text (the __cause__ of a re-raised worker exception)."""
 
-    def __init__(self, tb: str) -> None:
-        super().__init__(tb)
-        self.tb = tb
-
-    def __str__(self) -> str:
-        return self.tb
+    def __str__(self):
+        return self.args[0]
 
 
 class _WorkerException:
-    """Queue item: an exception raised in a worker (the exception itself, if it can be passed on)."""
+    """Queue item: an exception raised in a worker (as WorkerError if it cannot be passed on)."""
 
     def __init__(self, exc: BaseException) -> None:
         self.tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        self.type_name = f"{type(exc).__module__}.{type(exc).__qualname__}"
-        self.message = str(exc)
         try:
             pickle.loads(_pickle_backend.dumps(exc, protocol=5))  # as the queue will pickle it
             self.exc = exc
         except Exception:
-            self.exc = None
+            self.exc = WorkerError(f"{type(exc).__module__}.{type(exc).__qualname__}: {exc}")
 
     def reraise(self):
-        if self.exc is not None:
-            raise self.exc from _RemoteTraceback(self.tb)
-        raise WorkerError(f"{self.type_name}: {self.message}") from _RemoteTraceback(self.tb)
-
-    def __getstate__(self):
-        state = dict(self.__dict__)
-        if state["exc"] is not None:
-            state["exc"] = state["exc"].with_traceback(None)  # tracebacks cannot be pickled
-        return state
-
-
-class _WorkerDied:
-    """Queue item: a worker of this stage exited abnormally (put by the monitor in the creating process)."""
-
-    def __init__(self, pid: int, exitcode: int) -> None:
-        self.pid, self.exitcode = pid, exitcode
+        raise self.exc from _RemoteTraceback(self.tb)
 
 
 class _Stop:
@@ -94,46 +66,18 @@ _PARENT_CHECK_INTERVAL = 0.5
 _STOP_GRACE = 0.1  # seconds that close() gives workers to end by themselves after their queue was shut down
 
 
-_me = None
-
-
-def _identity():
-    """(pid, start time) of this process, for its workers' watchdog (see _exit_with_parent)."""
-    global _me
-    if _me is None or _me[0] != os.getpid():
-        _me = (os.getpid(), psutil.Process().create_time())
-    return _me
-
-
-def _exit_with_parent(parent) -> None:
-    """In a worker: exit once the parent process (pid, start time) is gone.
-
-    Stopping a worker (terminate) skips its cleanup, and a parent that crashes (or a Jupyter kernel that is
-    killed) leaves its workers blocked on a queue. Either way, processes would be left running. With this
-    watchdog they exit, and in turn their own child processes, e.g. those of a stage created in a worker.
-    The parent is identified by the creating process (not os.getppid() at this point: a worker that is still
-    starting when its parent dies would otherwise watch the process that adopted it).
-    """
-    ppid, started = parent
+def _exit_with_parent(ppid) -> None:
+    """In a worker: exit once the creating process is gone (it crashed, or terminated this worker's parent
+    stage), so that no worker stays blocked on a queue (POSIX: the orphan is adopted; Windows: not running)."""
     try:
         proc = psutil.Process(ppid)
-        alive = proc.create_time() == started and proc.status() != psutil.STATUS_ZOMBIE
     except psutil.Error:
-        alive = False
-    if not alive:
         os._exit(1)
 
     def watch():
-        while True:
+        while os.getppid() == ppid and proc.is_running():
             time.sleep(_PARENT_CHECK_INTERVAL)
-            try:
-                # POSIX: an orphan is adopted by another process (also while its dead parent is a zombie);
-                # Windows: the parent is no longer running (is_running also detects pid reuse)
-                gone = os.getppid() != ppid or not proc.is_running()
-            except Exception:
-                gone = True
-            if gone:
-                os._exit(1)
+        os._exit(1)
 
     threading.Thread(target=watch, name="dejaq-parent-watchdog", daemon=True).start()
 
@@ -145,31 +89,36 @@ def _forwardable(it) -> bool:
     return isinstance(it, lazymap)
 
 
-def _forward(it, out_queue, fcn=None, kwargs=None) -> None:
-    """Pass on the results of a stage (or tuples of the results of zipped stages), or fcn of them, without a
-    private copy: the item (and the result) is handled inside get(callback=...), while its arrays still view the
-    source queue's memory, so they are copied once, straight from queue to queue. Ends like zip(): at the end of
-    any source."""
+def _forward(it, outs, fcn=None, kwargs=None) -> None:
+    """Pass on the results of a stage (or tuples of the results of zipped stages), or fcn of them, to each queue
+    in outs without a private copy: the item (and the result) is handled inside get(callback=...), while its
+    arrays still view the source queue's memory, so they are copied once, straight from queue to queue. Ends
+    like zip(): at the end of any source; then puts the stop signal (an error before it)."""
     kwargs = kwargs or {}
     sources = it._iterables if isinstance(it, _Zipped) else [it]
-    for src in sources:
-        if src._start_type == "lazy":  # (as iterating it would)
-            src._start()
-    queues = [src._out_queue for src in sources]
-    zipped = isinstance(it, _Zipped)
+    live = list(outs)
+
+    def put(res):
+        for q in list(live):
+            try:
+                q.put(res)  # (before the source's memory is released: also a view of the item is safe)
+            except ShutDown:  # e.g. a tee branch was closed
+                live.remove(q)
+            except Exception as e:  # e.g. the result cannot be pickled
+                q.put(_WorkerException(e))
 
     def take(i, items):
         def got(item):
             kind = type(item)
             if kind is _Stop:
                 return False
-            if kind is _WorkerException or kind is _WorkerDied:
-                out_queue.put(item)  # the consumer raises it
+            if kind is _WorkerException:
+                put(item)  # the consumer raises it
                 return False
             items.append(item)
-            if i + 1 < len(queues):
+            if i + 1 < len(sources):
                 return take(i + 1, items)
-            res = tuple(items) if zipped else items[0]
+            res = tuple(items) if isinstance(it, _Zipped) else items[0]
             go_on = True
             if fcn is not None:
                 try:
@@ -178,18 +127,23 @@ def _forward(it, out_queue, fcn=None, kwargs=None) -> None:
                     res = _WorkerException(e)
                 except BaseException as e:  # e.g. sys.exit() in fcn: pass it on, then stop
                     res, go_on = _WorkerException(e), False
-            try:
-                out_queue.put(res)  # (before the source's memory is released: also a view of the item is safe)
-            except Exception as e:  # e.g. the result cannot be pickled
-                out_queue.put(_WorkerException(e))
-            return go_on
+            put(res)
+            return go_on and bool(live)
         try:
-            return queues[i].get(callback=got)
+            return sources[i]._out_queue.get(callback=got)
         except ShutDown:
             raise RuntimeError("a stage feeding this one was closed") from None
 
-    while take(0, []):
-        pass
+    try:
+        for src in sources:
+            if src._start_type == "lazy":  # (as iterating it would)
+                src._start()
+        while take(0, []):
+            pass
+    except BaseException as e:
+        put(_WorkerException(e))
+    for q in live:
+        _put_stop(q)
 
 
 def _keep(obj):
@@ -208,29 +162,15 @@ def _put_stop(q) -> None:
 
 
 def _stop_processes(procs, lock=None, timeout=1.0, grace=0.0) -> None:
-    """Terminate (if still running) and join processes; first wait up to `grace` seconds for them to end."""
+    """Wait up to `grace` s for the processes to end, terminate those left, and kill those alive after `timeout` s."""
     with lock or threading.Lock():
-        deadline = time.monotonic() + grace
-        for p in procs:
-            try:
-                p.join(max(0.0, deadline - time.monotonic()))
-            except Exception:
-                pass
-        for p in procs:
-            try:
-                if p.is_alive():
-                    p.terminate()
-            except Exception:
-                pass
-        deadline = time.monotonic() + timeout
-        for p in procs:
-            try:
-                p.join(max(0.0, deadline - time.monotonic()))
-                if p.is_alive():
-                    p.kill()
-                    p.join(1.0)
-            except Exception:
-                pass
+        for wait, stop in ((grace, "terminate"), (timeout, "kill"), (1.0, None)):
+            end = time.monotonic() + wait
+            for p in procs:
+                p.join(max(0.0, end - time.monotonic()))
+            for p in procs:
+                if stop and p.is_alive():
+                    getattr(p, stop)()
 
 
 # One monitor thread per process watches the workers of the lazymaps this process created (only the parent of
@@ -306,11 +246,10 @@ class lazymap:
             raise ValueError("zero_copy=True needs n_workers=1 (the function runs while the input item is held)")
         if start_type not in ("lazy", "eager", "manual"):
             raise ValueError(f"start_type must be 'lazy', 'eager' or 'manual', not {start_type!r}")
-        self._own_input = None
         self._closed = False
         if n_workers > 1 and not isinstance(it, lazymap):
             # one process reads the input, so that a stateful iterable (e.g. a file reader) is read only once
-            it = self._own_input = lazymap(None, it, n_workers=1, buffer_bytes=buffer_bytes)
+            it = lazymap(None, it, n_workers=1, buffer_bytes=buffer_bytes)
         self._it = it
         self._start_type = start_type
         self._out_queue = DejaQueue(buffer_bytes)
@@ -326,26 +265,24 @@ class lazymap:
             # gate lets only the first one through, so that exactly one input token circulates.
             self._start_gate = NamedSemaphore(initial=1)
         self._out_sem[0].release()
-        self._n_workers = n_workers
         self._buffer_bytes = buffer_bytes
         self._done = ctx.RawArray("b", n_workers)  # set by each worker when it finished normally
         pkl = cloudpickle.dumps((fcn, self._it, kwargs))
-        self._ordered = ordered
+        # ordered=False: workers share their input queue (whoever is free takes the next item); the last one to
+        # finish puts the stop signal (kept referenced here until the workers have opened it)
         self._finished = finished = None if ordered else NamedSemaphore(initial=n_workers - 1)
-        # (unordered workers simply share their input queue: whoever is free takes the next item)
         worker_args = (pkl, self._out_queue, n_workers, self._in_sem, self._out_sem, self._done, ordered, finished,
                        zero_copy)
         self._procs = procs = []
         self._owner = True  # only the creating process stops the workers (not pickled copies in other workers)
-        self._closing = False
         self._reported = set()
         self._procs_lock = threading.Lock()  # exit codes are read by the monitor, workers joined by close()
-        # Stops the workers when this object is garbage-collected (also if starting them fails part-way), or at
-        # interpreter exit before Python waits for its child processes (which would otherwise wait forever for
-        # workers blocked on a full queue).
-        self._finalizer = _mp_util.Finalize(self, _stop_processes, args=(procs, self._procs_lock), exitpriority=10)
+        # stops the workers at close(), garbage collection (also if starting them fails part-way) or interpreter
+        # exit, before Python waits for its child processes (which may be blocked on a full queue)
+        self._finalizer = _mp_util.Finalize(self, _stop_processes, args=(procs, self._procs_lock),
+                                            kwargs={"grace": _STOP_GRACE}, exitpriority=10)
         for pid in range(n_workers):
-            p = ctx.Process(target=self._worker_fcn, args=(_identity(), pid, *worker_args))
+            p = ctx.Process(target=self._worker_fcn, args=(os.getpid(), pid, *worker_args))
             p.start()
             procs.append(p)
         self.pids = [p.pid for p in procs]
@@ -396,9 +333,6 @@ class lazymap:
                 if kind is _WorkerException:
                     q.get(callback=_drop)
                     item.reraise()
-                if kind is _WorkerDied:
-                    q.get(callback=_drop)
-                    raise WorkerError(f"worker process {item.pid} died (exit code {item.exitcode})")
                 held = True
                 yield item
         except GeneratorExit:  # left early: the item handed out last counts as taken
@@ -432,8 +366,6 @@ class lazymap:
                     return
                 if kind is _WorkerException:
                     item.reraise()
-                if kind is _WorkerDied:
-                    raise WorkerError(f"worker process {item.pid} died (exit code {item.exitcode})")
                 yield item
         except GeneratorExit:  # the loop was left early: the workers keep going, iterating again continues
             raise
@@ -464,14 +396,7 @@ class lazymap:
         nxt = (pid + 1) % _n_workers
         in_sem[pid].acquire()  # the start signal
         if failure is None and _n_workers == 1 and (fcn is None or zero_copy) and _forwardable(it):  # e.g. zip()
-            try:
-                _forward(it, _out_queue, fcn, kwargs)
-            except BaseException as e:
-                try:
-                    _out_queue.put(_WorkerException(e))
-                except Exception:
-                    pass
-            _put_stop(_out_queue)
+            _forward(it, [_out_queue], fcn, kwargs)
             done[pid] = 1
             return
         if failure is None:
@@ -528,7 +453,7 @@ class lazymap:
 
     def _check_workers(self) -> None:
         """Called by the monitor thread: report workers that exited abnormally to the consumer."""
-        if self._closing:
+        if self._closed:
             return
         with self._procs_lock:
             for i, p in enumerate(self._procs):
@@ -538,7 +463,8 @@ class lazymap:
                 if code is None or (code == 0 and self._done[i]):
                     continue
                 try:
-                    self._out_queue.put(_WorkerDied(p.pid, code), timeout=0.2)
+                    died = WorkerError(f"worker process {p.pid} died (exit code {code})")
+                    self._out_queue.put(_WorkerException(died), timeout=0.2)
                 except (Full, ShutDown):
                     continue  # try again at the next check
                 self._reported.add(p.pid)
@@ -549,7 +475,7 @@ class lazymap:
         '''
         if not getattr(self, "_owner", False) or self._closed:
             return
-        self._closing = self._closed = True
+        self._closed = True
         _monitored.discard(self)
         # Order matters: a process that is terminated inside a queue operation can leave that queue's internal
         # lock held, so a queue is shut down while every process that uses it still runs. Hence the input stages
@@ -561,8 +487,7 @@ class lazymap:
             self._out_queue.shutdown()
         except Exception:
             pass
-        self._finalizer.cancel()
-        _stop_processes(self._procs, self._procs_lock, grace=_STOP_GRACE)
+        self._finalizer()
 
     def __enter__(self):
         return self
@@ -576,9 +501,6 @@ class lazymap:
             state.pop(k, None)
         state["_owner"] = False
         return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
 
     def compute(self, progress=True, ndarray=False, tqdm_args=None):
         ''' Computes the results of the lazymap and returns them as a list (or a numpy array)
@@ -603,9 +525,7 @@ class lazymap:
                 return out
         return out
 
-    def run(self, progress=True, ndarray=False, tqdm_args=None):
-        ''' Same as compute(): runs the lazymap and returns its results as a list (or a numpy array). '''
-        return self.compute(progress=progress, ndarray=ndarray, tqdm_args=tqdm_args)
+    run = compute
 
     def submit(self):
         ''' Submits the computation to a background thread and returns a Future object.
@@ -650,7 +570,7 @@ class lazymap:
 
 
 def Parallel(n_workers=1, buffer_bytes=10e6, ordered=True, zero_copy=False):
-    ''' A wrapper to make a class or callablle a parallel worker. Can be used as a decorator.
+    ''' A wrapper to make a class or callable a parallel worker. Can be used as a decorator.
 
     Args:
         n_workers (int): number of workers (default: 1)
@@ -722,26 +642,21 @@ class Startable:
         self._gate = NamedSemaphore()
         self._stopped = NamedSemaphore()  # holds 1 count once stopped
         self._running = False  # (known in the controlling process)
-        self._lock = threading.Lock()
         self._it = None
 
     def start(self):
-        with self._lock:
-            if self._emit_one:
-                self._gate.release()
-            elif not self._running:
-                self._gate.release()
-                self._running = True
+        if self._emit_one or not self._running:
+            self._gate.release()
+            self._running = not self._emit_one
         return self
 
     def pause(self):
-        with self._lock:
-            if self._emit_one:
-                while self._gate.acquire(timeout=0):  # withdraw items not yet emitted
-                    pass
-            elif self._running:
-                self._gate.acquire()
-                self._running = False
+        if self._emit_one:
+            while self._gate.acquire(timeout=0):  # withdraw items not yet emitted
+                pass
+        elif self._running:
+            self._gate.acquire()
+            self._running = False
         return self
 
     def stop(self):
@@ -765,16 +680,6 @@ class Startable:
             self._it = iter(src)  # created in the consumer process
         return next(self._it)
 
-    def __getstate__(self):
-        state = dict(self.__dict__)
-        state["_lock"] = None
-        state["_it"] = None
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self._lock = threading.Lock()
-
 
 class Ticker(Startable):
     """ An iterable that yields the current datetime while started (see Startable).
@@ -784,43 +689,7 @@ class Ticker(Startable):
 
 def _tee_worker(parent, pkl, queues, done):
     _exit_with_parent(parent)
-    live = list(queues)
-
-    def forward(item):
-        # Runs inside get(): the item's arrays still view the upstream queue's memory, so each put copies them
-        # once, straight into a branch's queue (no private copy in between). Errors and _WorkerDied items are
-        # passed on as they are: each branch raises them.
-        if type(item) is _Stop:
-            return False
-        for q in list(live):
-            try:
-                q.put(item)
-            except ShutDown:  # the branch was closed
-                live.remove(q)
-            except Exception as e:  # e.g. too large for the branch's queue
-                q.put(_WorkerException(e))
-        return True
-
-    try:
-        upstream = cloudpickle.loads(pkl)
-        if upstream._start_type == "lazy":  # (as iterating it would)
-            upstream._start()
-        src = upstream._out_queue
-        while live:
-            try:
-                if not src.get(callback=forward):
-                    break
-            except ShutDown:
-                raise RuntimeError("the stage feeding this tee was closed") from None
-    except BaseException as e:  # the upstream stage failed: every branch raises
-        failure = _WorkerException(e)
-        for q in live:
-            try:
-                q.put(failure)
-            except Exception:
-                pass
-    for q in live:
-        _put_stop(q)
+    _forward(cloudpickle.loads(pkl), queues)  # each branch raises errors and deaths of the upstream stage
     done[0] = 1
 
 
@@ -833,7 +702,7 @@ class _Tee:
         self.buffer_bytes = buffer_bytes
         self.queues = [DejaQueue(buffer_bytes) for _ in range(n)]
         self.done = ctx.RawArray("b", 1)
-        self.proc = ctx.Process(target=_tee_worker, args=(_identity(), cloudpickle.dumps(lzy), self.queues, self.done))
+        self.proc = ctx.Process(target=_tee_worker, args=(os.getpid(), cloudpickle.dumps(lzy), self.queues, self.done))
         self.proc.start()
         self.open_branches = set(range(n))
         self.lock = threading.Lock()
@@ -854,12 +723,10 @@ class _TeeBranch(lazymap):
 
     def __init__(self, tee_, i):
         self._tee = tee_
-        self._own_input = None
-        self._closed = self._closing = False
-        self._it = tee_.upstream  # for len()
+        self._closed = False
+        self._it = None  # (closing a branch does not close the upstream stage: see _Tee.branch_closed)
         self._start_type, self._started, self._start_gate = "eager", True, None
         self._out_queue = tee_.queues[i]
-        self._n_workers = 1
         self._buffer_bytes = tee_.buffer_bytes
         self._done = tee_.done
         self._procs = [tee_.proc]
@@ -870,18 +737,8 @@ class _TeeBranch(lazymap):
         self._finalizer = _mp_util.Finalize(self, tee_.branch_closed, args=(i,), exitpriority=11)
         _watch(self)
 
-    def close(self):
-        """Closes this branch. The tee process, and the stages that feed it, are stopped once all branches
-        are closed."""
-        if not getattr(self, "_owner", False) or self._closed:
-            return
-        self._closing = self._closed = True
-        _monitored.discard(self)
-        try:
-            self._out_queue.shutdown()  # the tee process stops copying into it
-        except Exception:
-            pass
-        self._finalizer()
+    def __len__(self):
+        return len(self._tee.upstream)
 
 
 def tee(lzy, n, buffer_bytes=None):

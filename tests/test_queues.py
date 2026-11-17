@@ -5,10 +5,8 @@ import random
 import multiprocessing as mp
 import time
 
-from dejaq.queues import LegacyDejaQueue, DejaQueue, NamedSemaphore
+from dejaq.queues import DejaQueue, NamedSemaphore
 
-# LegacyDejaQueue is deprecated, but still tested here until its removal
-pytestmark = pytest.mark.filterwarnings("ignore:LegacyDejaQueue is deprecated:DeprecationWarning")
 
 def sema_acquire(name, result_list):
     sem = NamedSemaphore(name=name, create=False)
@@ -61,7 +59,7 @@ def hash_it(item):
     else:
         return hashlib.sha256(repr(item).encode()).hexdigest()
 
-@pytest.mark.parametrize("QueueCls", [LegacyDejaQueue, DejaQueue])
+@pytest.mark.parametrize("QueueCls", [DejaQueue])
 def test_queue_mp_basic(QueueCls):
     q = QueueCls(1024 * 1024)
     items = [b"foo", b"bar", b"baz", b"qux"]
@@ -75,7 +73,7 @@ def test_queue_mp_basic(QueueCls):
     p2.join()
     assert list(results) == hash_it(items)
 
-@pytest.mark.parametrize("QueueCls", [LegacyDejaQueue, DejaQueue])
+@pytest.mark.parametrize("QueueCls", [DejaQueue])
 def test_queue_mp_numpy_arrays(QueueCls):
     q = QueueCls(2 * 1024 * 1024)
     arrays = [np.random.randn(1000) for _ in range(5)]
@@ -91,7 +89,7 @@ def test_queue_mp_numpy_arrays(QueueCls):
     for orig, got in zip(arrays_bytes, results):
         assert hash_it(orig) == got
 
-@pytest.mark.parametrize("QueueCls", [LegacyDejaQueue, DejaQueue])
+@pytest.mark.parametrize("QueueCls", [DejaQueue])
 def test_queue_mp_race_condition(QueueCls):
     q = QueueCls(64 * 1024)  # small ring: items wrap around and the producer waits for space
     N = 50
@@ -107,7 +105,7 @@ def test_queue_mp_race_condition(QueueCls):
     p2.join()
     assert hashes == list(results)
 
-@pytest.mark.parametrize("QueueCls", [LegacyDejaQueue, DejaQueue])
+@pytest.mark.parametrize("QueueCls", [DejaQueue])
 def test_queue_mp_multiple_producers_consumers(QueueCls):
     q = QueueCls(4 * 1024 * 1024)
     N = 100
@@ -129,7 +127,7 @@ def test_queue_mp_multiple_producers_consumers(QueueCls):
     assert len(results) == len(items)
     assert sorted(list(results)) == sorted(items)
 
-@pytest.mark.parametrize("QueueCls", [LegacyDejaQueue, DejaQueue])
+@pytest.mark.parametrize("QueueCls", [DejaQueue])
 def test_queue_mp_stress(QueueCls):
     q = QueueCls(64 * 1024)  # small ring: wraparound and full-queue waits under contention
     N = 300

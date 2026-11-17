@@ -49,8 +49,7 @@ def _all_gone(pids, timeout=10.0):
 
 
 def _stage_pids(stage):
-    own = stage._own_input
-    return stage.pids + (own.pids if own is not None else [])
+    return stage.pids + (stage._it.pids if isinstance(stage._it, lazymap) else [])
 
 
 def add5(x):

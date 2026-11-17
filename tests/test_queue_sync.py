@@ -98,47 +98,50 @@ def test_explicit_queue_name_that_exists_raises_and_keeps_the_queue():
 def test_failed_creation_cleans_up(monkeypatch):
     """If creating a queue fails halfway, what was created is removed again and the name is reusable."""
     name = "dq_test_" + os.urandom(5).hex()
-    real = queues.NamedByteRing._create_named
+    real = queues.NamedSemaphore
     calls = []
 
-    def flaky(self, cls, nm):
-        calls.append(nm)
-        if len(calls) == 4:
+    def flaky(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 2:  # the second of the queue's two plain semaphores
             raise OSError("simulated failure")
-        return real(self, cls, nm)
+        return real(*args, **kwargs)
 
-    monkeypatch.setattr(queues.NamedByteRing, "_create_named", flaky)
+    monkeypatch.setattr(queues, "NamedSemaphore", flaky)
     with pytest.raises(OSError, match="simulated"):
         DejaQueue(4096, name=name)
-    monkeypatch.setattr(queues.NamedByteRing, "_create_named", real)
+    monkeypatch.setattr(queues, "NamedSemaphore", real)
     q = DejaQueue(4096, name=name)  # FileExistsError if anything was left behind
     q.put(1)
     assert q.get(timeout=1) == 1
 
 
 @pytest.mark.skipif(_IS_WIN, reason="Windows semaphores vanish with their last handle")
-def test_stale_semaphores_from_a_crashed_queue_are_replaced():
-    """POSIX semaphores and lock files can outlive a crashed creator (e.g. when its resource tracker died too)."""
+def test_stale_objects_of_a_crashed_queue():
+    """Lock files left by a crashed creator (macOS keeps them) are reused; semaphores left behind (only if its
+    resource tracker died too) make creating a queue of the same name fail cleanly."""
     import posix_ipc
 
     name = "dq_test_" + os.urandom(5).hex()
     _, _, lock_names, sem_names = queues.NamedByteRing._names(name)
-    stale = [posix_ipc.Semaphore(queues._posix_name(nm), posix_ipc.O_CREX, initial_value=v)
-             for nm, v in zip(sem_names, (0, 3, 7))]  # state lock "held", phantom items and wake-ups
     for nm in lock_names:
         lk = queues._RobustLock(nm, auto_unlink=False)
         lk._finalizer.detach()  # leave the file behind, as a crashed process would
         lk.close()
+    q = DejaQueue(4096, name=name)
+    q.put("fresh")
+    assert q.get(timeout=1) == "fresh"
+    _assert_quiescent(q)
+    del q
+    name2 = "dq_test_" + os.urandom(5).hex()
+    stale = posix_ipc.Semaphore(queues._posix_name(queues.NamedByteRing._names(name2)[3][1]), posix_ipc.O_CREX)
     try:
-        q = DejaQueue(4096, name=name)
-        with pytest.raises(TimeoutError):
-            q.get(timeout=0.1)  # no phantom items
-        q.put("fresh")
-        assert q.get(timeout=1) == "fresh"
-        _assert_quiescent(q)
+        with pytest.raises(FileExistsError):
+            DejaQueue(4096, name=name2)
+        DejaQueue(4096, name=name2 + "b")  # (nothing else was affected)
     finally:
-        for s in stale:
-            s.close()
+        stale.close()
+        stale.unlink()
 
 
 # ---------- get(timeout) with competing consumers ----------

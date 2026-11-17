@@ -2,11 +2,9 @@ from __future__ import annotations
 import logging
 import atexit, collections, contextlib, errno, gc, numbers, os, sys, time, warnings, weakref, struct, threading
 import queue as _stdqueue
-import multiprocessing as mp
 from multiprocessing import shared_memory
 import pickle
 import cloudpickle
-import dataclasses
 from typing import Any
 import numpy as np
 import array
@@ -32,9 +30,6 @@ class _pickleall:
 
     def loads(*args, **kwargs):
         return pickle.loads(*args, **kwargs)
-    
-    def PickleBuffer(*args, **kwargs):
-        return pickle.PickleBuffer(*args, **kwargs)
 
 _pickle_backend = _pickleall
 
@@ -46,12 +41,9 @@ def _safe_base(prefix: str = "ns") -> str:
     """Random base name: prefix + pid (to tell leftover names apart) + 40 random bits.
 
     At most 2 + 8 + 10 characters, so semaphore and shared-memory names derived from it stay within the
-    macOS name limits without shortening. Creators still retry on the (now rare) collision.
+    macOS name limits.
     """
     return f"{prefix}{os.getpid():x}{os.urandom(5).hex()}"
-
-
-_CREATE_ATTEMPTS = 16  # fresh random names tried before giving up on a name collision
 
 
 # macOS limits on POSIX names, in bytes including the leading '/' (measured on macOS CI:
@@ -60,32 +52,22 @@ _DARWIN_SEM_NAME_MAX = 30
 _DARWIN_SHM_NAME_MAX = 31
 
 
-def _darwin_shorten(nm: str, max_len: int) -> str:
-    """On macOS, shorten a too-long '/'-prefixed name to a prefix plus a hash of the full name.
-
-    Different long names (e.g. a queue's '_Lp' and '_Lg' locks) stay distinct, every process
-    derives the same short name, and the result is a fixed point (shortening it again is a no-op).
-    Names that fit, and all names on other platforms, are returned unchanged, so processes running
-    different dejaq versions still agree on them.
-    """
-    if sys.platform != "darwin" or len(nm.encode()) <= max_len:
-        return nm
-    import hashlib
-
-    digest = hashlib.blake2s(nm.encode(), digest_size=6).hexdigest()  # 12 hex chars
-    keep = max_len - len(digest) - 1
-    return nm.encode()[:keep].decode("utf-8", "ignore") + "-" + digest
+def _check_len(nm: str, max_len: int) -> str:
+    """macOS limits the length of POSIX names: refuse names that are too long (generated names always fit)."""
+    if sys.platform == "darwin" and len(nm.encode()) > max_len:
+        raise ValueError(f"name {nm!r} is too long for macOS (at most {max_len} bytes including '/' and suffix)")
+    return nm
 
 
 def _posix_name(base: str) -> str:
     """Return a POSIX-safe semaphore name ('/'-prefixed; short enough for macOS)."""
     nm = "/" + "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in base)
-    return _darwin_shorten(nm, _DARWIN_SEM_NAME_MAX)
+    return _check_len(nm, _DARWIN_SEM_NAME_MAX)
 
 
 def _shm_name(name: str) -> str:
     """Shared-memory name for SharedMemory (which adds the '/'), short enough for macOS."""
-    return _darwin_shorten("/" + name, _DARWIN_SHM_NAME_MAX)[1:]
+    return _check_len("/" + name, _DARWIN_SHM_NAME_MAX)[1:]
 
 
 def _win_name(name: str) -> str:
@@ -283,21 +265,15 @@ def _flush_tracker_backlog() -> None:
 
 atexit.register(_flush_tracker_backlog)  # calls queued by the last garbage collections
 if not _IS_WIN:
-    # multiprocessing workers end with os._exit, which skips atexit; multiprocessing's own exit handlers run
-    # its "finalizers" instead. A worker clears the finalizers it inherited or registered on import before
-    # it runs, and then calls the after-fork hooks: register (again) there.
+    # multiprocessing workers end with os._exit (skipping atexit) after running multiprocessing's finalizers,
+    # which a worker clears before it runs its after-fork hooks: register (again) there.
     from multiprocessing import util as _mp_util
 
-    class _Anchor:  # register_after_fork needs an object to refer to
-        pass
-
-    _mp_anchor = _Anchor()
-
-    def _flush_at_worker_exit(_anchor=None) -> None:
+    def _flush_at_worker_exit(_=None) -> None:
         _mp_util.Finalize(None, _flush_tracker_backlog, exitpriority=0)
 
     _flush_at_worker_exit()
-    _mp_util.register_after_fork(_mp_anchor, _flush_at_worker_exit)
+    _mp_util.register_after_fork(_flush_at_worker_exit, _flush_at_worker_exit)
 
 
 def _reset_tracker_state_in_child() -> None:
@@ -320,7 +296,6 @@ _LOCK_DIR = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
 _LOCK_FILES_TRACKABLE = sys.platform.startswith("linux") and _LOCK_DIR == "/dev/shm"
 
 
-_FD_NOT_REOPENED = -2  # a lock whose file could not be reopened in a forked child
 
 
 class _RobustLock:
@@ -356,7 +331,9 @@ class _RobustLock:
             handle = self._h
         else:
             self.path = _RobustLock._path_for(name)
-            flags = os.O_RDWR | (os.O_CREAT | os.O_EXCL if create else 0)
+            # no O_EXCL: a lock file holds no state, so one left by a crashed queue is reused (creating the queue's
+            # shared memory, which happens first, is what fails if the name is taken)
+            flags = os.O_RDWR | (os.O_CREAT if create else 0)
             self._fd = [os.open(self.path, flags, 0o600)]  # a box: replaced after fork
             self._tlock = threading.Lock()
             if create and auto_unlink and _LOCK_FILES_TRACKABLE:
@@ -384,11 +361,8 @@ class _RobustLock:
             _flock(self._fd[0], _LOCK_EX)
         except BaseException:
             self._tlock.release()
-            if self._fd[0] == _FD_NOT_REOPENED:
-                raise RuntimeError(
-                    "This queue was unlinked before this process was forked, and its lock cannot be reopened "
-                    "here; create or attach queues after forking, or unlink them later."
-                ) from None
+            if self._fd[0] < 0:  # see _after_fork_in_child
+                raise RuntimeError("queue unlinked before this process was forked: unlink it later") from None
             raise
 
     def release(self) -> None:
@@ -453,11 +427,8 @@ class _RobustLock:
             if old >= 0:
                 try:
                     new_fd = os.open(lk.path, os.O_RDWR)
-                except OSError:  # the lock file was deleted (unlink()): reopen the open file itself
-                    try:
-                        new_fd = os.open(f"/proc/self/fd/{old}", os.O_RDWR)  # Linux
-                    except OSError:
-                        new_fd = _FD_NOT_REOPENED  # never share the parent's lock: acquire() raises
+                except OSError:  # the lock file was deleted (unlink()): never share the parent's lock
+                    new_fd = -1
                 lk._fd[0] = new_fd
                 os.close(old)
             lk._tlock = threading.Lock()  # may have been held by another thread of the parent
@@ -498,18 +469,12 @@ class NamedSemaphore:
             if create:
                 if not (1 <= MAX <= _LONG_MAX and 0 <= int(initial) <= MAX):
                     raise ValueError(f"NamedSemaphore: need 0 <= initial <= maxcount <= {_LONG_MAX}")
-                for _ in range(_CREATE_ATTEMPTS):
-                    nm = _win_name(name or _safe_base("ns"))
-                    ctypes.set_last_error(0)
-                    # opens the existing semaphore (ignoring initial/max) if the name already exists
-                    h = _CreateSemaphoreW(None, int(initial), MAX, nm)
-                    if not h or ctypes.get_last_error() != _ERROR_ALREADY_EXISTS:
-                        break
+                nm = _win_name(name or _safe_base("ns"))
+                ctypes.set_last_error(0)
+                # opens the existing semaphore (ignoring initial/max) if the name already exists
+                h = _CreateSemaphoreW(None, int(initial), MAX, nm)
+                if h and ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
                     _CloseHandle(h)  # someone else's semaphore: never share it
-                    h = None
-                    if name:
-                        break
-                if h is None:
                     raise FileExistsError(errno.EEXIST, "NamedSemaphore already exists", nm)
             else:
                 if not name:
@@ -524,18 +489,11 @@ class NamedSemaphore:
             import posix_ipc as P
 
             if create:
-                for _ in range(_CREATE_ATTEMPTS):
-                    nm = _posix_name(name.lstrip("/")) if name else _posix_name(_safe_base("ns"))
-                    try:
-                        self._sem = P.Semaphore(nm, flags=P.O_CREAT | P.O_EXCL, initial_value=int(initial))
-                        break
-                    except P.ExistentialError:  # name taken: never share someone else's semaphore
-                        if name:
-                            break
-                else:
-                    nm = None
-                if getattr(self, "_sem", None) is None:
-                    raise FileExistsError(errno.EEXIST, "NamedSemaphore already exists", nm)
+                nm = _posix_name(name.lstrip("/") if name else _safe_base("ns"))
+                try:
+                    self._sem = P.Semaphore(nm, flags=P.O_CREAT | P.O_EXCL, initial_value=int(initial))
+                except P.ExistentialError:  # never share someone else's semaphore
+                    raise FileExistsError(errno.EEXIST, "NamedSemaphore already exists", nm) from None
                 self.name = nm
             else:
                 if not name:
@@ -551,7 +509,7 @@ class NamedSemaphore:
         if self._tracked[0]:
             _tracker("register", self.name, "semaphore")
         self._finalizer = weakref.finalize(
-            self, NamedSemaphore._finalize, self.backend, self.name, self._auto_unlink, owner_pid, handle,
+            self, NamedSemaphore._finalize, self.name, self._auto_unlink, owner_pid, handle,
             self._tracked,
         )
 
@@ -641,32 +599,13 @@ class NamedSemaphore:
         self.__init__(s["name"], create=False, auto_unlink=auto_unlink)
 
     @staticmethod
-    def _finalize(
-        backend: str, name: str, auto_unlink: bool, owner_pid: int | None, handle: Any, tracked: list
-    ) -> None:
+    def _finalize(name: str, auto_unlink: bool, owner_pid: int | None, handle: Any, tracked: list) -> None:
         try:
-            if backend == "win32":
-                try:
-                    logger.debug(f"finalizer closing {name}")
-                    handle.close()
-                except Exception:
-                    pass
-            else:
-                try:
-                    handle.close()
-                    logger.debug(f"finalizer closing {name}")
-                except Exception:
-                    pass
-                if auto_unlink and owner_pid == os.getpid():
-                    NamedSemaphore._unlink(name, owner_pid, tracked)
-                    logger.debug(f"finalizer unlinking {name}")
+            handle.close()
         except Exception:
             pass
-
-    def __del__(self):
-        finalizer = getattr(self, "_finalizer", None)  # absent if __init__ failed
-        if finalizer is not None:
-            finalizer()
+        if not _IS_WIN and auto_unlink and owner_pid == os.getpid():
+            NamedSemaphore._unlink(name, owner_pid, tracked)
 
     def __enter__(self):
         self.acquire()
@@ -705,9 +644,6 @@ class _StateLock(NamedSemaphore):
         super().__init__(name=name, create=create, initial=1, maxcount=1, auto_unlink=auto_unlink)
 
     if not _IS_WIN:
-
-        def release(self) -> None:
-            self._sem.release()
 
         def __enter__(self):
             self._sem.acquire()
@@ -754,10 +690,10 @@ class _SharedMemory(shared_memory.SharedMemory):
 #   _WAITERS counts producers registered as waiting for space (see DejaQueue.put).
 #   _MAGIC identifies the layout of this block and of the items in the ring: processes sharing a queue
 #   must run compatible dejaq versions, and a mismatch is reported instead of corrupting data.
-#   _GET_CLAIM is set while the get lock's holder holds a claimed item (see DejaQueue.get).
-_HEAD, _TAIL, _NITEMS, _CLOSED, _CAP, _WAITERS, _MAGIC, _GET_CLAIM = range(8)
+#   Slot 7 is unused.
+_HEAD, _TAIL, _NITEMS, _CLOSED, _CAP, _WAITERS, _MAGIC = range(7)
 _STATE_SLOTS = 8
-_STATE_MAGIC = 0x64656A61710003  # "dejaq" + format version 3 (1: dejaq <= 0.8; 2: without _GET_CLAIM)
+_STATE_MAGIC = 0x64656A61710003  # "dejaq" + format version 3 (1: dejaq <= 0.8; 2: development versions)
 
 
 def _untrack_shm(shm) -> None:
@@ -841,7 +777,7 @@ def _is_number(x) -> bool:
 def _wait_time(block, timeout, method: str):
     """Timeout of get()/put() from queue.Queue-style (block, timeout) arguments (None: wait indefinitely).
 
-    dejaq <= 0.9 took the timeout as the first argument; a number there is still taken as a timeout
+    dejaq <= 0.8 took the timeout as the first argument; a number there is still taken as a timeout
     (deprecated). get(None) waited indefinitely then and still does.
     """
     if block is None:
@@ -892,19 +828,10 @@ class NamedByteRing:
         self, buffer_bytes: int = 10_000_000, name: str | None = None, create: bool = True, *, auto_unlink: bool = True
     ) -> None:
         self._auto_unlink = bool(auto_unlink)
-        self._owns = False  # set only once creation has succeeded: a failed __init__ must never unlink anything
         if not create:
             self._open(name or _safe_base("nq"))
-        elif name is not None:
-            self._create(name, int(buffer_bytes))
         else:
-            for attempt in range(_CREATE_ATTEMPTS):
-                try:
-                    self._create(_safe_base("nq"), int(buffer_bytes))
-                    break
-                except FileExistsError:  # random name already taken: try another
-                    if attempt == _CREATE_ATTEMPTS - 1:
-                        raise
+            self._create(name if name is not None else _safe_base("nq"), int(buffer_bytes))
         self._finalizer = weakref.finalize(self, self._res.finalize)
 
     @staticmethod
@@ -915,30 +842,6 @@ class NamedByteRing:
                     [p + base for p in ("NLs_", "NI_", "NG_")])
         return (_shm_name(base + "_S"), _shm_name(base + "_B"), [base + "_Lp", base + "_Lg"],
                 [base + s for s in ("_Ls", "_I", "_G")])
-
-    def _create_named(self, cls, name: str):
-        try:
-            return cls(name, create=True, auto_unlink=self._auto_unlink)
-        except FileExistsError:
-            if _IS_WIN:
-                raise
-        # POSIX semaphores and lock files outlive the processes that created them, e.g. after a crash. The
-        # caller has just created this queue's shared memory exclusively, so a semaphore or lock file under
-        # its name can only belong to a dead queue: replace it. (Processes still attached to the dead queue
-        # keep their own.)
-        if cls is _RobustLock:
-            try:
-                os.unlink(_RobustLock._path_for(name))
-            except OSError:
-                pass
-        else:
-            import posix_ipc as P
-
-            try:
-                P.unlink_semaphore(_posix_name(name))
-            except P.ExistentialError:
-                pass
-        return cls(name, create=True, auto_unlink=self._auto_unlink)
 
     def _create(self, base: str, buffer_bytes: int) -> None:
         st_name, buf_name, lock_names, sem_names = self._names(base)
@@ -960,10 +863,9 @@ class NamedByteRing:
             _view = np.frombuffer(buf.buf, dtype="B", count=buffer_bytes)
             _view[:] = 0
             del _view
-            for nm in lock_names:
-                others.append(self._create_named(_RobustLock, nm))
-            for cls, nm in zip((_StateLock, NamedSemaphore, NamedSemaphore), sem_names):
-                others.append(self._create_named(cls, nm))
+            for cls, nm in zip((_RobustLock, _RobustLock, _StateLock, NamedSemaphore, NamedSemaphore),
+                               lock_names + sem_names):
+                others.append(cls(nm, create=True, auto_unlink=self._auto_unlink))
             state = state_mem.cast("q")
             state[0:_STATE_SLOTS] = array.array("q", [0, 0, 0, 0, buffer_bytes, 0, _STATE_MAGIC, 0])
         except BaseException:
@@ -978,7 +880,6 @@ class NamedByteRing:
         self._state_mem, self._state, self.buf, self.cap = state_mem, state, buf, buffer_bytes
         self._state_name, self._buf_name = st_name, buf_name
         self._put_lock, self._get_lock, self._state_lock, self._items, self._space_gate = others
-        self._owns = True
         self._res = _RingResources(shms, others, os.getpid(), self._auto_unlink, self._auto_unlink)
 
     def _open(self, base: str) -> None:
@@ -989,15 +890,9 @@ class NamedByteRing:
             try:
                 shms.append(_attach_shm(st_name, cls=_SharedMemory))
             except FileNotFoundError:
-                hint = (
-                    "on Windows, a queue exists only while some process has it open"
-                    if _IS_WIN
-                    else "with auto_unlink=True (the default), a queue is removed when its creating object is "
-                    "garbage-collected"
-                )
                 raise FileNotFoundError(
-                    errno.ENOENT, f"DejaQueue {base!r} does not exist (any more): {hint}. Keep it alive while "
-                    "processes attach."
+                    errno.ENOENT, f"DejaQueue {base!r} does not exist (any more): keep the creating object (and on "
+                    "Windows, any object of the queue) alive while processes attach"
                 ) from None
             state = shms[0].cast("q")
             if len(state) < _STATE_SLOTS or state[_MAGIC] != _STATE_MAGIC:
@@ -1098,7 +993,6 @@ class NamedByteRing:
 
     def _purge_locked(self) -> None:
         """Caller holds put_lock and get_lock."""
-        self._state[_GET_CLAIM] = 0  # all claims are void (and an abandoned one needs no repair)
         with self._state_lock:
             self._state[_HEAD] = 0
             self._state[_TAIL] = 0
@@ -1110,46 +1004,19 @@ class NamedByteRing:
             if self._state[_CLOSED]:  # keep shutdown()'s wake-up for consumers waiting on the empty queue
                 self._items.release(1)
 
-    def _write_bytes(self, data, tail=None, write_tail=True) -> int:
-        """Write data at current tail; return new tail (mod cap). Caller holds put_lock."""
+    def _write_bytes(self, data, tail: int) -> int:
+        """Write data at tail (not yet committed); return the new tail. Caller holds put_lock."""
         if not isinstance(data, memoryview):
             data = memoryview(data)
-        n = len(data)
-        cap = self.cap
-        if tail is None:
-            with self._state_lock:
-                tail = int(self._state[_TAIL])
+        n, cap = len(data), self.cap
         end = tail + n
         if end <= cap:
             self.buf.buf[tail:end] = data
-            new_tail = end % cap
-        else:
-            first = cap - tail
-            self.buf.buf[tail:cap] = data[0:first]
-            self.buf.buf[0 : n - first] = data[first:n]
-            new_tail = n - first
-        if write_tail:
-            with self._state_lock:
-                self._state[_TAIL] = new_tail
-        return new_tail
-
-    def _read_bytes(self, n: int, head: int | None = None) -> bytes:
-        """Read n bytes from current head; advance head. Caller holds get_lock."""
-        cap = self.cap
-        if head is None:
-            with self._state_lock:
-                head = int(self._state[_HEAD])
-        end = head + n
-        if end <= cap:
-            out = bytes(self.buf.buf[head:end])
-            new_head = end % cap
-        else:
-            first = cap - head
-            out = bytes(self.buf.buf[head:cap]) + bytes(self.buf.buf[0 : n - first])
-            new_head = n - first
-        with self._state_lock:
-            self._state[_HEAD] = new_head
-        return out
+            return end % cap
+        first = cap - tail
+        self.buf.buf[tail:cap] = data[0:first]
+        self.buf.buf[0 : n - first] = data[first:n]
+        return n - first
 
     def close(self) -> None:
         """Close this object's access to the queue (other objects and processes are not affected)."""
@@ -1171,7 +1038,6 @@ class NamedByteRing:
 
     def __setstate__(self, s: dict) -> None:
         self.__dict__.clear()
-        self._owns = False
         self._auto_unlink = bool(s.get("auto_unlink", False))
         self._open(s["base"])  # all names derive deterministically from the base name
         self._finalizer = weakref.finalize(self, self._res.finalize)
@@ -1245,9 +1111,9 @@ class DejaQueue(NamedByteRing):
                         # after the check above sees the registration and wakes us (no lost wake-up).
                         st[5] += 1  # _WAITERS
                 if fits:
-                    new_tail = self._write_bytes(hdr, tail=tail, write_tail=False)
+                    new_tail = self._write_bytes(hdr, tail)
                     for s in segs:
-                        new_tail = self._write_bytes(s, tail=new_tail, write_tail=False)
+                        new_tail = self._write_bytes(s, new_tail)
                     with self._state_lock:
                         if st[3]:  # _CLOSED while copying: consumers may have stopped already; don't commit
                             raise ShutDown("Queue is shut down.")
@@ -1302,7 +1168,7 @@ class DejaQueue(NamedByteRing):
         """
         if block is not True:
             if isinstance(timeout, bool) and (block is None or _is_number(block)):
-                # dejaq <= 0.9: get(timeout, peek_only); the second argument is a timeout now
+                # dejaq <= 0.8: get(timeout, peek_only); the second argument is a timeout now
                 warnings.warn(
                     "DejaQueue.get(): positional (timeout, peek_only) arguments are deprecated; pass "
                     "timeout=... and peek_only=... as keywords",
@@ -1314,19 +1180,15 @@ class DejaQueue(NamedByteRing):
                 timeout = _wait_time(block, timeout, "get")
         # The item count in the state block (read under the state lock) is the truth about available items.
         # The _items semaphore, with one count per item, serves to wait for items; counts are only taken while
-        # holding the get lock, where a consumer that dies is noticed (_GET_CLAIM) and its count restored. Lost
-        # or spare counts are harmless: an item is taken whenever one is there, and a count without an item is
-        # dropped. So a get with a timeout never waits behind another consumer, and a consumer that dies
-        # (even holding the get lock: the OS releases it) cannot block the others.
+        # holding the get lock. Lost or spare counts are harmless: an item is taken whenever one is there, and a
+        # count without an item is dropped. So a get with a timeout never waits behind another consumer, and a
+        # consumer that dies (even holding the get lock: the OS releases it) cannot block the others.
         deadline = None if timeout is None else (time.monotonic() + max(0.0, float(timeout)))
         items = self._items
         while True:
             self._get_lock.acquire()
             st = self._state  # hot path: literal slot indices
             try:
-                if st[7]:  # _GET_CLAIM still set: the previous holder of the lock died holding a count
-                    items.release(1)  # restore it (wakes a waiting consumer for the item it left behind)
-                st[7] = 1  # set before taking a count: dying in between leaves a spare count, which is harmless
                 counted = items.acquire(timeout=0)
                 with self._state_lock:
                     nitems = st[2]  # _NITEMS
@@ -1340,7 +1202,6 @@ class DejaQueue(NamedByteRing):
                     raise ShutDown("Queue is shut down and empty.")
                 # No item (a count without one is spare, e.g. after purge(): drop it).
             finally:
-                st[7] = 0
                 self._get_lock.release()
             # Wait for an item without holding the lock. The count only signals that one arrived: hand it back
             # at once and take the item under the lock. (Only a process dying right in between loses a count.)
@@ -1468,251 +1329,3 @@ class DejaQueue(NamedByteRing):
                 self.put(Ellipsis)
         except ShutDown:
             pass
-
-
-### Legacy DejaQueue: ###
-
-class ByteFIFO:
-    """A FIFO buffer (queue) for bytes. The queue is implemented as a ring buffer in shared memory.
-
-    Deprecated (to be removed in dejaq 1.0): use DejaQueue.
-    """
-
-    def __init__(self, buffer_bytes=10e6):
-        """
-        Initializes a ByteFIFO object.
-
-        Args:
-            buffer_bytes (int): The size of the buffer in bytes. Defaults to 10 MiB.
-        """
-        warnings.warn(
-            f"{type(self).__name__} is deprecated and will be removed in dejaq 1.0; use DejaQueue",
-            DeprecationWarning,
-            stacklevel=2 if type(self) is ByteFIFO else 3,
-        )
-
-        self.buffer_bytes = int(buffer_bytes)
-        self.buffer = mp.Array("B", self.buffer_bytes, lock=False)
-        self._view = None
-        self.queue = mp.Manager().Queue()  # manager helps avoid out-of-order problems
-        self.get_lock = mp.Lock()
-        self.put_lock = mp.Lock()
-        self.head_changed = mp.Condition()
-        self.head = mp.Value("l", 0)
-        self.tail = mp.Value("l", 0)
-        self.closed = mp.Value("b", False)
-
-    def put(self, array_bytes, meta=None, timeout=None):
-        """
-        Puts a byte array into the queue.
-
-        Args:
-            array_bytes (numpy.ndarray or memoryview): The byte array to be put into the queue.
-            meta (Any, optional): Additional metadata associated with the byte array.
-
-        Raises:
-            AssertionError: If the size of the byte array exceeds the buffer size.
-        """
-        if type(array_bytes) == memoryview:
-            # array_bytes = np.frombuffer(array_bytes, dtype='byte')
-            array_bytes = array_bytes
-        elif type(array_bytes) == np.ndarray:
-            array_bytes = array_bytes.ravel().view("B")
-        nbytes = array_bytes.nbytes
-        assert nbytes < self.buffer_bytes, "Array size exceeds buffer size."
-        with self.put_lock:
-            while self._available_space() < nbytes:
-                with self.head_changed:
-                    if not self.head_changed.wait(timeout=timeout):
-                        raise TimeoutError("Timeout waiting for available space.")
-            _, frame_head, frame_tail = self._write_buffer(array_bytes)
-            frame_info = FrameInfo(nbytes=nbytes, head=frame_head, tail=frame_tail, meta=meta)
-            self.queue.put(frame_info)
-
-    def _write_buffer(self, array_bytes, old_tail=None):
-        """Write a byte array into the queue. Warning: this function should be called after acquiring the put_lock."""
-        old_tail = old_tail or self.tail.value
-        nbytes = len(array_bytes)
-        if old_tail + nbytes <= self.buffer_bytes:
-            self.view[old_tail : old_tail + nbytes] = array_bytes
-            new_tail = (old_tail + nbytes) % self.buffer_bytes
-        else:
-            tail_part_size = self.buffer_bytes - old_tail
-            self.view[old_tail:] = array_bytes[:tail_part_size]
-            self.view[: nbytes - tail_part_size] = array_bytes[tail_part_size:]
-            new_tail = nbytes - tail_part_size
-        self.tail.value = new_tail
-        return nbytes, old_tail, new_tail
-
-    def get(self, callback=None, copy=None, **kwargs):
-        """Gets a byte array from the queue.
-
-        Args:
-            callback (Callable, optional): A callback function to be called with the byte array (pre-copy, potentially unsafe!) and metadata.
-            copy (bool, optional): Whether to make a copy of the byte array. Defaults to None: copy if a callback is not provided.
-            **kwargs: Additional keyword arguments to be passed to the queue's get method.
-
-        Returns:
-            A tuple containing the byte array and any metadata provided with put OR the return value of the callback function, if provided.
-        """
-        with self.get_lock:
-            frame_info = self.queue.get(**kwargs)
-            if frame_info is Ellipsis:
-                self.close()
-                return Ellipsis
-            head = frame_info.head
-            tail = frame_info.tail
-            assert head == self.head.value, f"head: {head}, self.head: {self.head.value}"
-            if head <= tail:
-                array_bytes = self.view[head:tail]
-            else:
-                array_bytes = np.concatenate((self.view[head:], self.view[:tail]))
-            if copy or ((copy is None) and (callback is None)):
-                array_bytes = array_bytes.copy()
-            if callback is not None:
-                return_value = callback(array_bytes, frame_info.meta)
-            else:
-                return_value = array_bytes, frame_info.meta
-            self.head.value = (head + frame_info.nbytes) % self.buffer_bytes
-
-        with self.head_changed:
-            self.head_changed.notify()
-
-        return return_value
-
-    def _available_space(self):
-        """Calculates the available space in the buffer.
-
-        Returns:
-            int: The available space in bytes.
-        """
-        return (self.head.value - self.tail.value - 1) % self.buffer_bytes
-
-    @property
-    def view(self):
-        """numpy.ndarray: A view of the shared memory array as a numpy array. Lazy initialization to avoid pickling issues."""
-        if self._view is None:
-            self._view = np.frombuffer(self.buffer, "B")
-        return self._view
-
-    def __del__(self):
-        self._view = None
-
-    def empty(self):
-        """Checks if the queue is empty.
-
-        Returns:
-            bool: True if the queue is empty, False otherwise.
-        """
-        return self.queue.empty()
-
-    def close(self):
-        """Closes the queue."""
-        self.closed.value = True
-
-    def join(self):
-        """Joins the queue"""
-        self.queue.join()
-
-    def task_done(self):
-        """Marks a task as done."""
-        self.queue.task_done()
-
-    @property
-    def done(self):
-        """Returns True if the queue is empty and closed."""
-        return self.queue.empty() and self.closed.value
-
-    def __iter__(self):
-        while True:
-            x = self.get()
-            if x is Ellipsis:
-                self.queue.put(Ellipsis)
-                return
-            yield x
-
-    def _signal_stop(self, n=1):
-        """Puts n stop signals into the queue."""
-        for _ in range(n):
-            self.queue.put(Ellipsis)
-
-    def __getstate__(self):
-        state = {k: v for k, v in self.__dict__.items() if k != "_view"}
-        state["_view"] = None
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__ = state
-
-
-class LegacyDejaQueue(ByteFIFO):
-    """A fast queue for arbitrary (picklable) Python objects.
-
-    Deprecated (to be removed in dejaq 1.0): use DejaQueue.
-
-    Args:
-        buffer_bytes (int): The size of the buffer in bytes. Defaults to 10 MiB.
-    """
-
-    def __init__(self, buffer_bytes=10e6):
-        super().__init__(buffer_bytes=buffer_bytes)
-
-    def put(self, obj, timeout=None):
-        """Puts a Python object into the queue.
-
-        Args:
-            obj (Any): The byte array to be put into the queue.
-            timeout (float, optional): The maximum time to wait for available space in the queue.
-        """
-        buffers = []
-        pkl = _pickle_backend.dumps(obj, buffer_callback=buffers.append, protocol=_PICKLE_PROTOCOL)
-        buffer_lengths = [len(pkl)] + [len(it.raw()) for it in buffers]
-        nbytes_total = sum(buffer_lengths)
-
-        assert nbytes_total < self.buffer_bytes, "Array size exceeds buffer size."
-
-        with self.put_lock:
-            while self._available_space() < nbytes_total:
-                with self.head_changed:
-                    if not self.head_changed.wait(timeout=timeout):
-                        raise TimeoutError("Timeout waiting for available space.")
-
-            head = self.tail.value
-            self._write_buffer(np.frombuffer(pkl, "byte"))
-            for buf in buffers:
-                self._write_buffer(buf.raw())
-
-            frame_info = FrameInfo(nbytes=nbytes_total, head=head, tail=self.tail.value, meta=buffer_lengths)
-            self.queue.put(frame_info)
-
-    def get(self, **kwargs):
-        """Gets an item from the queue.
-
-        Args:
-            **kwargs: Additional keyword arguments to be passed to the underlying queue's get method (e.g. timeout).
-
-        Returns:
-            obj: The object that was put into the queue.
-        """
-
-        def callback(array_bytes, buffer_lengths):
-            buffers = []
-            offset = 0
-            for length in buffer_lengths:
-                buffers.append(_pickle_backend.PickleBuffer(array_bytes[offset : offset + length]))
-                offset += length
-            obj = _pickle_backend.loads(buffers[0], buffers=buffers[1:])
-            return obj
-
-        obj = super().get(copy=False, callback=callback, **kwargs)
-        return obj
-
-
-@dataclasses.dataclass
-class FrameInfo:
-    """A class to store metadata about a data frame in a ring buffer."""
-
-    nbytes: int
-    head: int
-    tail: int
-    meta: Any  # any picklable object

@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 import dejaq
-from dejaq.queues import DejaQueue, Empty, Full, ShutDown, LegacyDejaQueue
+from dejaq.queues import DejaQueue, Empty, Full, ShutDown
 
 
 def _fill(q, item=b"x" * 6000):
@@ -233,10 +233,3 @@ def test_ellipsis_still_ends_iteration():
     q._signal_stop()
     assert list(q) == [1]
     assert q.get(timeout=1) is Ellipsis  # put back for other consumers
-
-
-# ---------- legacy ----------
-
-def test_legacy_queue_is_deprecated():
-    with pytest.warns(DeprecationWarning, match="LegacyDejaQueue is deprecated"):
-        LegacyDejaQueue(10_000)

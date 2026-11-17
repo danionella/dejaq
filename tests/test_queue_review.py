@@ -94,11 +94,7 @@ def test_2_forked_child_never_shares_the_lock_of_an_unlinked_queue(tmp_path):
     r = _run_script(tmp_path, _FORK_AFTER_UNLINK)
     assert r.returncode == 0, r.stderr
     result = r.stdout.strip()
-    assert result != "S", "the child acquired the lock its parent holds"
-    if sys.platform.startswith("linux"):
-        assert result == "B"  # reopened via /proc/self/fd: a lock of its own
-    else:
-        assert result in ("B", "E")
+    assert result == "E", "the child must refuse, not share the lock its parent holds"
 
 
 # ---------- 3: purge() after shutdown() ----------

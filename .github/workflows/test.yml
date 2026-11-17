@@ -22,11 +22,9 @@ jobs:
     strategy:
       matrix:
         platform: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.12"]
-        include:
-          # free-threaded build: guards against Windows dependencies without cp314t wheels (e.g. pywin32)
-          - platform: windows-latest
-            python-version: "3.14t"
+        # oldest supported, 3.10, current, and the free-threaded build (also guards against dependencies
+        # without cp314t wheels, e.g. pywin32 on Windows)
+        python-version: ["3.8", "3.10", "3.12", "3.14t"]
 
     defaults:
       run:

@@ -128,13 +128,13 @@ def test_tee_closing_one_branch_keeps_the_others_going():
     a.close()
     assert len(list(b)) == 20  # would block once a's queue is full if a were still served
     b.close()
-    assert _all_gone(up.pids + up._own_input.pids + a.pids)
+    assert _all_gone(up.pids + up._it.pids + a.pids)
 
 
 def test_tee_garbage_collected_branches_stop_the_tee_and_the_stage():
     import gc
     up = Parallel(n_workers=2)(big)(range(20))
-    pids = up.pids + up._own_input.pids
+    pids = up.pids + up._it.pids
     a, b = up.tee(2)
     pids += a.pids
     next(iter(a))
@@ -151,7 +151,7 @@ def test_closing_the_last_stage_closes_the_stages_that_feed_it():
     stage3 = Parallel(n_workers=1)(ident)(stage2)
     next(iter(stage3))
     stage3.close()
-    assert _all_gone(stage1.pids + stage1._own_input.pids + stage2.pids + stage3.pids)
+    assert _all_gone(stage1.pids + stage1._it.pids + stage2.pids + stage3.pids)
     with pytest.raises(RuntimeError, match="closed"):
         list(stage1)
 
@@ -161,7 +161,7 @@ def test_an_error_closes_the_whole_pipeline():
     stage2 = Parallel(n_workers=2)(ident)(stage1)
     with pytest.raises(ValueError):
         stage2.run(progress=False)
-    assert _all_gone(stage1.pids + stage1._own_input.pids + stage2.pids)
+    assert _all_gone(stage1.pids + stage1._it.pids + stage2.pids)
 
 
 def test_closing_a_zip_closes_its_inputs():
@@ -170,7 +170,7 @@ def test_closing_a_zip_closes_its_inputs():
     z = parallel.zip(a, b)
     next(iter(z))
     z.close()
-    assert _all_gone(a.pids + a._own_input.pids + b.pids + z.pids)
+    assert _all_gone(a.pids + a._it.pids + b.pids + z.pids)
 
 
 # ---------- processes left behind ----------
@@ -187,7 +187,7 @@ def outer(x):
     stage = Parallel(n_workers=2)(inner)(range(100))  # a stage created in a worker
     next(iter(stage))
     print("grandchildren", *stage.pids, flush=True)
-    print("queues", stage._out_queue._base, stage._own_input._out_queue._base, flush=True)
+    print("queues", stage._out_queue._base, stage._it._out_queue._base, flush=True)
     time.sleep(60)
     return x
 
@@ -221,8 +221,8 @@ if __name__ == "__main__":
     if sys.argv[1] == "running":
         next(iter(stage))
     # else: the workers are probably still starting when this process is killed
-    print("queues", stage._out_queue._base, stage._own_input._out_queue._base, flush=True)
-    print("workers", *(stage.pids + stage._own_input.pids), flush=True)
+    print("queues", stage._out_queue._base, stage._it._out_queue._base, flush=True)
+    print("workers", *(stage.pids + stage._it.pids), flush=True)
     time.sleep(60)
 """
 
