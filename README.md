@@ -30,6 +30,8 @@ Auto-generated (minimal) API documentation: https://danionella.github.io/dejaq
 
 - for development, clone this repository, navigate to the root directory and type `pip install -e .`
 
+dejaq supports Python 3.8 and later on Linux, macOS and Windows. On free-threaded Python builds (e.g. 3.14t), dejaq works, but on Linux and macOS importing it turns the GIL back on, because its dependency `posix_ipc` does not declare free-threading support yet (see #38).
+
 ## Examples
 ### dejaq.DejaQueue
 ```python
