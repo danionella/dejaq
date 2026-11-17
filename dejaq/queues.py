@@ -1,6 +1,7 @@
 from __future__ import annotations
 import logging
-import errno, os, sys, time, weakref, struct, threading
+import errno, numbers, os, sys, time, warnings, weakref, struct, threading
+import queue as _stdqueue
 import multiprocessing as mp
 from multiprocessing import shared_memory
 import pickle
@@ -701,9 +702,46 @@ class _RingResources:
             self.unlink()
 
 
+class Empty(_stdqueue.Empty, TimeoutError):
+    """Raised by DejaQueue.get() when no item is available in time (also a queue.Empty and a TimeoutError)."""
+
+
+class Full(_stdqueue.Full, TimeoutError):
+    """Raised by DejaQueue.put() when there is no space in time (also a queue.Full and a TimeoutError)."""
+
+
+class ShutDown(getattr(_stdqueue, "ShutDown", Exception)):
+    """Raised by put() on a queue that was shut down, and by get() once a shut-down queue is empty
+    (a queue.ShutDown on Python >= 3.13)."""
+
+
+def _wait_time(block, timeout, method: str):
+    """Timeout of get()/put() from queue.Queue-style (block, timeout) arguments (None: wait indefinitely).
+
+    dejaq <= 0.9 took the timeout as the first argument; a number there is still taken as a timeout
+    (deprecated). get(None) waited indefinitely then and still does.
+    """
+    if block is None:
+        return timeout
+    if isinstance(block, numbers.Real) and not isinstance(block, bool):
+        if timeout is not None:
+            raise TypeError(f"DejaQueue.{method}(): block must be True or False, got {block!r}")
+        warnings.warn(
+            f"DejaQueue.{method}(): a timeout as first argument is deprecated; pass timeout=... as a keyword "
+            "(positional arguments now follow queue.Queue: block, timeout)",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return block
+    return timeout if block else 0.0
+
+
 def _pack_header(lens) -> bytes:
     """Item header: number of segments K, then K segment lengths (all uint64)."""
     return struct.pack(f"<Q{len(lens)}Q", len(lens), *lens)
+
+
+_MIN_ITEM_BYTES = 16 + len(pickle.dumps(None, protocol=5))  # header with one segment + the smallest pickle
 
 
 class NamedByteRing:
@@ -851,17 +889,45 @@ class NamedByteRing:
         self._res = _RingResources(shms, others, None, False, False)
 
     @property
+    def is_shutdown(self) -> bool:
+        """True once shutdown() was called (by any process)."""
+        return bool(self._state[_CLOSED])
+
+    @property
     def closed(self) -> bool:
-        with self._state_lock:
-            return bool(int(self._state[_CLOSED]))
+        """Alias of is_shutdown (setting it to True shuts the queue down)."""
+        return self.is_shutdown
 
     @closed.setter
     def closed(self, val: bool) -> None:
-        with self._state_lock:
-            self._state[_CLOSED] = int(val)
+        if val:
+            self.shutdown()
+        else:  # reopen
+            with self._state_lock:
+                self._state[_CLOSED] = 0
+
+    def shutdown(self, immediate: bool = False) -> None:
+        """Shut the queue down, for all processes using it (like queue.Queue.shutdown in Python 3.13).
+
+        Afterwards put() raises ShutDown, and get() returns the remaining items and then raises ShutDown.
+        Producers and consumers waiting at that moment are woken and raise ShutDown (consumers only once
+        the queue is empty). With immediate=True, the remaining items are dropped as well.
+        """
+        if immediate:
+            with self._put_lock, self._get_lock:
+                with self._state_lock:
+                    self._state[_CLOSED] = 1
+                self._purge_locked()  # also wakes waiting producers
+        else:
+            with self._state_lock:
+                self._state[_CLOSED] = 1
+                self._wake_producers()
+        # Wake waiting consumers: each one that finds the queue shut down and empty passes this count on.
+        self._items.release(1)
 
     @property
     def nitems(self) -> int:
+        """Number of items in the queue."""
         with self._state_lock:
             return int(self._state[_NITEMS])
 
@@ -873,11 +939,14 @@ class NamedByteRing:
         return head == tail
 
     @property
-    def bytes_available(self) -> int:
+    def bytes_free(self) -> int:
+        """Free space in the ring buffer, in bytes (an item needs its pickled size plus a small header)."""
         with self._state_lock:
             head = int(self._state[_HEAD])
             tail = int(self._state[_TAIL])
         return (head - tail - 1) % self.cap
+
+    bytes_available = bytes_free  # former name
 
     def _wake_producers(self) -> None:
         """Wake every producer waiting for space. Caller holds _state_lock.
@@ -985,6 +1054,10 @@ class DejaQueue(NamedByteRing):
         auto_unlink (bool): If True (default), the creating process unlinks the shared memory and semaphores once
             its queue object is gone. Other processes must not attach after that.
 
+    The interface follows queue.Queue / multiprocessing.Queue: put(), get(), put_nowait(), get_nowait(),
+    qsize(), empty(), full() and shutdown(), raising Empty, Full and ShutDown (which are also queue.Empty,
+    queue.Full, TimeoutError and, on Python >= 3.13, queue.ShutDown).
+
     Example:
         >>> import pickle
         >>> q = DejaQueue(buffer_bytes=1e7)
@@ -995,7 +1068,20 @@ class DejaQueue(NamedByteRing):
         {'a': 1, 'b': [1, 2, 3]}
     """
 
-    def put(self, obj, timeout: float | None = None) -> bool:
+    def put(self, obj, block: bool = True, timeout: float | None = None) -> bool:
+        """Put an object into the queue.
+
+        Args:
+            obj: Any picklable object (numpy arrays are copied in without an intermediate copy).
+            block (bool): If False, raise Full at once if there is no space (timeout is ignored).
+            timeout (float | None): Maximum time to wait for space. Default None (wait indefinitely).
+
+        Raises:
+            Full: No space in time. ShutDown: The queue was shut down. ValueError: The object is larger than
+                the queue's buffer.
+        """
+        if block is not True:
+            timeout = _wait_time(block, timeout, "put")
         bufs = []
         p0 = _pickle_backend.dumps(obj, protocol=_PICKLE_PROTOCOL, buffer_callback=bufs.append)
         segs = [p0] + [b.raw() for b in bufs]
@@ -1013,6 +1099,8 @@ class DejaQueue(NamedByteRing):
             with self._put_lock:
                 st = self._state  # hot path: literal slot indices (see _HEAD, _TAIL, ... above)
                 with self._state_lock:
+                    if st[3]:  # _CLOSED
+                        raise ShutDown("Queue is shut down.")
                     head = st[0]  # _HEAD
                     tail = st[1]  # _TAIL
                     fits = (head - tail - 1) % self.cap >= need
@@ -1041,7 +1129,7 @@ class DejaQueue(NamedByteRing):
                 raise
             if not woken:
                 self._cancel_space_wait()
-                raise TimeoutError("Timeout waiting for space in queue.")
+                raise Full("Timeout waiting for space in queue.")
 
     def _cancel_space_wait(self) -> None:
         """Deregister a producer that stops waiting for space without having been woken."""
@@ -1054,10 +1142,11 @@ class DejaQueue(NamedByteRing):
                 # equals the number of registered producers, and we are still one of them.
                 self._space_gate.acquire(timeout=0)
 
-    def get(self, timeout=None, peek_only=False, callback=None):
-        """Gets an item from the queue.
+    def get(self, block: bool = True, timeout: float | None = None, *, peek_only: bool = False, callback=None):
+        """Get an item from the queue.
 
         Args:
+            block (bool): If False, raise Empty at once if no item is available (timeout is ignored).
             timeout (float | None): Maximum time to wait for an item. Default None (wait indefinitely).
             peek_only (bool): If True, read the item without removing it from the queue. Default False.
             callback (Callable, optional): If provided, a function to be called with the unpickled object
@@ -1066,7 +1155,12 @@ class DejaQueue(NamedByteRing):
                 copied out of the queue and writable).
                 Make sure the callback is fast, since it runs while holding the get_lock, and that it does not keep references
                 to the object (or its buffers), since the underlying memory may be overwritten.
+
+        Raises:
+            Empty: No item in time. ShutDown: The queue was shut down and is empty.
         """
+        if block is not True:
+            timeout = _wait_time(block, timeout, "get")
         # The item count in the state block (read under the state lock) is the truth about available items.
         # The _items semaphore, with one count per item, serves to wait for items; counts are only taken while
         # holding the get lock, where a consumer that dies is noticed (_GET_CLAIM) and its count restored. Lost
@@ -1089,6 +1183,10 @@ class DejaQueue(NamedByteRing):
                 if nitems > 0:  # (without a count if it was lost, or is being handed back by a waiting consumer)
                     out = self._get_locked(head0, peek_only, callback, counted)
                     break
+                if st[3]:  # _CLOSED (puts are refused under the state lock once it is set)
+                    if counted:
+                        items.release(1)  # pass shutdown()'s wake-up on to the next waiting consumer
+                    raise ShutDown("Queue is shut down and empty.")
                 # No item (a count without one is spare, e.g. after purge(): drop it).
             finally:
                 st[7] = 0
@@ -1097,9 +1195,29 @@ class DejaQueue(NamedByteRing):
             # at once and take the item under the lock. (Only a process dying right in between loses a count.)
             rem = None if deadline is None else max(0.0, deadline - time.monotonic())
             if not items.acquire(timeout=rem):
-                raise TimeoutError("Timeout waiting for item.")
+                raise Empty("Timeout waiting for item.")
             items.release(1)
         return out
+
+    def put_nowait(self, obj) -> bool:
+        """put(obj, block=False)"""
+        return self.put(obj, block=False)
+
+    def get_nowait(self):
+        """get(block=False)"""
+        return self.get(block=False)
+
+    def qsize(self) -> int:
+        """Number of items in the queue."""
+        return self.nitems
+
+    def empty(self) -> bool:
+        """True if the queue holds no items (may change at once if other processes use the queue)."""
+        return self.nitems == 0
+
+    def full(self) -> bool:
+        """True if not even the smallest item fits (a larger item may not fit even when this is False)."""
+        return self.bytes_free < _MIN_ITEM_BYTES
 
     def _get_locked(self, head0: int, peek_only: bool, callback, counted: bool = True):
         """Read the item at head0. Caller holds get_lock, and one count of _items if counted."""
@@ -1177,10 +1295,18 @@ class DejaQueue(NamedByteRing):
             self._items.release(1)
 
     def __iter__(self):
+        """Yield items until the queue is shut down and empty (or an Ellipsis stop signal arrives, which is
+        put back for other consumers)."""
         while True:
-            x = self.get()
+            try:
+                x = self.get()
+            except ShutDown:
+                return
             if x is Ellipsis:
-                self.put(Ellipsis)
+                try:
+                    self.put(Ellipsis)
+                except ShutDown:
+                    pass
                 return
             yield x
 
@@ -1193,7 +1319,10 @@ class DejaQueue(NamedByteRing):
 ### Legacy DejaQueue: ###
 
 class ByteFIFO:
-    """A FIFO buffer (queue) for bytes. The queue is implemented as a ring buffer in shared memory."""
+    """A FIFO buffer (queue) for bytes. The queue is implemented as a ring buffer in shared memory.
+
+    Deprecated (to be removed in dejaq 1.0): use DejaQueue.
+    """
 
     def __init__(self, buffer_bytes=10e6):
         """
@@ -1202,6 +1331,11 @@ class ByteFIFO:
         Args:
             buffer_bytes (int): The size of the buffer in bytes. Defaults to 10 MiB.
         """
+        warnings.warn(
+            f"{type(self).__name__} is deprecated and will be removed in dejaq 1.0; use DejaQueue",
+            DeprecationWarning,
+            stacklevel=2 if type(self) is ByteFIFO else 3,
+        )
 
         self.buffer_bytes = int(buffer_bytes)
         self.buffer = mp.Array("B", self.buffer_bytes, lock=False)
@@ -1359,6 +1493,8 @@ class ByteFIFO:
 
 class LegacyDejaQueue(ByteFIFO):
     """A fast queue for arbitrary (picklable) Python objects.
+
+    Deprecated (to be removed in dejaq 1.0): use DejaQueue.
 
     Args:
         buffer_bytes (int): The size of the buffer in bytes. Defaults to 10 MiB.

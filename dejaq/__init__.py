@@ -7,9 +7,9 @@ __docformat__ = 'google'
 # handler, so when the application has configured none, warnings and errors (e.g. from worker processes)
 # still reach stderr through logging's last-resort handler.
 
-from .queues import LegacyDejaQueue, DejaQueue
+from .queues import LegacyDejaQueue, DejaQueue, Empty, Full, ShutDown
 from .parallel import Parallel
 from .remote import Actor, RemoteFunc, ActorDecorator
 from .stream import Source, MapNode
 
-__all__ = ["DejaQueue", "Parallel", "Actor", "Source", "MapNode", "remote", "stream", "queues"]
+__all__ = ["DejaQueue", "Empty", "Full", "ShutDown", "Parallel", "Actor", "Source", "MapNode", "remote", "stream", "queues"]
