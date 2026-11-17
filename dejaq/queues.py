@@ -718,7 +718,8 @@ class _StateLock(NamedSemaphore):
 
 
 class _SharedMemory(shared_memory.SharedMemory):
-    """SharedMemory that owns the views derived from it and releases them in close().
+    """SharedMemory that owns the views derived from it and releases them in close() (and tolerates views that
+    others still hold, see close()).
 
     A live derived view (e.g. ``buf.cast("q")``) keeps the mapping exported, so closing fails with
     ``BufferError: cannot close exported pointers exist``. Normally the view is dropped first, but the
@@ -737,7 +738,16 @@ class _SharedMemory(shared_memory.SharedMemory):
         views, self._views = self._views, ()
         for view in views:
             view.release()
-        super().close()
+        try:
+            super().close()
+        except BufferError:
+            # Arrays handed out without a copy (get(callback=...), dejaq.parallel's zero-copy iteration) still
+            # view the memory: leave the mapping to them (it is unmapped when the last of them is gone).
+            self._buf = self._mmap = None
+            fd = getattr(self, "_fd", -1)
+            if fd >= 0:
+                os.close(fd)
+                self._fd = -1
 
 
 # Shared state block: int64 slots, read and written only under _state_lock.
@@ -941,7 +951,7 @@ class NamedByteRing:
                 _flush_tracker_backlog()
                 state_mem = _SharedMemory(create=True, name=st_name, size=8 * _STATE_SLOTS)
                 shms.append(state_mem)
-                buf = shared_memory.SharedMemory(name=buf_name, create=True, size=buffer_bytes)
+                buf = _SharedMemory(name=buf_name, create=True, size=buffer_bytes)
                 shms.append(buf)
             if not self._auto_unlink:
                 for shm in shms:
@@ -995,7 +1005,7 @@ class NamedByteRing:
                     f"Queue {base!r} was created by an incompatible dejaq version; "
                     "all processes sharing a queue must use the same dejaq version."
                 )
-            shms.append(_attach_shm(buf_name))
+            shms.append(_attach_shm(buf_name, cls=_SharedMemory))
             for nm in lock_names:
                 others.append(_RobustLock(nm, create=False))
             others.append(_StateLock(sem_names[0], create=False))

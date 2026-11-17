@@ -369,3 +369,96 @@ def test_zip_of_tee_branches_with_frames():
 def test_pass_through_stage():
     up = Parallel(n_workers=2)(add5)(range(10))
     assert lazymap(None, up).run(progress=False) == [i + 5 for i in range(10)]
+
+
+# ---------- zero_copy ----------
+
+def numbered_frame(i):
+    return np.full(250_000, i, dtype=np.int64)  # 2 MB
+
+
+def half_view(frame):
+    return frame[::2]  # a view of the input: put before the input's memory is released
+
+
+def frame_sum(frame):
+    return int(frame[0]), int(frame.sum())
+
+
+def test_zero_copy_stage_results_stay_correct_when_the_ring_wraps():
+    cam = Parallel(n_workers=1, buffer_bytes=9e6)(numbered_frame)(range(60))  # ~4 frames per ring
+    views = Parallel(n_workers=1, zero_copy=True)(half_view)(cam)
+    sums = Parallel(n_workers=1, zero_copy=True)(frame_sum)(views)
+    assert sums.run(progress=False) == [(i, i * 125_000) for i in range(60)]
+
+
+def test_zero_copy_stage_errors_and_zip_input():
+    a = Parallel(n_workers=1)(ident)(range(10))
+    with pytest.raises(ValueError, match="bad item 3"):
+        Parallel(n_workers=1, zero_copy=True)(fails_at_3)(a).run(progress=False)
+    a, b = Parallel(n_workers=1)(ident)(range(5)), Parallel(n_workers=1)(add5)(range(5))
+    assert Parallel(n_workers=1, zero_copy=True)(sum)(parallel.zip(a, b)).run(progress=False) == [5, 7, 9, 11, 13]
+
+
+def test_zero_copy_needs_one_worker():
+    with pytest.raises(ValueError, match="n_workers=1"):
+        Parallel(n_workers=2, zero_copy=True)(ident)(range(3))
+
+
+def test_zero_copy_with_a_plain_input_works_as_usual():
+    assert Parallel(n_workers=1, zero_copy=True)(add5)(range(3)).run(progress=False) == [5, 6, 7]
+
+
+def test_iterating_without_copies_in_the_main_process():
+    stage = Parallel(n_workers=1, buffer_bytes=9e6)(numbered_frame)(range(40))
+    seen = []
+    for i, frame in enumerate(stage.iter(zero_copy=True)):
+        seen.append((int(frame[0]), int(frame[-1])))  # valid until the next frame is requested
+        if i == 9:
+            break
+    for frame in stage.iter(zero_copy=True):  # continues with the next frame
+        seen.append((int(frame[0]), int(frame[-1])))
+    assert seen == [(i, i) for i in range(40)]
+
+
+def test_iterating_without_copies_raises_worker_errors():
+    with pytest.raises(ValueError, match="bad item 3"):
+        for _ in Parallel(n_workers=2)(fails_at_3)(range(10)).iter(zero_copy=True):
+            pass
+
+
+_CLOSE_STRESS = """
+import numpy as np
+from dejaq import Parallel, parallel
+
+def big(x):
+    return np.ones(500_000)
+
+def ident(x):
+    return x
+
+if __name__ == "__main__":
+    for i in range(12):
+        a = Parallel(n_workers=2)(big)(range(1000))
+        b = Parallel(n_workers=1)(big)(range(1000))
+        kind = i % 3
+        if kind == 0:
+            last = Parallel(n_workers=2)(ident)(a)
+        elif kind == 1:
+            last = parallel.zip(a, b)
+        else:
+            x, y = a.tee(2)
+            last = Parallel(n_workers=1)(ident)(x)
+        next(iter(last))  # every process is busy moving data when they are stopped
+        last.close()
+        if kind == 2:
+            y.close()
+        b.close()
+    print("ok", flush=True)
+"""
+
+
+def test_closing_busy_pipelines_never_hangs(tmp_path):
+    r = _run_script(tmp_path, _CLOSE_STRESS, timeout=120)
+    assert r.returncode == 0 and "ok" in r.stdout, r.stderr[-3000:]
+    assert "Traceback" not in r.stderr, r.stderr[-3000:]  # workers end quietly when their stage is closed

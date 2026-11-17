@@ -91,6 +91,7 @@ def _close_input(it) -> None:
 
 
 _PARENT_CHECK_INTERVAL = 0.5
+_STOP_GRACE = 0.1  # seconds that close() gives workers to end by themselves after their queue was shut down
 
 
 def _exit_with_parent() -> None:
@@ -122,16 +123,18 @@ def _exit_with_parent() -> None:
 
 
 def _forwardable(it) -> bool:
-    """Whether a stage without a function can pass its input on with one copy (see _forward)."""
+    """Whether a stage's input is read from queues (one stage, or zipped stages), so that _forward can be used."""
     if isinstance(it, _Zipped):
         return all(isinstance(x, lazymap) for x in it._iterables)
     return isinstance(it, lazymap)
 
 
-def _forward(it, out_queue) -> None:
-    """Pass on the results of a stage (or tuples of the results of zipped stages) without a private copy: each
-    item is put into out_queue while it still views the source queue's memory (from inside get(callback=...)),
-    so its arrays are copied once, straight from queue to queue. Ends like zip(): at the end of any source."""
+def _forward(it, out_queue, fcn=None, kwargs=None) -> None:
+    """Pass on the results of a stage (or tuples of the results of zipped stages), or fcn of them, without a
+    private copy: the item (and the result) is handled inside get(callback=...), while its arrays still view the
+    source queue's memory, so they are copied once, straight from queue to queue. Ends like zip(): at the end of
+    any source."""
+    kwargs = kwargs or {}
     sources = it._iterables if isinstance(it, _Zipped) else [it]
     for src in sources:
         if src._start_type == "lazy":  # (as iterating it would)
@@ -150,8 +153,20 @@ def _forward(it, out_queue) -> None:
             items.append(item)
             if i + 1 < len(queues):
                 return take(i + 1, items)
-            out_queue.put(tuple(items) if zipped else items[0])
-            return True
+            res = tuple(items) if zipped else items[0]
+            go_on = True
+            if fcn is not None:
+                try:
+                    res = fcn(res, **kwargs)
+                except Exception as e:
+                    res = _WorkerException(e)
+                except BaseException as e:  # e.g. sys.exit() in fcn: pass it on, then stop
+                    res, go_on = _WorkerException(e), False
+            try:
+                out_queue.put(res)  # (before the source's memory is released: also a view of the item is safe)
+            except Exception as e:  # e.g. the result cannot be pickled
+                out_queue.put(_WorkerException(e))
+            return go_on
         try:
             return queues[i].get(callback=got)
         except ShutDown:
@@ -161,6 +176,14 @@ def _forward(it, out_queue) -> None:
         pass
 
 
+def _keep(obj):
+    return obj
+
+
+def _drop(obj):
+    return None
+
+
 def _put_stop(q) -> None:
     try:
         q.put(_Stop())
@@ -168,9 +191,15 @@ def _put_stop(q) -> None:
         pass
 
 
-def _stop_processes(procs, lock=None, timeout=1.0) -> None:
-    """Terminate (if still running) and join processes."""
+def _stop_processes(procs, lock=None, timeout=1.0, grace=0.0) -> None:
+    """Terminate (if still running) and join processes; first wait up to `grace` seconds for them to end."""
     with lock or threading.Lock():
+        deadline = time.monotonic() + grace
+        for p in procs:
+            try:
+                p.join(max(0.0, deadline - time.monotonic()))
+            except Exception:
+                pass
         for p in procs:
             try:
                 if p.is_alive():
@@ -241,6 +270,10 @@ class lazymap:
             'eager' at once, 'manual' when start() is called
         ordered (bool): if True (default), results are returned in input order; if False, in the order in which
             they are ready (a slow item does not hold up the others)
+        zero_copy (bool): n_workers=1 only, with a stage (or a zip of stages) as input: fcn receives the item without
+            a copy, its numpy arrays viewing the input queue's memory. They are valid only during the call: do not
+            keep them (e.g. as the previous frame) or hand them to another thread; copy what you need to keep.
+            Returning them (or views of them) is fine. Default False.
 
         **kwargs: optional, being passed to fcn
 
@@ -248,9 +281,12 @@ class lazymap:
         (iterable): an iterable that returns the results of fcn(item) for each item in it
     '''
 
-    def __init__(self, fcn, it, n_workers=1, buffer_bytes=10e6, start_type='lazy', ordered=True, **kwargs):
+    def __init__(self, fcn, it, n_workers=1, buffer_bytes=10e6, start_type='lazy', ordered=True, zero_copy=False,
+                 **kwargs):
         if not isinstance(n_workers, int) or n_workers < 1:
             raise ValueError(f"n_workers must be a positive integer, not {n_workers!r}")
+        if zero_copy and n_workers != 1:
+            raise ValueError("zero_copy=True needs n_workers=1 (the function runs while the input item is held)")
         if start_type not in ("lazy", "eager", "manual"):
             raise ValueError(f"start_type must be 'lazy', 'eager' or 'manual', not {start_type!r}")
         self._own_input = None
@@ -280,7 +316,8 @@ class lazymap:
         self._ordered = ordered
         self._finished = finished = None if ordered else NamedSemaphore(initial=n_workers - 1)
         # (unordered workers simply share their input queue: whoever is free takes the next item)
-        worker_args = (pkl, self._out_queue, n_workers, self._in_sem, self._out_sem, self._done, ordered, finished)
+        worker_args = (pkl, self._out_queue, n_workers, self._in_sem, self._out_sem, self._done, ordered, finished,
+                       zero_copy)
         self._procs = procs = []
         self._owner = True  # only the creating process stops the workers (not pickled copies in other workers)
         self._closing = False
@@ -307,6 +344,54 @@ class lazymap:
         if self._start_type == "lazy":
             self._start()
         return self._results()
+
+    def iter(self, zero_copy=False):
+        """ Returns an iterator over the results, like iter(stage).
+
+        Args:
+            zero_copy (bool): if True, each result's numpy arrays view the stage's queue memory instead of being
+                copied out. They are valid until the next result is requested: do not keep them (copy what you need
+                to keep). Default False.
+        """
+        if not zero_copy:
+            return iter(self)
+        if self._closed:
+            raise RuntimeError("this lazymap was closed (its workers were stopped)")
+        if self._start_type == "lazy":
+            self._start()
+        return self._views()
+
+    def _views(self):
+        q = self._out_queue
+        held = False  # the item handed out last is still in the queue (its memory stays valid until removed)
+        try:
+            while True:
+                if held:
+                    q.get(callback=_drop)
+                    held = False
+                try:
+                    item = q.get(peek_only=True, callback=_keep)
+                except ShutDown:
+                    raise RuntimeError("this lazymap was closed (its workers were stopped)") from None
+                kind = type(item)
+                if kind is _Stop:
+                    return  # (left in the queue for other consumers)
+                if kind is _WorkerException:
+                    q.get(callback=_drop)
+                    item.reraise()
+                if kind is _WorkerDied:
+                    q.get(callback=_drop)
+                    raise WorkerError(f"worker process {item.pid} died (exit code {item.exitcode})")
+                held = True
+                yield item
+        except GeneratorExit:  # left early: the item handed out last counts as taken
+            if held:
+                q.get(callback=_drop)
+            raise
+        except BaseException:
+            if getattr(self, "_owner", False):
+                self.close()
+            raise
 
     def _start(self):
         if not self._started:
@@ -341,7 +426,14 @@ class lazymap:
             raise
 
     @staticmethod
-    def _worker_fcn(pid, pkl, _out_queue, _n_workers, in_sem, out_sem, done, ordered, finished):
+    def _worker_fcn(*args):
+        try:
+            lazymap._worker_body(*args)
+        except ShutDown:  # the stage was closed
+            pass
+
+    @staticmethod
+    def _worker_body(pid, pkl, _out_queue, _n_workers, in_sem, out_sem, done, ordered, finished, zero_copy):
         # Unless ordered=False, workers take turns (round-robin, passing semaphore tokens) to read the input and
         # to put results. A failure is passed on as a _WorkerException item, in this worker's turn, after which
         # the worker stops.
@@ -354,9 +446,9 @@ class lazymap:
             failure = _WorkerException(e)
         nxt = (pid + 1) % _n_workers
         in_sem[pid].acquire()  # the start signal
-        if failure is None and fcn is None and _n_workers == 1 and _forwardable(it):  # e.g. zip()
+        if failure is None and _n_workers == 1 and (fcn is None or zero_copy) and _forwardable(it):  # e.g. zip()
             try:
-                _forward(it, _out_queue)
+                _forward(it, _out_queue, fcn, kwargs)
             except BaseException as e:
                 try:
                     _out_queue.put(_WorkerException(e))
@@ -442,12 +534,18 @@ class lazymap:
             return
         self._closing = self._closed = True
         _monitored.discard(self)
-        self._finalizer()
+        # Order matters: a process that is terminated inside a queue operation can leave that queue's internal
+        # lock held, so a queue is shut down while every process that uses it still runs. Hence the input stages
+        # are closed first (this stage's workers read from them), and then this stage's queue is shut down
+        # (waking workers blocked on it, which then end, and consumers in other threads, which raise
+        # RuntimeError) before the workers are stopped.
+        _close_input(self._it)
         try:
-            self._out_queue.shutdown()  # wakes consumers waiting for results (they raise RuntimeError)
+            self._out_queue.shutdown()
         except Exception:
             pass
-        _close_input(self._it)
+        self._finalizer.cancel()
+        _stop_processes(self._procs, self._procs_lock, grace=_STOP_GRACE)
 
     def __enter__(self):
         return self
@@ -509,7 +607,7 @@ class lazymap:
         thread.start()
         return future
 
-    def map(self, fcn, n_workers=1, buffer_bytes=10e6, ordered=True, **kwargs):
+    def map(self, fcn, n_workers=1, buffer_bytes=10e6, ordered=True, zero_copy=False, **kwargs):
         ''' Maps another function over the output of this lazymap, returning a new lazymap.
 
         Args:
@@ -521,7 +619,7 @@ class lazymap:
         Returns:
             (lazymap): a new lazymap that maps fcn over the output of this lazymap
         '''
-        return lazymap(fcn, self, n_workers, buffer_bytes, ordered=ordered, **kwargs)
+        return lazymap(fcn, self, n_workers, buffer_bytes, ordered=ordered, zero_copy=zero_copy, **kwargs)
 
     def start(self):
         ''' Starts the lazymap if it was created with start_type='manual'.
@@ -534,23 +632,25 @@ class lazymap:
         return tee(self, n, buffer_bytes)
 
 
-def Parallel(n_workers=1, buffer_bytes=10e6, ordered=True):
+def Parallel(n_workers=1, buffer_bytes=10e6, ordered=True, zero_copy=False):
     ''' A wrapper to make a class or callablle a parallel worker. Can be used as a decorator.
 
     Args:
         n_workers (int): number of workers (default: 1)
         buffer_bytes (int): size of the queue buffer (default: 10e6 bytes)
         ordered (bool): if True (default), results come in input order; if False, as soon as they are ready
+        zero_copy (bool): n_workers=1 only: the function receives its input without a copy, valid only during the
+            call (see lazymap)
 
     Returns:
 
     '''
     def decorator(cls):
         if isinstance(cls, type):
-            return WorkerWrapper(cls, n_workers, buffer_bytes, ordered)
+            return WorkerWrapper(cls, n_workers, buffer_bytes, ordered, zero_copy)
         elif callable(cls):
             def wrapped(iterable, **kwargs):
-                return lazymap(cls, iterable, n_workers, buffer_bytes, ordered=ordered, **kwargs)
+                return lazymap(cls, iterable, n_workers, buffer_bytes, ordered=ordered, zero_copy=zero_copy, **kwargs)
             return wrapped
         else:
             raise ValueError(f'Invalid type {type(cls)}')
@@ -564,12 +664,13 @@ class WorkerWrapper:
         n_workers (int): number of workers (default: 1)
         buffer_bytes (int): size of the queue buffer (default: 10e6 bytes)
     '''
-    def __init__(self, cls, n_workers=1, buffer_bytes=10e6, ordered=True):
+    def __init__(self, cls, n_workers=1, buffer_bytes=10e6, ordered=True, zero_copy=False):
         self._instance = None
         self._cls = cls
         self._n_workers = n_workers
         self._buffer_bytes = int(buffer_bytes)
         self._ordered = ordered
+        self._zero_copy = zero_copy
     def __call__(self, *init_args, **init_kwargs):
         def mapper(iterable, **map_kwargs):
             def worker(arg, **kwargs):
@@ -577,7 +678,7 @@ class WorkerWrapper:
                     self._instance = self._cls(*init_args, **init_kwargs)
                 return self._instance(arg, **kwargs)
             return lazymap(worker, iterable, self._n_workers, self._buffer_bytes, ordered=self._ordered,
-                           **map_kwargs)
+                           zero_copy=self._zero_copy, **map_kwargs)
         return mapper
 
 
@@ -725,9 +826,10 @@ class _Tee:
         with self.lock:
             self.open_branches.discard(i)
             last = not self.open_branches
-        if last:
-            self.finalizer()
+        if last:  # (in this order: see lazymap.close)
             _close_input(self.upstream)
+            self.finalizer.cancel()
+            _stop_processes([self.proc], grace=_STOP_GRACE)
 
 
 class _TeeBranch(lazymap):
