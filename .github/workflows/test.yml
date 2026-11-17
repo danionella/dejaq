@@ -61,8 +61,18 @@ jobs:
           python -c "import sys; print(sys.version); ft = '${{ matrix.python-version }}'.endswith('t'); assert ft == (not getattr(sys, '_is_gil_enabled', lambda: True)()), 'wrong interpreter build'"
 
       # this runs the platform-specific tests declared in tox.ini
+      - name: Snapshot OS objects (shared memory, semaphores, lock files)
+        if: runner.os != 'Windows'
+        run: python tests/check_leftovers.py snapshot "$RUNNER_TEMP/os_objects_before.txt"
+
       - name: Test with pytest
         run: |
           pytest -vv -s
         env:
           PLATFORM: ${{ matrix.platform }}
+
+      # after pytest has exited, so that cleanup at interpreter exit is included (Windows: objects disappear
+      # with the processes holding them; tests/test_teardown.py checks that per object on all platforms)
+      - name: Check for OS objects left behind by the tests
+        if: runner.os != 'Windows'
+        run: python tests/check_leftovers.py compare "$RUNNER_TEMP/os_objects_before.txt"
