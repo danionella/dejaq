@@ -88,16 +88,17 @@ def test_explicit_queue_name_that_exists_raises_and_keeps_the_queue():
 def test_failed_creation_cleans_up(monkeypatch):
     """If creating a queue fails halfway, what was created is removed again and the name is reusable."""
     name = "dq_test_" + os.urandom(5).hex()
-    real = queues.NamedSemaphore
     calls = []
 
-    def flaky(*args, **kwargs):
-        calls.append(args)
-        if len(calls) == 2:  # the second of the queue's two plain semaphores
-            raise OSError("simulated failure")
-        return real(*args, **kwargs)
+    class Flaky(queues.NamedSemaphore):
+        def __init__(self, *args, **kwargs):
+            calls.append(args)
+            if len(calls) == 2:  # the second of the queue's two plain semaphores
+                raise OSError("simulated failure")
+            super().__init__(*args, **kwargs)
 
-    monkeypatch.setattr(queues, "NamedSemaphore", flaky)
+    real = queues.NamedSemaphore
+    monkeypatch.setattr(queues, "NamedSemaphore", Flaky)
     with pytest.raises(OSError, match="simulated"):
         DejaQueue(4096, name=name)
     monkeypatch.setattr(queues, "NamedSemaphore", real)
@@ -130,8 +131,8 @@ def test_stale_objects_of_a_crashed_queue():
             DejaQueue(4096, name=name2)
         DejaQueue(4096, name=name2 + "b")  # (nothing else was affected)
     finally:
-        stale.close()
         stale.unlink()
+        stale.close()
 
 
 # ---------- get(timeout) with competing consumers ----------
