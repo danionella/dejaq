@@ -283,10 +283,21 @@ def _flush_tracker_backlog() -> None:
 
 atexit.register(_flush_tracker_backlog)  # calls queued by the last garbage collections
 if not _IS_WIN:
-    # multiprocessing workers end with os._exit, which skips atexit; their exit handlers run these
+    # multiprocessing workers end with os._exit, which skips atexit; multiprocessing's own exit handlers run
+    # its "finalizers" instead. A worker clears the finalizers it inherited or registered on import before
+    # it runs, and then calls the after-fork hooks: register (again) there.
     from multiprocessing import util as _mp_util
 
-    _mp_util.Finalize(None, _flush_tracker_backlog, exitpriority=0)
+    class _Anchor:  # register_after_fork needs an object to refer to
+        pass
+
+    _mp_anchor = _Anchor()
+
+    def _flush_at_worker_exit(_anchor=None) -> None:
+        _mp_util.Finalize(None, _flush_tracker_backlog, exitpriority=0)
+
+    _flush_at_worker_exit()
+    _mp_util.register_after_fork(_mp_anchor, _flush_at_worker_exit)
 
 
 def _reset_tracker_state_in_child() -> None:

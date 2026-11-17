@@ -220,7 +220,7 @@ def test_6_tracker_calls_from_threads_stay_in_order(monkeypatch):
 # ---------- 7: worker processes send their queued tracker calls ----------
 
 _WORKER_FINALIZES_IN_GC = """
-import gc, multiprocessing as mp
+import gc, sys, multiprocessing as mp
 from dejaq.queues import NamedSemaphore
 
 def child():
@@ -230,7 +230,7 @@ def child():
     gc.collect()
 
 if __name__ == "__main__":
-    p = mp.get_context(mp.get_start_method()).Process(target=child)
+    p = mp.get_context(sys.argv[1]).Process(target=child)
     p.start()
     p.join()
     print("ok")
@@ -238,10 +238,11 @@ if __name__ == "__main__":
 
 
 @_POSIX_ONLY
-def test_7_worker_process_sends_queued_tracker_calls(tmp_path):
+@pytest.mark.parametrize("start_method", __import__("multiprocessing").get_all_start_methods())
+def test_7_worker_process_sends_queued_tracker_calls(tmp_path, start_method):
     """Formerly a multiprocessing worker exited (os._exit) with its queued "unregister" unsent: at exit the
     tracker reported a leaked semaphore."""
-    r = _run_script(tmp_path, _WORKER_FINALIZES_IN_GC)
+    r = _run_script(tmp_path, _WORKER_FINALIZES_IN_GC, start_method)
     assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr
     assert r.stderr.strip() == "", r.stderr
 
