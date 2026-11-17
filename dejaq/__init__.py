@@ -10,6 +10,5 @@ __docformat__ = 'google'
 from .queues import LegacyDejaQueue, DejaQueue, Empty, Full, ShutDown
 from .parallel import Parallel
 from .remote import Actor, RemoteFunc, ActorDecorator
-from .stream import Source, MapNode
 
-__all__ = ["DejaQueue", "Empty", "Full", "ShutDown", "Parallel", "Actor", "Source", "MapNode", "remote", "stream", "queues"]
+__all__ = ["DejaQueue", "Empty", "Full", "ShutDown", "Parallel", "Actor", "remote", "queues"]

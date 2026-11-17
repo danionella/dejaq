@@ -10,7 +10,7 @@ A fast alternative to `multiprocessing.Queue`. Faster, because it takes advantag
 
 <img src="https://github.com/user-attachments/assets/837ca980-b225-45b7-8bf5-f0ce6cf7083c" width="100%">
 
-The speed advantage of `DejaQueue` becomes substantial for items of > 1 MB size. It enables efficient inter-job communication in big-data processing pipelines using [`dejaq.Actor`](#dejaqactor-and-actordecorator) or [`dejaq.stream`](#dejaqstream---building-data-pipelines).
+The speed advantage of `DejaQueue` becomes substantial for items of > 1 MB size. It enables efficient inter-job communication in big-data processing pipelines using [`dejaq.Actor`](#dejaqactor-and-actordecorator) or [`dejaq.Parallel`](#dejaqparallel).
 
 ### Features:
 - Fast, low-latency, high-throughput inter-process communication
