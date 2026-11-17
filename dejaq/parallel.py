@@ -65,6 +65,11 @@ class _WorkerDied:
         self.pid, self.exitcode = pid, exitcode
 
 
+class _Stop:
+    """Queue item: the stop signal at the end of a stage's output (a private type, so that no input item or
+    result, e.g. an Ellipsis, can be mistaken for it)."""
+
+
 class _Zipped:
     """Picklable: zips the given iterables when iterated, in the process that iterates it."""
 
@@ -97,8 +102,8 @@ def _stop_processes(procs, lock=None, timeout=1.0) -> None:
 
 # One monitor thread per process watches the workers of the lazymaps this process created (only the parent of
 # a process sees its exit code). When a worker exits abnormally, the monitor tells the stage's consumer by
-# putting a _WorkerDied item into the stage's output queue. A worker that finished normally has exit code 0
-# (and has put its stop signal into the queue before exiting). If the consumer is a worker of a downstream
+# putting a _WorkerDied item into the stage's output queue. A worker that finished normally has marked itself as
+# done (after putting its stop signal into the queue); any other exit, even with exit code 0, counts as a death. If the consumer is a worker of a downstream
 # stage, it passes the error on as an item, so it reaches the end of the pipeline.
 _MONITOR_INTERVAL = 0.5
 _monitored: "weakref.WeakSet" = weakref.WeakSet()
@@ -106,14 +111,19 @@ _monitor_lock = threading.Lock()
 _monitor_thread = None
 
 
+def _check_all() -> None:
+    # A function of its own, so that no reference to a lazymap outlives the check (it would keep it alive).
+    for lzy in list(_monitored):
+        try:
+            lzy._check_workers()
+        except Exception:  # the monitor must not die
+            pass
+
+
 def _monitor() -> None:
     while True:
         time.sleep(_MONITOR_INTERVAL)
-        for lzy in list(_monitored):
-            try:
-                lzy._check_workers()
-            except Exception:  # the monitor must not die
-                pass
+        _check_all()
 
 
 def _watch(lzy) -> None:
@@ -129,15 +139,18 @@ class lazymap:
     ''' Returns an Iterable, functionally related to map (except that outputs are calculated by a pool of processes).
 
     Results are returned in input order. If a worker raises an exception, iterating raises it (with the worker's
-    traceback as its cause); if a worker dies, iterating raises WorkerError. In both cases, and when iteration
-    is left early, the stage's workers are stopped. They are also stopped when the lazymap is closed (close(),
-    or the end of a ``with`` block), garbage-collected, or at interpreter exit.
+    traceback as its cause); if a worker dies, iterating raises WorkerError. In both cases the stage's workers
+    are stopped. They are also stopped when the lazymap is closed (close(), or the end of a ``with`` block),
+    garbage-collected, or at interpreter exit. Leaving a loop early does not stop them: iterating again
+    continues with the next result. Iterating a closed lazymap raises RuntimeError.
 
     Args:
         fcn (callable): function that is being mapped. Signature: fcn(item, **kwargs)
         it (iterable): iterable that maps over the function, providing items as arguments (must be picklable)
         n_workers (int): number of workers (default: 1)
         buffer_bytes (int): size of the queue buffer (default: 10e6 bytes)
+        start_type (str): when the workers start reading input: 'lazy' (default) when iteration starts,
+            'eager' at once, 'manual' when start() is called
 
         **kwargs: optional, being passed to fcn
 
@@ -146,7 +159,12 @@ class lazymap:
     '''
 
     def __init__(self, fcn, it, n_workers=1, buffer_bytes=10e6, start_type='lazy', **kwargs):
+        if not isinstance(n_workers, int) or n_workers < 1:
+            raise ValueError(f"n_workers must be a positive integer, not {n_workers!r}")
+        if start_type not in ("lazy", "eager", "manual"):
+            raise ValueError(f"start_type must be 'lazy', 'eager' or 'manual', not {start_type!r}")
         self._own_input = None
+        self._closed = False
         if n_workers > 1 and not isinstance(it, lazymap):
             # one process reads the input, so that a stateful iterable (e.g. a file reader) is read only once
             it = self._own_input = lazymap(None, it, n_workers=1, buffer_bytes=buffer_bytes)
@@ -158,12 +176,17 @@ class lazymap:
         if start_type == "eager":
             self._in_sem[0].release()
             self._started = True
+            self._start_gate = None
         else:
             self._started = False
+            # Pickled copies of this lazymap (one in each worker of a downstream stage) all try to start it; the
+            # gate lets only the first one through, so that exactly one input token circulates.
+            self._start_gate = NamedSemaphore(initial=1)
         self._out_sem[0].release()
         self._n_workers = n_workers
+        self._done = ctx.RawArray("b", n_workers)  # set by each worker when it finished normally
         pkl = cloudpickle.dumps((fcn, self._it))
-        worker_args = [pkl, self._out_queue, n_workers, self._in_sem, self._out_sem]
+        worker_args = [pkl, self._out_queue, n_workers, self._in_sem, self._out_sem, self._done]
         procs = [ctx.Process(target=self._worker_fcn, args=(pid, *worker_args), kwargs=kwargs) for pid in range(n_workers)]
         for p in procs:
             p.start()
@@ -183,82 +206,110 @@ class lazymap:
 
     def __iter__(self):
         """ Returns an iterator over the results of fcn(item) for each item in it """
-        if self._start_type == "lazy" and not self._started:
-            self._in_sem[0].release()
-            self._started = True
+        if self._closed:
+            raise RuntimeError("this lazymap was closed (its workers were stopped)")
+        if self._start_type == "lazy":
+            self._start()
         return self._results()
 
+    def _start(self):
+        if not self._started:
+            if self._start_gate is None or self._start_gate.acquire(timeout=0):
+                self._in_sem[0].release()
+            self._started = True
+
     def _results(self):
-        finished = False
         try:
             while True:
                 try:
                     item = self._out_queue.get()
-                except ShutDown:
-                    finished = True
+                except ShutDown:  # close() shuts the queue down, also for consumers in other threads or processes
+                    raise RuntimeError("this lazymap was closed (its workers were stopped)") from None
+                kind = type(item)
+                if kind is _Stop:  # put it back for other consumers of this queue
+                    try:
+                        self._out_queue.put(item)
+                    except ShutDown:
+                        pass
                     return
-                if item is Ellipsis:  # stop signal: put it back for other consumers of this queue
-                    self._out_queue._signal_stop()
-                    finished = True
-                    return
-                if type(item) is _WorkerException:
+                if kind is _WorkerException:
                     item.reraise()
-                if type(item) is _WorkerDied:
+                if kind is _WorkerDied:
                     raise WorkerError(f"worker process {item.pid} died (exit code {item.exitcode})")
                 yield item
-        finally:
-            if not finished and getattr(self, "_owner", False):
-                self.close()  # left early, or a worker failed: stop the workers
+        except GeneratorExit:  # the loop was left early: the workers keep going, iterating again continues
+            raise
+        except BaseException:
+            if getattr(self, "_owner", False):
+                self.close()  # a worker failed (or e.g. Ctrl-C while waiting): stop the workers
+            raise
 
     @staticmethod
-    def _worker_fcn(pid, pkl, _out_queue, _n_workers, in_sem, out_sem, **kwargs):
-        import cloudpickle
-        fcn, it = cloudpickle.loads(pkl)
+    def _worker_fcn(pid, pkl, _out_queue, _n_workers, in_sem, out_sem, done, **kwargs):
+        # A failure is passed on as a _WorkerException item, in this worker's turn, after which the worker stops.
+        failure = None
+        try:
+            fcn, it = cloudpickle.loads(pkl)
+        except BaseException as e:
+            failure = _WorkerException(e)
         nxt = (pid + 1) % _n_workers
         in_sem[pid].acquire()
-        iterator = iter(it)
+        if failure is None:
+            try:
+                iterator = iter(it)
+            except BaseException as e:
+                failure = _WorkerException(e)
         in_sem[pid].release()
 
         while True:
             in_sem[pid].acquire()
-            input_failed = False
-            try:
-                item = next(iterator)
-            except StopIteration:
+            if failure is not None:
                 in_sem[nxt].release()
-                break
-            except BaseException as e:  # the input failed (e.g. an upstream stage's worker raised or died)
-                in_sem[nxt].release()
-                res, input_failed = _WorkerException(e), True
+                res = failure
             else:
-                in_sem[nxt].release()
                 try:
-                    res = item if fcn is None else fcn(item, **kwargs)
-                except Exception as e:
-                    res = _WorkerException(e)
+                    item = next(iterator)
+                except StopIteration:
+                    in_sem[nxt].release()
+                    break
+                except BaseException as e:  # the input failed (e.g. an upstream stage's worker raised or died)
+                    in_sem[nxt].release()
+                    res = failure = _WorkerException(e)
+                else:
+                    in_sem[nxt].release()
+                    try:
+                        res = item if fcn is None else fcn(item, **kwargs)
+                    except Exception as e:
+                        res = _WorkerException(e)
+                    except BaseException as e:  # e.g. sys.exit() in fcn: pass it on, then stop
+                        res = failure = _WorkerException(e)
             out_sem[pid].acquire()
             try:
                 _out_queue.put(res)
             except Exception as e:  # e.g. the result cannot be pickled
                 _out_queue.put(_WorkerException(e))
             out_sem[nxt].release()
-            if input_failed:
+            if failure is not None:
                 break
 
         out_sem[pid].acquire()
-        _out_queue._signal_stop()
+        try:
+            _out_queue.put(_Stop())
+        except ShutDown:
+            pass
         out_sem[nxt].release()
+        done[pid] = 1
 
     def _check_workers(self) -> None:
         """Called by the monitor thread: report workers that exited abnormally to the consumer."""
         if self._closing:
             return
         with self._procs_lock:
-            for p in self._procs:
+            for i, p in enumerate(self._procs):
                 if p.pid in self._reported:
                     continue
                 code = p.exitcode
-                if code is None or code == 0:
+                if code is None or (code == 0 and self._done[i]):
                     continue
                 try:
                     self._out_queue.put(_WorkerDied(p.pid, code), timeout=0.2)
@@ -272,9 +323,13 @@ class lazymap:
         '''
         if not getattr(self, "_owner", False):
             return
-        self._closing = True
+        self._closing = self._closed = True
         _monitored.discard(self)
         self._finalizer()
+        try:
+            self._out_queue.shutdown()  # wakes consumers waiting for results (they raise RuntimeError)
+        except Exception:
+            pass
         if self._own_input is not None:
             self._own_input.close()
 
@@ -286,7 +341,7 @@ class lazymap:
 
     def __getstate__(self):
         state = dict(self.__dict__)
-        for k in ("_procs", "_finalizer", "_procs_lock", "_reported"):
+        for k in ("_procs", "_finalizer", "_procs_lock", "_reported", "_done"):
             state.pop(k, None)
         state["_owner"] = False
         return state
@@ -332,7 +387,7 @@ class lazymap:
             try:
                 result = self.compute(progress=False)
                 future.set_result(result)
-            except Exception as e:
+            except BaseException as e:
                 future.set_exception(e)
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
@@ -355,9 +410,7 @@ class lazymap:
     def start(self):
         ''' Starts the lazymap if it was created with start_type='manual'.
         '''
-        if not self._started:
-            self._in_sem[0].release()
-            self._started = True
+        self._start()
         return self
 
     def tee(self, n):

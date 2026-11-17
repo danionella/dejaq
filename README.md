@@ -150,7 +150,7 @@ result = stage.run() # or list(stage)
 result = Parallel(n_workers=10)(slow_function)(input_iterable).run()
 ```
 
-If a worker raises an exception, `run()` (or iterating) raises the same exception, with the worker's traceback as its cause; if a worker process dies, it raises `dejaq.parallel.WorkerError`. A stage's workers are stopped when that happens, when you stop iterating early, when the stage is closed (`stage.close()` or a `with` block) or garbage-collected, and at exit.
+If a worker raises an exception, `run()` (or iterating) raises the same exception, with the worker's traceback as its cause; if a worker process dies, it raises `dejaq.parallel.WorkerError`. A stage's workers are stopped when that happens, when the stage is closed (`stage.close()` or a `with` block) or garbage-collected, and at exit. Leaving a loop early (`break`) does not stop them: iterating again continues with the next result.
 
 You can also use `Parallel` as a function decorator:
 ```python
