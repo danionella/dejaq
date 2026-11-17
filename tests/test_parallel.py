@@ -51,7 +51,7 @@ def test_lazymap_exception_propagation():
         return x
     data = range(5)
     lm = lazymap(f, data, n_workers=2)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError, match="bad value"):  # the worker's exception, with its traceback as cause
         list(lm)
 
 def test_parallel_function():
