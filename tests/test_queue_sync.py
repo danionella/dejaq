@@ -17,6 +17,7 @@ import pytest
 
 from dejaq import queues
 from dejaq.queues import _IS_WIN, DejaQueue, NamedSemaphore
+from _testutil import run_script
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -458,3 +459,32 @@ def test_forked_child_does_not_unlink_the_parents_queue():
 def _run_python(code):
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [REPO_ROOT, os.environ.get("PYTHONPATH")])))
     return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60, env=env)
+
+
+_DIES_HOLDING_THE_STATE_LOCK = """
+import multiprocessing as mp, os, time
+from dejaq import DejaQueue
+
+def die_holding(name):
+    q = DejaQueue(name=name, create=False)
+    q._state_lock.__enter__()
+    os._exit(1)
+
+if __name__ == "__main__":
+    q = DejaQueue(100_000)
+    p = mp.get_context("spawn").Process(target=die_holding, args=(q._base,))
+    p.start()
+    p.join()
+    assert p.exitcode == 1
+    t = time.monotonic()
+    q.put("after")
+    print(round(time.monotonic() - t, 1), q.get(timeout=1), flush=True)
+"""
+
+
+def test_state_lock_of_a_dead_process_is_taken_over(tmp_path):
+    """Formerly a process that died inside a queue operation's short critical section blocked the queue for good."""
+    r = run_script(tmp_path, _DIES_HOLDING_THE_STATE_LOCK, timeout=60)
+    assert r.returncode == 0, r.stderr[-2000:]
+    seconds, item = r.stdout.split()
+    assert item == "after" and float(seconds) < 5

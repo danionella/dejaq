@@ -276,9 +276,13 @@ if not _IS_WIN:
     _mp_util.register_after_fork(_flush_at_worker_exit, _flush_at_worker_exit)
 
 
+_pid = os.getpid()  # (kept current after fork: see below)
+
+
 def _reset_tracker_state_in_child() -> None:
     """After fork: the parent sends its own queued calls, and locks held by its other threads stay held."""
-    global _tracker_send_lock, _gc_pause_lock, _gc_pause_depth
+    global _tracker_send_lock, _gc_pause_lock, _gc_pause_depth, _pid
+    _pid = os.getpid()
     _tracker_backlog.clear()
     _tracker_send_lock = threading.Lock()
     _gc_pause_lock = threading.Lock()
@@ -305,8 +309,7 @@ class _RobustLock:
     own (and reopens it in a forked child, which would otherwise share the parent's), and a threading.Lock
     serializes threads sharing one object. Windows: a named mutex (released on exit as "abandoned").
 
-    The lock itself does not report whether a previous holder died; callers that need to know keep a flag
-    in shared memory (see DejaQueue.get).
+    The lock itself does not report whether a previous holder died.
     """
 
     _posix_instances: "weakref.WeakSet[_RobustLock]" = weakref.WeakSet()
@@ -436,8 +439,10 @@ class _RobustLock:
 
 if not _IS_WIN:
     import fcntl
+    import posix_ipc
 
     _flock, _LOCK_EX, _LOCK_UN = fcntl.flock, fcntl.LOCK_EX, fcntl.LOCK_UN
+    _Busy = posix_ipc.BusyError
     os.register_at_fork(after_in_child=_RobustLock._after_fork_in_child)
     os.register_at_fork(after_in_child=_reset_tracker_state_in_child)
 
@@ -636,21 +641,60 @@ class NamedLock(NamedSemaphore):
             raise RuntimeError("Over-release of NamedLock on POSIX")
 
 
-class _StateLock(NamedSemaphore):
-    """Internal mutex for short critical sections: like NamedLock, but releasing is a single operation
-    (no over-release probe on POSIX; Windows still enforces maxcount=1). Only for strictly paired use."""
+if _IS_WIN:
 
-    def __init__(self, name: str | None = None, create: bool = True, *, auto_unlink: bool = True) -> None:
-        super().__init__(name=name, create=create, initial=1, maxcount=1, auto_unlink=auto_unlink)
+    class _StateLock(_RobustLock):
+        """Internal mutex for the queue's state block: a named mutex, released by Windows if its holder dies."""
 
-    if not _IS_WIN:
+        slot = None
+
+else:
+
+    class _StateLock(NamedSemaphore):
+        """Internal mutex for short critical sections (microseconds) on the queue's state block.
+
+        A process that dies holding it would block the queue for good, so the holder's pid is kept in the state
+        block (slot _HOLDER): a process that waits for more than a second checks whether that process still
+        exists, and takes the lock over if not.
+        """
+
+        slot = None  # the queue's state block (set once it is mapped)
+
+        def __init__(self, name: str | None = None, create: bool = True, *, auto_unlink: bool = True) -> None:
+            super().__init__(name=name, create=create, initial=1, auto_unlink=auto_unlink)
 
         def __enter__(self):
-            self._sem.acquire()
+            try:
+                self._sem.acquire(0)  # (uncontended: at once)
+            except _Busy:
+                self._wait()
+            self.slot[7] = _pid  # _HOLDER
             return self
 
         def __exit__(self, *_):
+            self.slot[7] = 0
             self._sem.release()
+
+        def _wait(self) -> None:
+            unknown = 0
+            while not self.acquire(timeout=1.0):
+                holder = int(self.slot[_HOLDER])
+                if holder and _running(holder):
+                    unknown = 0
+                    continue
+                unknown += 1  # (pid 0: the holder is just releasing, or died before recording itself: wait again)
+                if holder or unknown > 1:
+                    logger.warning(f"process {holder or '?'} died holding a queue's state lock: taking it over")
+                    return
+
+
+def _running(pid: int) -> bool:
+    import psutil
+
+    try:
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
 
 
 class _SharedMemory(shared_memory.SharedMemory):
@@ -690,8 +734,8 @@ class _SharedMemory(shared_memory.SharedMemory):
 #   _WAITERS counts producers registered as waiting for space (see DejaQueue.put).
 #   _MAGIC identifies the layout of this block and of the items in the ring: processes sharing a queue
 #   must run compatible dejaq versions, and a mismatch is reported instead of corrupting data.
-#   Slot 7 is unused.
-_HEAD, _TAIL, _NITEMS, _CLOSED, _CAP, _WAITERS, _MAGIC = range(7)
+#   _HOLDER is the pid of the process holding the state lock (0: none; see _StateLock).
+_HEAD, _TAIL, _NITEMS, _CLOSED, _CAP, _WAITERS, _MAGIC, _HOLDER = range(8)
 _STATE_SLOTS = 8
 _STATE_MAGIC = 0x64656A61710003  # "dejaq" + format version 3 (1: dejaq <= 0.8; 2: development versions)
 
@@ -880,6 +924,7 @@ class NamedByteRing:
         self._state_mem, self._state, self.buf, self.cap = state_mem, state, buf, buffer_bytes
         self._state_name, self._buf_name = st_name, buf_name
         self._put_lock, self._get_lock, self._state_lock, self._items, self._space_gate = others
+        self._state_lock.slot = state
         self._res = _RingResources(shms, others, os.getpid(), self._auto_unlink, self._auto_unlink)
 
     def _open(self, base: str) -> None:
@@ -913,6 +958,7 @@ class NamedByteRing:
         self.cap = int(state[_CAP])  # read cap stored by the creator
         self._state_name, self._buf_name = st_name, buf_name
         self._put_lock, self._get_lock, self._state_lock, self._items, self._space_gate = others
+        self._state_lock.slot = state
         self._res = _RingResources(shms, others, None, False, False)
 
     @property
