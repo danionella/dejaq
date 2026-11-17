@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import warnings
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
 from multiprocessing import util as _mp_util
@@ -172,7 +173,8 @@ def _actor_server(parent: int, pkl: bytes) -> None:
             if _static(obj, "_idle_function"):
                 getattr(obj, obj._idle_function)()
         except Exception as e:  # a request that cannot be unpickled: its caller is unknown
-            logger.error(f"request dropped: {e!r}")
+            if not stop.is_set():  # (else a signal interrupted the wait)
+                logger.error(f"request dropped: {e!r}")
     if obj is not None and hasattr(obj, "close"):
         try:
             obj.close()
@@ -217,11 +219,11 @@ class _Mailbox:
         self._cond = threading.Condition()
         self._reading = False
 
-    def _read(self, timeout: float) -> None:
-        """Store one reply (if one comes within timeout). Caller holds _cond."""
+    def _read(self, timeout: float) -> bool:
+        """Store one reply (if one comes within timeout); False if none came. Caller holds _cond."""
         if self._reading:  # another thread reads: it stores our reply, too
             self._cond.wait(timeout)
-            return
+            return False
         self._reading = True
         self._cond.release()
         try:
@@ -232,11 +234,13 @@ class _Mailbox:
             self._cond.acquire()
             self._reading = False
             self._cond.notify_all()
-        if rep is not None:
-            if rep.call_id in self._dropped:
-                self._dropped.discard(rep.call_id)
-            else:
-                self._got[rep.call_id] = rep
+        if rep is None:
+            return False
+        if rep.call_id in self._dropped:
+            self._dropped.discard(rep.call_id)
+        else:
+            self._got[rep.call_id] = rep
+        return True
 
     def wait(self, cid: int, deadline: Optional[float], alive: Callable[[], bool]) -> _Rep:
         with self._cond:
@@ -254,7 +258,8 @@ class _Mailbox:
     def pump(self) -> None:
         """Store the replies that have arrived (e.g. while a request waits for space: the server may wait for us)."""
         with self._cond:
-            self._read(0)
+            while self._read(0):
+                pass
 
 
 class Future:
@@ -286,6 +291,7 @@ def _stop_servers(procs, req: DejaQueue, timeout: float = 1.0) -> None:
 
 
 _mbox_lock = threading.Lock()
+_mailboxes: "weakref.WeakValueDictionary[tuple, _Mailbox]" = weakref.WeakValueDictionary()  # of this process
 
 
 class _Client:
@@ -301,13 +307,16 @@ class _Client:
 
     @property
     def _mbox(self) -> _Mailbox:
-        """This process's mailbox (created on first use: also in processes a client was pickled to)."""
+        """This process's mailbox for this client (created on first use: also in processes a client was pickled
+        or forked to; shared by all copies of the client in a process)."""
         mb = self.__dict__.get("_mb")
         if mb is None or mb[0] != os.getpid():
+            key = (os.getpid(), self._req._base)
             with _mbox_lock:
-                mb = self.__dict__.get("_mb")
-                if mb is None or mb[0] != os.getpid():
-                    self.__dict__["_mb"] = mb = (os.getpid(), _Mailbox(self._buffer_bytes))
+                box = _mailboxes.get(key)
+                if box is None:
+                    _mailboxes[key] = box = _Mailbox(self._buffer_bytes)
+            self.__dict__["_mb"] = mb = (os.getpid(), box)
         return mb[1]
 
     def _alive(self) -> bool:
@@ -327,7 +336,7 @@ class _Client:
         cid = next(_ids)
         msg = _Req(cid, self._mbox.name if reply else None, kind, name, args, kwargs, deepcopy)
         while True:
-            rem = _POLL if deadline is None else min(_POLL, deadline - time.monotonic())
+            rem = 0.05 if deadline is None else min(0.05, deadline - time.monotonic())
             try:
                 self._req.put(msg, timeout=max(rem, 0))
                 return cid
@@ -415,6 +424,8 @@ class Actor(_Client):
         stops the actor.
       • the remote object may define `_idle_timeout` (seconds) and `_idle_function` (name of a method that is
         called when no request came within that time)
+      • a request the actor cannot unpickle (e.g. an argument of a class defined only in a notebook) is
+        dropped with an error in the actor's log: its call waits until its timeout
 
     Args:
       cls: the class (local and nested classes work too), or a module
