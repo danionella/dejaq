@@ -130,7 +130,9 @@ greeter.close()
 ## dejaq.Parallel
 The following examples show how to use `dejaq.Parallel` to parallelize a function or a class, and how to create job pipelines.
 
-Here we execute a function and map iterable inputs across 10 workers. To enable pipelining, the results of each stage are provided as iterable generator. Use `.run()` (or `.compute()` for backwards compatibility) to get the final result. Results are always ordered.
+Here we execute a function and map iterable inputs across 10 workers. To enable pipelining, the results of each stage are provided as iterable generator. Use `.run()` (or `.compute()`) to get the final result as a list. Results are always ordered.
+
+Workers are started with the `spawn` method, which imports your main script in each worker: in a script (unlike in Jupyter), put the code that starts pipelines under `if __name__ == "__main__":`.
 
 ```python
 from time import sleep
@@ -141,12 +143,14 @@ def slow_function(arg):
     return arg + 5
 
 input_iterable = range(100)
-slow_function = Parallel(n_workers=10)(slow_function)
-stage = slow_function(input_iterable)
+parallel_function = Parallel(n_workers=10)(slow_function)
+stage = parallel_function(input_iterable)
 result = stage.run() # or list(stage)
 # or shorter: 
-result = Parallel(n_workers=10)(slow_function)(input_iterable).compute()
+result = Parallel(n_workers=10)(slow_function)(input_iterable).run()
 ```
+
+If a worker raises an exception, `run()` (or iterating) raises the same exception, with the worker's traceback as its cause; if a worker process dies, it raises `dejaq.parallel.WorkerError`. A stage's workers are stopped when that happens, when you stop iterating early, when the stage is closed (`stage.close()` or a `with` block) or garbage-collected, and at exit.
 
 You can also use `Parallel` as a function decorator:
 ```python
