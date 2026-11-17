@@ -1,11 +1,12 @@
-"""A/B benchmark of DejaQueue: compares two checkouts of dejaq on the same machine.
+"""A/B benchmark of DejaQueue and dejaq.parallel: compares two checkouts of dejaq on the same machine.
 
     python benchmarks/ab_bench.py --rounds 5 base=<path to checkout> head=<path to checkout> [--markdown out.md]
+        [--suite queue|pipeline]
 
 Each round runs every case once per variant, each variant in a fresh process with that checkout on
 PYTHONPATH; the order of the variants alternates between rounds, so slow drifts of a (shared) machine
 affect both alike. The report gives medians and per-round paired ratios (head / base, for times).
-Only the public DejaQueue API is used, so any dejaq version can be compared.
+Only the public API is used, so any dejaq version can be compared.
 """
 
 import argparse
@@ -127,16 +128,118 @@ CASES = [
     ("create+use+drop queue", "ms", False, _lifecycle),
 ]
 
+# ------------------------------------------------------------------------------------------ pipelines
+# Throughput of dejaq.parallel pipelines, measured once the workers have started (spawning them is not timed).
+
+
+def _ident(x):
+    return x
+
+
+def _mb(x):
+    import numpy as np
+
+    return np.ones(2**20 // 8)
+
+
+def _uneven(x):
+    time.sleep(0.004 if x % 4 == 0 else 0.0005)  # every 4th task is slow: in-order output waits for it
+    return x
+
+
+def _consume(it):
+    n = 0
+    for _ in it:
+        n += 1
+    return n
+
+
+def _timed(make, n, warmup=2.0):
+    stages = make()
+    time.sleep(warmup)  # let the workers start (they wait for the first item until iteration starts)
+    t0 = time.perf_counter()
+    got = _consume(stages[-1])
+    t = time.perf_counter() - t0
+    assert got == n, (got, n)
+    for s in stages[::-1]:
+        if hasattr(s, "close"):
+            s.close()
+    return n / t
+
+
+def _stage(fcn, it, n_workers, buffer_bytes=10e6):
+    from dejaq import Parallel
+
+    return Parallel(n_workers=n_workers, buffer_bytes=buffer_bytes)(fcn)(it)
+
+
+def _pipe_1(n_workers, n=20_000):
+    return _timed(lambda: [_stage(_ident, range(n), n_workers)], n)
+
+
+def _pipe_chain(n=20_000):
+    def make():
+        a = _stage(_ident, range(n), 1)
+        return [a, _stage(_ident, a, 1)]
+    return _timed(make, n)
+
+
+def _pipe_mb(n_workers, n=2_000):
+    return _timed(lambda: [_stage(_mb, range(n), n_workers)], n) * 2**20 / 1e9
+
+
+def _pipe_1_4_1_mb(n=2_000):
+    def make():
+        a = _stage(_mb, range(n), 1)
+        b = _stage(_ident, a, 4)
+        return [a, b, _stage(_ident, b, 1)]
+    return _timed(make, n) * 2**20 / 1e9
+
+
+def _pipe_tee(n=20_000):
+    def make():
+        a, b = _stage(_ident, range(n), 1).tee(2)
+        return [a, b, zip(a, b)]
+    return _timed(make, n)
+
+
+def _pipe_zip(n=20_000):
+    from dejaq import parallel
+
+    def make():
+        a, b = _stage(_ident, range(n), 1), _stage(_ident, range(n), 1)
+        return [a, b, parallel.zip(a, b)]
+    return _timed(make, n)
+
+
+def _pipe_uneven(n=2_000):
+    return _timed(lambda: [_stage(_uneven, range(n), 4)], n)
+
+
+PIPELINE_CASES = [
+    ("1 stage, 1 worker, int", "items/s", True, lambda: _pipe_1(1)),
+    ("1 stage, 4 workers, int", "items/s", True, lambda: _pipe_1(4)),
+    ("2 stages 1->1, int", "items/s", True, _pipe_chain),
+    ("1 stage, 1 worker, 1MB results", "GB/s", True, lambda: _pipe_mb(1)),
+    ("1 stage, 4 workers, 1MB results", "GB/s", True, lambda: _pipe_mb(4)),
+    ("3 stages 1->4->1, 1MB", "GB/s", True, _pipe_1_4_1_mb),
+    ("tee(2), int", "items/s", True, _pipe_tee),
+    ("parallel.zip of 2 stages, int", "items/s", True, _pipe_zip),
+    ("4 workers, uneven task times", "items/s", True, _pipe_uneven),
+]
+
+SUITES = {"queue": CASES, "pipeline": PIPELINE_CASES}
+
 # ------------------------------------------------------------------------------------------ reporting
 
 
-def _report(results, variants, rounds):
+def _report(results, variants, rounds, cases):
     base, head = variants[0][0], variants[1][0]
     lines = [
         f"| case | unit | {base} | {head} | change | {head} better in |",
         "|---|---|---:|---:|---:|---:|",
     ]
-    for name, unit, higher_better, _ in CASES:
+    for name, unit, higher_better, _ in cases:
         b, h = results[base].get(name, []), results[head].get(name, [])
         if not b or not h:
             continue
@@ -162,7 +265,7 @@ def _report(results, variants, rounds):
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--worker":
-        for name, unit, _, fn in CASES:
+        for name, unit, _, fn in SUITES[sys.argv[2]]:
             try:
                 print(json.dumps({"case": name, "value": fn()}), flush=True)
             except Exception as e:  # report and continue with the other cases
@@ -173,6 +276,7 @@ def main():
     ap.add_argument("variants", nargs=2, help="label=path (baseline first)")
     ap.add_argument("--rounds", type=int, default=5)
     ap.add_argument("--markdown", help="also write the report to this file")
+    ap.add_argument("--suite", choices=sorted(SUITES), default="queue")
     args = ap.parse_args()
     variants = [tuple(v.split("=", 1)) for v in args.variants]
     results = {label: {} for label, _ in variants}
@@ -181,7 +285,7 @@ def main():
         for label, path in order:
             env = dict(os.environ, PYTHONPATH=os.path.abspath(path))
             proc = subprocess.run(
-                [sys.executable, os.path.abspath(__file__), "--worker"], env=env, capture_output=True, text=True
+                [sys.executable, os.path.abspath(__file__), "--worker", args.suite], env=env, capture_output=True, text=True
             )
             for line in proc.stdout.splitlines():
                 if line.startswith("{"):
@@ -193,7 +297,7 @@ def main():
             if proc.returncode != 0:
                 print(f"round {r + 1} {label}: exit code {proc.returncode}\n{proc.stderr[-3000:]}", file=sys.stderr)
         print(f"round {r + 1}/{args.rounds} done", file=sys.stderr, flush=True)
-    report = _report(results, variants, args.rounds)
+    report = _report(results, variants, args.rounds, SUITES[args.suite])
     print(report)
     if args.markdown:
         with open(args.markdown, "w") as f:
