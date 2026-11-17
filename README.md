@@ -76,6 +76,7 @@ if __name__ == "__main__":
 
 `dejaq.Actor` allows you to run a class instance in a separate process and call its methods or access its attributes remotely, as if it were local. This is useful for isolating heavy computations, stateful services, or legacy code in a separate process, while keeping a simple Pythonic interface.
 
+Actors start their process with the `spawn` method, which imports your main script in it: in a script (unlike in Jupyter), put the code that creates actors under `if __name__ == "__main__":`, as in the DejaQueue example above.
 
 ### Example: Using `Actor` directly
 
@@ -119,7 +120,7 @@ print(greeter.greet())  # "Hello, Alice!"
 greeter.close()
 ```
 
-Use `with Actor(Counter) as counter:` to close it automatically. An actor is also stopped when the `Actor` object is garbage-collected, and when your program exits.
+Use `with Actor(Counter) as counter:` to close it automatically. An actor is also stopped when the `Actor` object is garbage-collected, and when your program exits. On stopping, the remote object's `close()` method is called, if it has one (the process is terminated if it has not ended after 10 s, see `close(timeout=...)`).
 
 ### Features
 

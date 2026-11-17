@@ -64,6 +64,7 @@ def _close_input(it) -> None:
 
 _PARENT_CHECK_INTERVAL = 0.5
 _STOP_GRACE = 0.1  # seconds that close() gives workers to end by themselves after their queue was shut down
+_EXIT_GRACE = 10.0  # ... and workers that finished their input (e.g. a class worker that finalizes a file in __del__)
 
 
 def _exit_with_parent(ppid) -> None:
@@ -74,8 +75,10 @@ def _exit_with_parent(ppid) -> None:
     except psutil.Error:
         os._exit(1)
 
+    parent = os.getppid()  # (forkserver: not the creating process)
+
     def watch():
-        while os.getppid() == ppid and proc.is_running():
+        while os.getppid() == parent and proc.is_running():
             time.sleep(_PARENT_CHECK_INTERVAL)
         os._exit(1)
 
@@ -161,9 +164,14 @@ def _put_stop(q) -> None:
         pass
 
 
-def _stop_processes(procs, lock=None, timeout=1.0, grace=0.0) -> None:
-    """Wait up to `grace` s for the processes to end, terminate those left, and kill those alive after `timeout` s."""
+def _stop_processes(procs, lock=None, timeout=1.0, grace=0.0, done=None) -> None:
+    """Wait up to `grace` s for the processes to end (those with done[i] set: up to _EXIT_GRACE s), terminate those
+    left, and kill those alive after `timeout` s."""
     with lock or threading.Lock():
+        end = time.monotonic() + _EXIT_GRACE
+        for p, d in builtins.zip(procs, done or ()):
+            if d:
+                p.join(max(0.0, end - time.monotonic()))
         for wait, stop in ((grace, "terminate"), (timeout, "kill"), (1.0, None)):
             end = time.monotonic() + wait
             for p in procs:
@@ -280,7 +288,7 @@ class lazymap:
         # stops the workers at close(), garbage collection (also if starting them fails part-way) or interpreter
         # exit, before Python waits for its child processes (which may be blocked on a full queue)
         self._finalizer = _mp_util.Finalize(self, _stop_processes, args=(procs, self._procs_lock),
-                                            kwargs={"grace": _STOP_GRACE}, exitpriority=10)
+                                            kwargs={"grace": _STOP_GRACE, "done": self._done}, exitpriority=10)
         for pid in range(n_workers):
             p = ctx.Process(target=self._worker_fcn, args=(os.getpid(), pid, *worker_args))
             p.start()
@@ -497,7 +505,7 @@ class lazymap:
 
     def __getstate__(self):
         state = dict(self.__dict__)
-        for k in ("_procs", "_finalizer", "_procs_lock", "_reported", "_done", "_tee"):
+        for k in ("_procs", "_finalizer", "_procs_lock", "_reported", "_done", "_tee", "_it"):
             state.pop(k, None)
         state["_owner"] = False
         return state
@@ -551,6 +559,8 @@ class lazymap:
             fcn (callable): function that is being mapped. Signature: fcn(item, **kwargs)
             n_workers (int): number of workers (default: 1)
             buffer_bytes (int): size of the queue buffer (default: 10e6 bytes)
+            ordered (bool): results in input order (default); False: as soon as they are ready
+            zero_copy (bool): with n_workers=1, fcn gets each item as a view of the input queue (see lazymap)
             **kwargs: optional, being passed to fcn
 
         Returns:
@@ -709,6 +719,7 @@ class _Tee:
         self.finalizer = _mp_util.Finalize(self, _stop_processes, args=([self.proc],), exitpriority=10)
 
     def branch_closed(self, i):
+        self.queues[i].shutdown()  # the tee process drops this branch (also if it was not closed, but collected)
         with self.lock:
             self.open_branches.discard(i)
             last = not self.open_branches
@@ -758,13 +769,17 @@ def tee(lzy, n, buffer_bytes=None):
     return [_TeeBranch(t, i) for i in range(n)]
 
 
-def zip(*lazys):
+def zip(*lazys, buffer_bytes=None):
     """Zips several lazymap iterables into one lazymap of tuples, in a process of its own: the items do not pass
     through the calling process, and the result can be fed into further stages (unlike a builtin zip object,
     which holds generators that cannot be passed to worker processes). To consume several pipelines in the
     calling process, the builtin zip is enough. Each item is copied once (see the README for measurements).
 
     Args:
-        *lazys (lazymap): the lazymap iterables to zip
+        *lazys (lazymap): the lazymap iterables to zip (each one once: to use a stage twice, tee() it)
+        buffer_bytes (int): size of the zipped stage's queue (default: the sum of the inputs' buffers)
     """
-    return lazymap(None, _Zipped(lazys), n_workers=1)
+    if len({id(x) for x in lazys}) < len(lazys):
+        raise ValueError("zip() got the same stage twice: use stage.tee() to read it twice")
+    buffer_bytes = buffer_bytes or sum(getattr(x, "_buffer_bytes", 10e6) for x in lazys)
+    return lazymap(None, _Zipped(lazys), n_workers=1, buffer_bytes=buffer_bytes)

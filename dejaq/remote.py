@@ -160,14 +160,14 @@ def _actor_server(parent: int, pkl: bytes) -> None:
         # so the reply is sent before that memory is reused (a result that views an argument is then safe).
         if msg.kind == "shutdown":
             return False
-        bases = [] if msg.deepcopy else [a.base for a in (*msg.args, *msg.kwargs.values())
-                                         if isinstance(a, np.ndarray) and a.base is not None]
+        bases = [] if msg.deepcopy else [x for a in (*msg.args, *msg.kwargs.values()) if isinstance(a, np.ndarray)
+                                         for x in (a, a.base) if x is not None]
         refs = [sys.getrefcount(b) for b in bases]
         try:
             reply(msg.call_id, msg.mailbox, True, handle(msg.kind, msg.name, msg.args, msg.kwargs, msg.deepcopy))
         except BaseException as e:
             reply(msg.call_id, msg.mailbox, False, _WorkerException(e, RemoteError))
-        if any(sys.getrefcount(b) > n for b, n in zip(bases, refs)):  # (views of an argument count, too)
+        if [sys.getrefcount(b) for b in bases] != refs:  # (views of an argument count, too)
             warnings.warn(f"{msg.name!r} kept a reference to an argument passed with deepcopy=False: its "
                           "memory is reused once the call returns (copy what you need to keep)", RuntimeWarning)
         return True
@@ -177,8 +177,11 @@ def _actor_server(parent: int, pkl: bytes) -> None:
             if not req.get(timeout=_own(obj, "_idle_timeout"), callback=dispatch):
                 break
         except Empty:
-            if _own(obj, "_idle_function"):
-                getattr(obj, obj._idle_function)()
+            try:
+                if _own(obj, "_idle_function"):
+                    getattr(obj, obj._idle_function)()
+            except Exception as e:
+                logger.error(f"_idle_function raised {e!r}")
         except Exception as e:  # a request that cannot be unpickled: its caller is unknown
             if not stop.is_set():  # (else a signal interrupted the wait)
                 logger.error(f"request dropped: {e!r}")
@@ -216,7 +219,7 @@ def _func_worker(parent: int, fn_pkl: bytes, req_name: str) -> None:
 
 
 class _Mailbox:
-    """A client process's replies, matched to calls by id. Thread-safe: the thread that holds _lock reads the
+    """A client process's replies, matched to calls by id. Thread-safe: one thread at a time reads the
     queue; replies for other calls go to _got, where their threads find them."""
 
     def __init__(self, buffer_bytes: int) -> None:
@@ -224,10 +227,11 @@ class _Mailbox:
         self.name = self.q._base
         self._got: dict = {}
         self._dropped: set = set()  # calls given up on (timeout): their replies are discarded
-        self._lock = threading.Lock()
+        self._cv = threading.Condition(threading.Lock())
+        self._reading = False  # one thread reads the queue at a time; the others wait on _cv
 
     def _read(self, timeout: float) -> bool:
-        """Store the next reply (False if none came within timeout). Caller holds _lock."""
+        """Store the next reply (False if none came within timeout). Caller is the reading thread."""
         try:
             rep = self.q.get(timeout=timeout)
         except Empty:
@@ -238,33 +242,46 @@ class _Mailbox:
             self._got[rep.call_id] = rep
         return True
 
-    def wait(self, cid: int, deadline: Optional[float], alive: Callable[[], bool]) -> _Rep:
+    def wait(self, cid: int, deadline: Optional[float], alive: Callable[[], bool], drop: bool = True) -> _Rep:
         while True:
             rep = self._got.pop(cid, None)
             if rep is not None:
                 return rep
             rem = _POLL if deadline is None else min(_POLL, deadline - time.monotonic())
             if rem <= 0:
-                self._dropped.add(cid)
+                if drop:  # (a Future can be asked again)
+                    self._dropped.add(cid)
                 raise TimeoutError(f"no reply within the timeout (call {cid})")
             t0 = time.monotonic()
-            if self._lock.acquire(timeout=rem):  # (else another thread reads: it stores our reply, too)
+            with self._cv:
+                reader = not self._reading and cid not in self._got
+                if reader:
+                    self._reading = True
+                elif cid not in self._got:
+                    self._cv.wait(rem)  # another thread reads: it stores our reply, too, and wakes us
+            if reader:
                 try:
-                    if cid not in self._got:
-                        self._read(rem)
+                    self._read(rem)
                 finally:
-                    self._lock.release()
+                    with self._cv:
+                        self._reading = False
+                        self._cv.notify_all()
             if cid not in self._got and time.monotonic() - t0 >= _POLL and not alive():
                 raise RemoteError("the remote process has exited (it died or was closed)")
 
     def pump(self) -> None:
         """Store the replies that have arrived (e.g. while a request waits for space: the server may wait for us)."""
-        if self._lock.acquire(blocking=False):
-            try:
-                while self._read(0):
-                    pass
-            finally:
-                self._lock.release()
+        with self._cv:
+            if self._reading:
+                return
+            self._reading = True
+        try:
+            while self._read(0):
+                pass
+        finally:
+            with self._cv:
+                self._reading = False
+                self._cv.notify_all()
 
 
 class Future:
@@ -276,8 +293,15 @@ class Future:
     def result(self, timeout: Optional[float] = None):
         if self._rep is None:
             deadline = None if timeout is None else time.monotonic() + timeout
-            self._rep = self._client._mbox.wait(self._id, deadline, self._client._alive)
+            self._rep = self._client._mbox.wait(self._id, deadline, self._client._alive, drop=False)
         return _unwrap(self._rep)
+
+    def __del__(self):
+        if self._rep is None:  # never read: discard its reply
+            box = self._client.__dict__.get("_mb", (None, None))[1]
+            if box is not None:
+                box._dropped.add(self._id)
+                box._got.pop(self._id, None)
 
 
 def _unwrap(rep: _Rep):
@@ -286,13 +310,17 @@ def _unwrap(rep: _Rep):
     rep.payload.reraise()
 
 
-def _stop_servers(procs, req: DejaQueue, timeout: float = 1.0) -> None:
+def _stop_servers(procs, req: DejaQueue, timeout: float = 10.0) -> None:
+    """Ask the servers to end (an actor's object is closed) and wait up to `timeout` s; terminate them if the
+    request cannot be sent (e.g. the request queue is full) or they do not end in time."""
     for _ in procs:
         try:
             req.put(_Req(-1, None, "shutdown", "", (), {}), timeout=0)
         except Exception:
-            break  # (stopped below anyway)
+            timeout = 0.0
+            break
     _stop_processes(procs, grace=timeout)
+    req.close()
 
 
 _mbox_lock = threading.Lock()
@@ -309,6 +337,7 @@ class _Client:
         self._servers = [(p.pid, psutil.Process(p.pid).create_time()) for p in procs]
         self._closed = False
         self._finalizer = _mp_util.Finalize(self, _stop_servers, args=(procs, req), exitpriority=10)
+        req._finalizer.atexit = False  # (closed by _stop_servers: at exit, only after the shutdown requests)
 
     @property
     def _mbox(self) -> _Mailbox:
@@ -329,7 +358,7 @@ class _Client:
         for pid, started in self._servers:
             try:
                 p = psutil.Process(pid)
-                if p.create_time() != started or p.status() == psutil.STATUS_ZOMBIE:
+                if abs(p.create_time() - started) > 5 or p.status() == psutil.STATUS_ZOMBIE:
                     return False
             except psutil.Error:
                 return False
@@ -358,8 +387,9 @@ class _Client:
         cid = self._request(kind, name, args, kwargs or {}, deepcopy=deepcopy, deadline=deadline)
         return _unwrap(self._mbox.wait(cid, deadline, self._alive))
 
-    def close(self, timeout: float = 1.0) -> None:
-        """Stop the server process(es): ask them to end, and terminate them after `timeout` seconds."""
+    def close(self, timeout: float = 10.0) -> None:
+        """Stop the server process(es): ask them to end (an actor's object is closed), and terminate them after
+        `timeout` seconds."""
         if self.__dict__.get("_finalizer") is not None and not self._closed:
             self._closed = True
             self._finalizer.cancel()
@@ -415,7 +445,7 @@ class _RemoteMethod:
         return f"<remote method {self._name} of {self._actor!r}>"
 
 
-_REMOTE_PRIVATE = ("__call__", "_idle_function", "_idle_timeout")  # private names of the remote object
+_REMOTE_PRIVATE = ("__call__", "_idle_function", "_idle_timeout", "_subscriptions", "_start_loop", "_stop_loop")  # private names of the remote object
 
 
 class Actor(_Client):
@@ -502,7 +532,7 @@ class RemoteFunc(_Client):
       start_method: multiprocessing start method (default 'spawn')
     """
 
-    def __init__(self, fn: Callable, workers: int = 1, buffer_bytes: int = 8_000_000, start_method: str = "spawn"):
+    def __init__(self, fn: Callable, workers: int = 1, buffer_bytes: int = 10_000_000, start_method: str = "spawn"):
         req = DejaQueue(buffer_bytes)
         ctx, pkl = mp.get_context(start_method), cloudpickle.dumps(fn)
         procs = [ctx.Process(target=_func_worker, args=(os.getpid(), pkl, req._base)) for _ in range(int(workers))]

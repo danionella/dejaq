@@ -546,7 +546,7 @@ class NamedSemaphore:
                     return False
             else: # polling hack for MACOS, which doesn't support timeout
                 deadline = time.monotonic() + timeout
-                sleep_s = 0.0005
+                sleep_s = 0.00002
                 while True:
                     try: 
                         self._sem.acquire(timeout=0)  # trywait
@@ -684,8 +684,19 @@ else:
                     continue
                 unknown += 1  # (pid 0: the holder is just releasing, or died before recording itself: wait again)
                 if holder or unknown > 1:
-                    logger.warning(f"process {holder or '?'} died holding a queue's state lock: taking it over")
-                    return
+                    with _takeover:  # (threads of this process: one at a time)
+                        if self.acquire(timeout=0):  # released meanwhile, e.g. after another takeover
+                            return
+                        if int(self.slot[_HOLDER]) == holder:  # still the dead holder: claim the lock
+                            self.slot[_HOLDER] = _pid
+                            time.sleep(0.05)  # (if several processes claim it, the last one wins)
+                            if int(self.slot[_HOLDER]) == _pid:
+                                logger.warning(f"process {holder or '?'} died holding a queue's state lock: taking it over")
+                                return
+                    unknown = 0
+
+
+_takeover = threading.Lock()
 
 
 def _running(pid: int) -> bool:
@@ -1093,7 +1104,7 @@ class DejaQueue(NamedByteRing):
     """Pickleable queue for arbitrary Python objects. Uses a ring buffer of shared memory and named semaphores.
 
     Args:
-        buffer_bytes (int): Size of the ring buffer in bytes. Default 10 MiB.
+        buffer_bytes (int): Size of the ring buffer in bytes. Default 10_000_000 (10 MB).
         name (str | None): Base name for shared memory and semaphores. If None (default), a random unique name is generated.
         create (bool): If True (default), create a new queue; raises FileExistsError if a queue with this name
             exists. If False, open an existing queue.
@@ -1316,8 +1327,8 @@ class DejaQueue(NamedByteRing):
             for i, n in enumerate(lens):
                 s = cursor % cap
                 e = s + n
-                if callback is None and i > 0:
-                    segs.append(_private(cursor, n))  # out-of-band buffers (numpy data): private, writable copies
+                if i > 0 and (callback is None or e > cap):  # out-of-band buffers (numpy data), and wrapped ones
+                    segs.append(_private(cursor, n))  # with a callback: private, writable copies (as views are)
                 elif e <= cap:
                     segs.append(buf[s:e])
                 else:

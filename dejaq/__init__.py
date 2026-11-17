@@ -11,4 +11,5 @@ from .queues import DejaQueue, Empty, Full, ShutDown
 from .parallel import Parallel
 from .remote import Actor, RemoteFunc, ActorDecorator
 
-__all__ = ["DejaQueue", "Empty", "Full", "ShutDown", "Parallel", "Actor", "remote", "queues"]
+__all__ = ["DejaQueue", "Empty", "Full", "ShutDown", "Parallel", "Actor", "RemoteFunc", "ActorDecorator",
+           "queues", "parallel", "remote"]
