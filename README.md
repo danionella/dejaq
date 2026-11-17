@@ -211,7 +211,7 @@ result = Consumer(1000)(Processor(10.0)(Producer(0.5)(input_iterable))).run()
 For large items such as camera frames (several MB each, at kHz rates), a few settings matter:
 - `buffer_bytes`: each stage's output queue. Make it at least about 10 times the item size, so that the stages can absorb each other's hiccups (a larger buffer does not make the steady state faster).
 - `zero_copy=True` (stages with `n_workers=1`, e.g. a writer): the function receives each item from the input stage without a copy, its numpy arrays viewing the queue's memory. They are valid only during the call: copy what you need to keep (e.g. a previous frame), but returning them is fine. Likewise, `for frame in stage.iter(zero_copy=True)` in the main process, where each item is valid until the next one is requested.
-- Each hop between processes copies an item once into a queue and once out of it, so fewer stages mean less copying; `tee` and `zip` copy each item only once.
+- Each hop between processes copies an item once into a queue and once out of it, so fewer stages mean less copying; `tee` and `zip` copy each item only once. (Measured with 4 MB frames on CI runners: `zip` is 1.2-1.5x faster than with two copies on Windows and macOS, but 0.7x on Linux, for reasons not yet understood.)
 
 A stage's results can be split into several branches with `stage.tee(n)`, and stages can be combined with `dejaq.parallel.zip(stage_a, stage_b)` (which yields tuples). Like the stages themselves, both run in processes of their own, so the data does not pass through your main process. As with `itertools.tee`, consume the branches side by side: a branch that falls behind by more than its buffer holds makes the others wait.
 

@@ -762,7 +762,7 @@ def zip(*lazys):
     """Zips several lazymap iterables into one lazymap of tuples, in a process of its own: the items do not pass
     through the calling process, and the result can be fed into further stages (unlike a builtin zip object,
     which holds generators that cannot be passed to worker processes). To consume several pipelines in the
-    calling process, the builtin zip is enough.
+    calling process, the builtin zip is enough. Each item is copied once (see the README for measurements).
 
     Args:
         *lazys (lazymap): the lazymap iterables to zip
