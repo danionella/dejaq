@@ -1,6 +1,6 @@
 """Synchronization, naming and lifecycle tests for DejaQueue/NamedSemaphore.
 
-Covers: unique and collision-safe names, get() timeouts with competing consumers, the waiting-producer
+Covers: names that are never shared, get() timeouts with competing consumers, the waiting-producer
 protocol (no unbounded semaphore growth, no lost wake-ups), purge() racing with consumers, 64-bit item
 headers, and the state-layout version check.
 """
@@ -55,26 +55,16 @@ def test_random_queue_names_are_unique():
     assert len({q._base for q in qs}) == len(qs)
 
 
-def test_semaphore_name_collision_is_retried(monkeypatch):
-    taken = NamedSemaphore()
-    fresh = queues._safe_base("ns")
-    names = iter([taken.name.lstrip("/"), fresh])
-    monkeypatch.setattr(queues, "_safe_base", lambda prefix="ns": next(names))
-    s = NamedSemaphore()
-    assert s.name != taken.name
-    s.release()
-    assert not taken.acquire(timeout=0)  # the two are independent
-
-
-def test_queue_name_collision_is_retried(monkeypatch):
-    taken = DejaQueue(4096)
-    names = iter([taken._base, queues._safe_base("nq")])
-    monkeypatch.setattr(queues, "_safe_base", lambda prefix="nq": next(names))
-    q = DejaQueue(4096)
-    assert q._base != taken._base
-    q.put("new")
-    taken.put("taken")
-    assert q.get(timeout=1) == "new" and taken.get(timeout=1) == "taken"
+def test_generated_name_collision_raises_and_never_shares(monkeypatch):
+    """Generated names are random (pid + 40 bits): a collision is not retried, it fails cleanly."""
+    taken_sem, taken_q = NamedSemaphore(), DejaQueue(4096)
+    monkeypatch.setattr(queues, "_safe_base", lambda prefix: taken_sem.name.lstrip("/") if prefix == "ns" else taken_q._base)
+    with pytest.raises(FileExistsError):
+        NamedSemaphore()
+    with pytest.raises(FileExistsError):
+        DejaQueue(4096)
+    taken_q.put("taken")
+    assert taken_q.get(timeout=1) == "taken"  # unaffected
 
 
 def test_explicit_semaphore_name_that_exists_raises():
