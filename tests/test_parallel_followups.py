@@ -251,23 +251,19 @@ def test_workers_are_stopped_if_starting_them_fails(monkeypatch):
     assert len(_started) == 1 and _all_gone(_started)
 
 
-# ---------- range inputs read by stride, ordered=False ----------
+# ---------- ordered=False ----------
 
 def slow_every_4th(x):
     time.sleep(0.2 if x % 4 == 0 else 0.0)
     return x
 
 
+@pytest.mark.parametrize("ordered", [True, False])
 @pytest.mark.parametrize("n_workers", [2, 3, 4])
 @pytest.mark.parametrize("n_items", [0, 1, 5, 12])
-def test_range_input_split_between_workers(n_workers, n_items):
-    stage = Parallel(n_workers=n_workers)(add5)(range(n_items))
-    assert stage._own_input is None  # each worker reads its share: no extra input stage
-    assert stage.run(progress=False) == [i + 5 for i in range(n_items)]
-
-
-def test_range_input_with_a_step():
-    assert Parallel(n_workers=3)(ident)(range(3, 40, 4)).run(progress=False) == list(range(3, 40, 4))
+def test_item_counts(n_workers, n_items, ordered):
+    out = Parallel(n_workers=n_workers, ordered=ordered)(add5)(range(n_items)).run(progress=False)
+    assert (out if ordered else sorted(out)) == [i + 5 for i in range(n_items)]
 
 
 @pytest.mark.parametrize("source", ["range", "list", "stage"])
@@ -278,7 +274,7 @@ def test_unordered_returns_every_result_once(source):
 
 
 def test_unordered_slow_items_do_not_hold_up_the_others():
-    out = Parallel(n_workers=4, ordered=False)(slow_every_4th)(range(8)).run(progress=False)
+    out = Parallel(n_workers=4, ordered=False)(slow_every_4th)(list(range(8))).run(progress=False)
     assert sorted(out) == list(range(8))
     assert out.index(0) > out.index(1)  # item 0 is slow: later items overtake it
 

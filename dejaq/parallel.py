@@ -215,10 +215,7 @@ class lazymap:
             raise ValueError(f"start_type must be 'lazy', 'eager' or 'manual', not {start_type!r}")
         self._own_input = None
         self._closed = False
-        # With several workers, each one reads its own share of a range; any other iterable that is not a stage
-        # is read by an extra stage of one worker, so that it is read only once (e.g. a file reader).
-        stride = n_workers > 1 and isinstance(it, range)
-        if n_workers > 1 and not isinstance(it, lazymap) and not stride:
+        if n_workers > 1 and not isinstance(it, lazymap):
             # one process reads the input, so that a stateful iterable (e.g. a file reader) is read only once
             it = self._own_input = lazymap(None, it, n_workers=1, buffer_bytes=buffer_bytes)
         self._it = it
@@ -242,9 +239,8 @@ class lazymap:
         pkl = cloudpickle.dumps((fcn, self._it, kwargs))
         self._ordered = ordered
         self._finished = finished = None if ordered else NamedSemaphore(initial=n_workers - 1)
-        read_in_turn = ordered and not stride  # (unordered workers of a stage simply share its queue)
-        worker_args = (pkl, self._out_queue, n_workers, self._in_sem, self._out_sem, self._done, read_in_turn,
-                       ordered, stride, finished)
+        # (unordered workers simply share their input queue: whoever is free takes the next item)
+        worker_args = (pkl, self._out_queue, n_workers, self._in_sem, self._out_sem, self._done, ordered, finished)
         self._procs = procs = []
         self._owner = True  # only the creating process stops the workers (not pickled copies in other workers)
         self._closing = False
@@ -305,11 +301,11 @@ class lazymap:
             raise
 
     @staticmethod
-    def _worker_fcn(pid, pkl, _out_queue, _n_workers, in_sem, out_sem, done, read_in_turn, write_in_turn, stride,
-                    finished):
-        # Workers take turns (round-robin, passing semaphore tokens) to read the input (unless each one reads its
-        # own share of it, stride) and to put results (unless ordered=False). A failure is passed on as a
-        # _WorkerException item, in this worker's turn, after which the worker stops.
+    def _worker_fcn(pid, pkl, _out_queue, _n_workers, in_sem, out_sem, done, ordered, finished):
+        # Unless ordered=False, workers take turns (round-robin, passing semaphore tokens) to read the input and
+        # to put results. A failure is passed on as a _WorkerException item, in this worker's turn, after which
+        # the worker stops.
+        read_in_turn = write_in_turn = ordered
         _exit_with_parent()
         failure = None
         try:
@@ -320,7 +316,7 @@ class lazymap:
         in_sem[pid].acquire()  # the start signal
         if failure is None:
             try:
-                iterator = iter(it[pid::_n_workers] if stride else it)
+                iterator = iter(it)
             except BaseException as e:
                 failure = _WorkerException(e)
         if read_in_turn:
@@ -620,18 +616,33 @@ class Ticker(Startable):
 def _tee_worker(pkl, queues, done):
     _exit_with_parent()
     live = list(queues)
+
+    def forward(item):
+        # Runs inside get(): the item's arrays still view the upstream queue's memory, so each put copies them
+        # once, straight into a branch's queue (no private copy in between). Errors and _WorkerDied items are
+        # passed on as they are: each branch raises them.
+        if type(item) is _Stop:
+            return False
+        for q in list(live):
+            try:
+                q.put(item)
+            except ShutDown:  # the branch was closed
+                live.remove(q)
+            except Exception as e:  # e.g. too large for the branch's queue
+                q.put(_WorkerException(e))
+        return True
+
     try:
         upstream = cloudpickle.loads(pkl)
-        for item in upstream:
-            for q in list(live):
-                try:
-                    q.put(item)
-                except ShutDown:  # the branch was closed
-                    live.remove(q)
-                except Exception as e:  # e.g. too large for the branch's queue
-                    q.put(_WorkerException(e))
-            if not live:
-                break
+        if upstream._start_type == "lazy":  # (as iterating it would)
+            upstream._start()
+        src = upstream._out_queue
+        while live:
+            try:
+                if not src.get(callback=forward):
+                    break
+            except ShutDown:
+                raise RuntimeError("the stage feeding this tee was closed") from None
     except BaseException as e:  # the upstream stage failed: every branch raises
         failure = _WorkerException(e)
         for q in live:
