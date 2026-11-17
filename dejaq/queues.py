@@ -213,52 +213,103 @@ def _attach_shm(name: str, cls=shared_memory.SharedMemory) -> shared_memory.Shar
 # versions deadlock. So finalizers run by the garbage collector only queue their tracker calls, which are
 # sent with the next call from regular code (or at exit); and dejaq's own tracker calls pause the garbage
 # collector, so that it cannot run finalizers (of dejaq or anything else) inside them.
-_gc_running = False
+#
+# All calls go through one queue, sent in order by one thread at a time (a later "unregister" must never
+# overtake its "register"). Calls queued while this thread runs the garbage collector, or while it is
+# sending the queue itself (e.g. from a finalizer run by refcounting), are sent by the sending loop.
 _tracker_backlog: "collections.deque" = collections.deque()
+_tracker_send_lock = threading.Lock()
+_tracker_local = threading.local()  # .in_gc: this thread runs the garbage collector; .sending: see above
 
 
 def _note_gc(phase: str, info: dict) -> None:
-    global _gc_running
-    _gc_running = phase == "start"
+    _tracker_local.in_gc = phase == "start"  # gc callbacks run in the collecting thread
 
 
 gc.callbacks.append(_note_gc)
 
+# Pausing the garbage collector is process-wide; nested and concurrent pauses (several threads creating
+# queues) are counted, and only the end of the last one restores the previous state.
+_gc_pause_lock = threading.Lock()
+_gc_pause_depth = 0
+_gc_pause_restore = False
+
 
 @contextlib.contextmanager
 def _gc_paused():
-    enabled = gc.isenabled()
-    gc.disable()
+    global _gc_pause_depth, _gc_pause_restore
+    with _gc_pause_lock:
+        if _gc_pause_depth == 0:
+            _gc_pause_restore = gc.isenabled()
+            gc.disable()
+        _gc_pause_depth += 1
     try:
         yield
     finally:
-        if enabled:
-            gc.enable()
+        with _gc_pause_lock:
+            _gc_pause_depth -= 1
+            if _gc_pause_depth == 0 and _gc_pause_restore:
+                gc.enable()
 
 
 def _tracker(action: str, name: str, rtype: str) -> None:
     """Register/unregister a POSIX resource with this process's multiprocessing resource tracker, which
     removes still-registered resources when the process tree's main process ends (also after a crash)."""
     _tracker_backlog.append((action, name, rtype))
-    if not _gc_running:
+    if not getattr(_tracker_local, "in_gc", False) and not getattr(_tracker_local, "sending", False):
         _flush_tracker_backlog()
 
 
 def _flush_tracker_backlog() -> None:
-    if not _tracker_backlog:
+    if not _tracker_backlog or getattr(_tracker_local, "sending", False):  # (the sending loop sends it)
         return
     from multiprocessing import resource_tracker
 
-    with _gc_paused():
-        while _tracker_backlog:
-            action, name, rtype = _tracker_backlog.popleft()
-            try:
-                getattr(resource_tracker, action)(name, rtype)
-            except Exception:  # crash cleanup is best effort
-                pass
+    with _tracker_send_lock, _gc_paused():
+        _tracker_local.sending = True
+        try:
+            while True:
+                try:
+                    action, name, rtype = _tracker_backlog.popleft()
+                except IndexError:
+                    break
+                try:
+                    getattr(resource_tracker, action)(name, rtype)
+                except Exception:  # crash cleanup is best effort
+                    pass
+        finally:
+            _tracker_local.sending = False
 
 
 atexit.register(_flush_tracker_backlog)  # calls queued by the last garbage collections
+if not _IS_WIN:
+    # multiprocessing workers end with os._exit, which skips atexit; multiprocessing's own exit handlers run
+    # its "finalizers" instead. A worker clears the finalizers it inherited or registered on import before
+    # it runs, and then calls the after-fork hooks: register (again) there.
+    from multiprocessing import util as _mp_util
+
+    class _Anchor:  # register_after_fork needs an object to refer to
+        pass
+
+    _mp_anchor = _Anchor()
+
+    def _flush_at_worker_exit(_anchor=None) -> None:
+        _mp_util.Finalize(None, _flush_tracker_backlog, exitpriority=0)
+
+    _flush_at_worker_exit()
+    _mp_util.register_after_fork(_mp_anchor, _flush_at_worker_exit)
+
+
+def _reset_tracker_state_in_child() -> None:
+    """After fork: the parent sends its own queued calls, and locks held by its other threads stay held."""
+    global _tracker_send_lock, _gc_pause_lock, _gc_pause_depth
+    _tracker_backlog.clear()
+    _tracker_send_lock = threading.Lock()
+    _gc_pause_lock = threading.Lock()
+    if _gc_pause_depth:  # another thread of the parent was inside a pause: it does not exist here
+        _gc_pause_depth = 0
+        if _gc_pause_restore:
+            gc.enable()
 
 
 # POSIX lock files live in a fixed directory (not $TMPDIR, which may differ between processes): every
@@ -267,6 +318,9 @@ _LOCK_DIR = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
 # glibc's shm_unlink(name) removes /dev/shm/<name>, so on Linux the resource tracker can clean up lock
 # files registered as shared memory after a crash. Elsewhere, files of crashed queues remain (empty).
 _LOCK_FILES_TRACKABLE = sys.platform.startswith("linux") and _LOCK_DIR == "/dev/shm"
+
+
+_FD_NOT_REOPENED = -2  # a lock whose file could not be reopened in a forked child
 
 
 class _RobustLock:
@@ -330,6 +384,11 @@ class _RobustLock:
             _flock(self._fd[0], _LOCK_EX)
         except BaseException:
             self._tlock.release()
+            if self._fd[0] == _FD_NOT_REOPENED:
+                raise RuntimeError(
+                    "This queue was unlinked before this process was forked, and its lock cannot be reopened "
+                    "here; create or attach queues after forking, or unlink them later."
+                ) from None
             raise
 
     def release(self) -> None:
@@ -390,13 +449,17 @@ class _RobustLock:
         # The child got copies of the parent's file descriptors, which share the parent's open file
         # descriptions and hence its flock locks. Give every object its own again.
         for lk in list(cls._posix_instances):
-            try:
-                old = lk._fd[0]
-                if old >= 0:
-                    lk._fd[0] = os.open(lk.path, os.O_RDWR)
-                    os.close(old)
-            except OSError:
-                pass
+            old = lk._fd[0]
+            if old >= 0:
+                try:
+                    new_fd = os.open(lk.path, os.O_RDWR)
+                except OSError:  # the lock file was deleted (unlink()): reopen the open file itself
+                    try:
+                        new_fd = os.open(f"/proc/self/fd/{old}", os.O_RDWR)  # Linux
+                    except OSError:
+                        new_fd = _FD_NOT_REOPENED  # never share the parent's lock: acquire() raises
+                lk._fd[0] = new_fd
+                os.close(old)
             lk._tlock = threading.Lock()  # may have been held by another thread of the parent
 
 
@@ -405,6 +468,7 @@ if not _IS_WIN:
 
     _flock, _LOCK_EX, _LOCK_UN = fcntl.flock, fcntl.LOCK_EX, fcntl.LOCK_UN
     os.register_at_fork(after_in_child=_RobustLock._after_fork_in_child)
+    os.register_at_fork(after_in_child=_reset_tracker_state_in_child)
 
 
 class NamedSemaphore:
@@ -726,18 +790,25 @@ class _RingResources:
         if self.unlinked:
             return
         self.unlinked = True
-        for shm in self.shms:
-            _unlink_shm(shm, self.shm_tracked)
-        for obj in self.others:
+        first_error = None
+        for obj in self.shms + self.others:  # remove everything that can be removed
             try:
-                obj.unlink()
-            except Exception:
-                pass
+                if obj in self.shms:
+                    _unlink_shm(obj, self.shm_tracked)
+                else:
+                    obj.unlink()
+            except Exception as e:
+                first_error = first_error or e
+        if first_error is not None:
+            raise first_error
 
     def finalize(self) -> None:
         self.close()
         if self.auto_unlink and self.owner_pid == os.getpid():  # not in a forked child, nor an attacher
-            self.unlink()
+            try:
+                self.unlink()
+            except Exception as e:  # no caller to report to
+                logger.warning(f"could not remove all of a queue's shared memory and semaphores: {e!r}")
 
 
 class Empty(_stdqueue.Empty, TimeoutError):
@@ -753,6 +824,10 @@ class ShutDown(getattr(_stdqueue, "ShutDown", Exception)):
     (a queue.ShutDown on Python >= 3.13)."""
 
 
+def _is_number(x) -> bool:
+    return isinstance(x, numbers.Real) and not isinstance(x, bool)
+
+
 def _wait_time(block, timeout, method: str):
     """Timeout of get()/put() from queue.Queue-style (block, timeout) arguments (None: wait indefinitely).
 
@@ -761,7 +836,7 @@ def _wait_time(block, timeout, method: str):
     """
     if block is None:
         return timeout
-    if isinstance(block, numbers.Real) and not isinstance(block, bool):
+    if _is_number(block):
         if timeout is not None:
             raise TypeError(f"DejaQueue.{method}(): block must be True or False, got {block!r}")
         warnings.warn(
@@ -858,8 +933,12 @@ class NamedByteRing:
     def _create(self, base: str, buffer_bytes: int) -> None:
         st_name, buf_name, lock_names, sem_names = self._names(base)
         shms, others = [], []  # removed again if any step fails
+        shm_tracked = True  # SharedMemory(create=True) registers with the resource tracker
         try:
-            with _gc_paused():  # creating shared memory registers it with the resource tracker
+            with _gc_paused():
+                # SharedMemory registers directly: send queued calls first, e.g. an "unregister" of the
+                # same name by a finalized queue, which must not follow (and cancel) this registration
+                _flush_tracker_backlog()
                 state_mem = _SharedMemory(create=True, name=st_name, size=8 * _STATE_SLOTS)
                 shms.append(state_mem)
                 buf = shared_memory.SharedMemory(name=buf_name, create=True, size=buffer_bytes)
@@ -867,6 +946,7 @@ class NamedByteRing:
             if not self._auto_unlink:
                 for shm in shms:
                     _untrack_shm(shm)
+                shm_tracked = False
             _view = np.frombuffer(buf.buf, dtype="B", count=buffer_bytes)
             _view[:] = 0
             del _view
@@ -877,9 +957,12 @@ class NamedByteRing:
             state = state_mem.cast("q")
             state[0:_STATE_SLOTS] = array.array("q", [0, 0, 0, 0, buffer_bytes, 0, _STATE_MAGIC, 0])
         except BaseException:
-            res = _RingResources(shms, others, os.getpid(), True, self._auto_unlink)
+            res = _RingResources(shms, others, os.getpid(), True, shm_tracked)
             res.close()
-            res.unlink()
+            try:
+                res.unlink()
+            except Exception:
+                pass  # report the original error
             raise
         self._base = base
         self._state_mem, self._state, self.buf, self.cap = state_mem, state, buf, buffer_bytes
@@ -956,13 +1039,13 @@ class NamedByteRing:
             with self._put_lock, self._get_lock:
                 with self._state_lock:
                     self._state[_CLOSED] = 1
-                self._purge_locked()  # also wakes waiting producers
+                self._purge_locked()  # also wakes waiting producers and consumers
         else:
             with self._state_lock:
                 self._state[_CLOSED] = 1
                 self._wake_producers()
-        # Wake waiting consumers: each one that finds the queue shut down and empty passes this count on.
-        self._items.release(1)
+            # Wake waiting consumers: each one that finds the queue shut down and empty passes this count on.
+            self._items.release(1)
 
     @property
     def nitems(self) -> int:
@@ -1014,6 +1097,8 @@ class NamedByteRing:
                 pass
             # counts handed back later by waiting consumers are spare: they are dropped (see get)
             self._wake_producers()
+            if self._state[_CLOSED]:  # keep shutdown()'s wake-up for consumers waiting on the empty queue
+                self._items.release(1)
 
     def _write_bytes(self, data, tail=None, write_tail=True) -> int:
         """Write data at current tail; return new tail (mod cap). Caller holds put_lock."""
@@ -1121,6 +1206,8 @@ class DejaQueue(NamedByteRing):
         """
         if block is not True:
             timeout = _wait_time(block, timeout, "put")
+        if self._state[3]:  # _CLOSED: refuse before pickling (checked again under the lock below)
+            raise ShutDown("Queue is shut down.")
         bufs = []
         p0 = _pickle_backend.dumps(obj, protocol=_PICKLE_PROTOCOL, buffer_callback=bufs.append)
         segs = [p0] + [b.raw() for b in bufs]
@@ -1152,6 +1239,8 @@ class DejaQueue(NamedByteRing):
                     for s in segs:
                         new_tail = self._write_bytes(s, tail=new_tail, write_tail=False)
                     with self._state_lock:
+                        if st[3]:  # _CLOSED while copying: consumers may have stopped already; don't commit
+                            raise ShutDown("Queue is shut down.")
                         st[1] = new_tail  # _TAIL
                         st[2] += 1  # _NITEMS
                     self._items.release(1)
@@ -1197,9 +1286,22 @@ class DejaQueue(NamedByteRing):
 
         Raises:
             Empty: No item in time. ShutDown: The queue was shut down and is empty.
+
+        Consumers read items one at a time: a get, also with block=False or a timeout, waits while another
+        consumer reads an item, including while its callback runs.
         """
         if block is not True:
-            timeout = _wait_time(block, timeout, "get")
+            if isinstance(timeout, bool) and (block is None or _is_number(block)):
+                # dejaq <= 0.9: get(timeout, peek_only); the second argument is a timeout now
+                warnings.warn(
+                    "DejaQueue.get(): positional (timeout, peek_only) arguments are deprecated; pass "
+                    "timeout=... and peek_only=... as keywords",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                timeout, peek_only = block, timeout
+            else:
+                timeout = _wait_time(block, timeout, "get")
         # The item count in the state block (read under the state lock) is the truth about available items.
         # The _items semaphore, with one count per item, serves to wait for items; counts are only taken while
         # holding the get lock, where a consumer that dies is noticed (_GET_CLAIM) and its count restored. Lost
@@ -1243,7 +1345,7 @@ class DejaQueue(NamedByteRing):
         return self.put(obj, block=False)
 
     def get_nowait(self):
-        """get(block=False)"""
+        """get(block=False) (waits while another consumer reads an item, see get())"""
         return self.get(block=False)
 
     def qsize(self) -> int:
@@ -1350,9 +1452,12 @@ class DejaQueue(NamedByteRing):
             yield x
 
     def _signal_stop(self, n=1):
-        """Puts n stop signals into the queue."""
-        for _ in range(n):
-            self.put(Ellipsis)
+        """Puts n stop signals into the queue (no-op once it is shut down: consumers stop anyway)."""
+        try:
+            for _ in range(n):
+                self.put(Ellipsis)
+        except ShutDown:
+            pass
 
 
 ### Legacy DejaQueue: ###
