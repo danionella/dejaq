@@ -6,6 +6,7 @@ with its original type (the remote traceback as its cause), or as RemoteError if
 """
 from __future__ import annotations
 
+import atexit
 import copy
 import inspect
 import itertools
@@ -337,7 +338,7 @@ class _Client:
         self._servers = [(p.pid, psutil.Process(p.pid).create_time()) for p in procs]
         self._closed = False
         self._finalizer = _mp_util.Finalize(self, _stop_servers, args=(procs, req), exitpriority=10)
-        req._finalizer.atexit = False  # (closed by _stop_servers: at exit, only after the shutdown requests)
+        atexit.register(self._finalizer)  # at exit before the queues are closed (atexit runs the latest first)
 
     @property
     def _mbox(self) -> _Mailbox:
@@ -393,6 +394,7 @@ class _Client:
         if self.__dict__.get("_finalizer") is not None and not self._closed:
             self._closed = True
             self._finalizer.cancel()
+            atexit.unregister(self._finalizer)
             _stop_servers(self._procs, self._req, timeout)
 
     def __enter__(self):

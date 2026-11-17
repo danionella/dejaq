@@ -92,8 +92,16 @@ def test_retention_warning_only_when_a_reference_is_kept():
         assert not [m for m in w if "kept a reference" in str(m.message)]
 
 
+def _nap(s):
+    time.sleep(s)
+    return os.getpid()
+
+
 def test_replies_of_other_threads_are_not_delayed():
-    with RemoteFunc(time.sleep, workers=2) as rf:
+    with RemoteFunc(_nap, workers=2) as rf:
+        deadline = time.monotonic() + 60
+        while len({f.result() for f in [rf.submit(0.3), rf.submit(0.3)]}) < 2:  # both workers have started
+            assert time.monotonic() < deadline
         t = threading.Thread(target=rf, args=(2.0,))
         t.start()
         time.sleep(0.2)
