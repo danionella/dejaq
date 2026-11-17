@@ -216,32 +216,21 @@ def _func_worker(parent: int, fn_pkl: bytes, req_name: str) -> None:
 
 
 class _Mailbox:
-    """A client process's replies, matched to calls by id. Thread-safe: one thread reads at a time."""
+    """A client process's replies, matched to calls by id. Thread-safe: the thread that holds _lock reads the
+    queue; replies for other calls go to _got, where their threads find them."""
 
     def __init__(self, buffer_bytes: int) -> None:
         self.q = DejaQueue(buffer_bytes)
         self.name = self.q._base
         self._got: dict = {}
         self._dropped: set = set()  # calls given up on (timeout): their replies are discarded
-        self._cond = threading.Condition()
-        self._reading = False
+        self._lock = threading.Lock()
 
     def _read(self, timeout: float) -> bool:
-        """Store one reply (if one comes within timeout); False if none came. Caller holds _cond."""
-        if self._reading:  # another thread reads: it stores our reply, too
-            self._cond.wait(timeout)
-            return False
-        self._reading = True
-        self._cond.release()
+        """Store the next reply (False if none came within timeout). Caller holds _lock."""
         try:
             rep = self.q.get(timeout=timeout)
         except Empty:
-            rep = None
-        finally:
-            self._cond.acquire()
-            self._reading = False
-            self._cond.notify_all()
-        if rep is None:
             return False
         if rep.call_id in self._dropped:
             self._dropped.discard(rep.call_id)
@@ -250,33 +239,42 @@ class _Mailbox:
         return True
 
     def wait(self, cid: int, deadline: Optional[float], alive: Callable[[], bool]) -> _Rep:
-        with self._cond:
-            while cid not in self._got:
-                rem = _POLL if deadline is None else min(_POLL, deadline - time.monotonic())
-                if rem <= 0:
-                    self._dropped.add(cid)
-                    raise TimeoutError(f"no reply within the timeout (call {cid})")
-                t0 = time.monotonic()
-                self._read(rem)
-                if cid not in self._got and time.monotonic() - t0 >= _POLL and not alive():
-                    raise RemoteError("the remote process has exited (it died or was closed)")
-            return self._got.pop(cid)
+        while True:
+            rep = self._got.pop(cid, None)
+            if rep is not None:
+                return rep
+            rem = _POLL if deadline is None else min(_POLL, deadline - time.monotonic())
+            if rem <= 0:
+                self._dropped.add(cid)
+                raise TimeoutError(f"no reply within the timeout (call {cid})")
+            t0 = time.monotonic()
+            if self._lock.acquire(timeout=rem):  # (else another thread reads: it stores our reply, too)
+                try:
+                    if cid not in self._got:
+                        self._read(rem)
+                finally:
+                    self._lock.release()
+            if cid not in self._got and time.monotonic() - t0 >= _POLL and not alive():
+                raise RemoteError("the remote process has exited (it died or was closed)")
 
     def pump(self) -> None:
         """Store the replies that have arrived (e.g. while a request waits for space: the server may wait for us)."""
-        with self._cond:
-            while self._read(0):
-                pass
+        if self._lock.acquire(blocking=False):
+            try:
+                while self._read(0):
+                    pass
+            finally:
+                self._lock.release()
 
 
 class Future:
     """The result of a remote call that was not waited for."""
 
     def __init__(self, client: "_Client", cid: int) -> None:
-        self._client, self._id = client, cid
+        self._client, self._id, self._rep = client, cid, None
 
     def result(self, timeout: Optional[float] = None):
-        if not hasattr(self, "_rep"):
+        if self._rep is None:
             deadline = None if timeout is None else time.monotonic() + timeout
             self._rep = self._client._mbox.wait(self._id, deadline, self._client._alive)
         return _unwrap(self._rep)
