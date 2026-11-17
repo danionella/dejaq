@@ -213,8 +213,39 @@ def test_6_tracker_calls_from_threads_stay_in_order(monkeypatch):
     assert errors == []
     order = {}
     for action, name in sent:
-        order.setdefault(name, []).append(action)
+        if name.startswith("/dq_test_"):  # (other objects' cleanup may call the tracker meanwhile)
+            order.setdefault(name, []).append(action)
     assert len(order) == 300 and all(v == ["register", "unregister"] for v in order.values())
+
+
+@_POSIX_ONLY
+def test_6_unregister_waits_for_a_register_still_being_sent(monkeypatch):
+    """Deterministic version: while one thread is still sending "register X", another thread's
+    "unregister X" must not be sent first (formerly it was)."""
+    from multiprocessing import resource_tracker
+
+    sent = []
+    sending, proceed = threading.Event(), threading.Event()
+
+    def register(name, rtype):
+        if name == "/dq_test_order":
+            sending.set()
+            proceed.wait(5)  # e.g. a slow pipe write
+        sent.append(("register", name))
+
+    monkeypatch.setattr(resource_tracker, "register", register)
+    monkeypatch.setattr(resource_tracker, "unregister", lambda name, rtype: sent.append(("unregister", name)))
+    t1 = threading.Thread(target=queues._tracker, args=("register", "/dq_test_order", "semaphore"))
+    t1.start()
+    assert sending.wait(5)
+    t2 = threading.Thread(target=queues._tracker, args=("unregister", "/dq_test_order", "semaphore"))
+    t2.start()
+    t2.join(0.3)  # formerly: sent its "unregister" now, before the "register" was complete
+    proceed.set()
+    t1.join(5)
+    t2.join(5)
+    queues._flush_tracker_backlog()
+    assert [a for a, n in sent if n == "/dq_test_order"] == ["register", "unregister"]
 
 
 # ---------- 7: worker processes send their queued tracker calls ----------
