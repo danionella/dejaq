@@ -117,14 +117,35 @@ print(greeter.greet())  # "Hello, Alice!"
 greeter.close()
 ```
 
+Use `with Actor(Counter) as counter:` to close it automatically. An actor is also stopped when the `Actor` object is garbage-collected, and when your program exits.
+
 ### Features
 
-- **Remote method calls:** Call methods as if the object was local.
-- **Remote attribute access:** Get/set attributes of the remote object.
-- **Async support:** Call `method_async()` to get a `Future` for non-blocking calls.
-- **Zero-copy fast path:** Pass `deepcopy=False` to skip the default deep-copy of numpy array arguments (e.g. `actor.process(arr, deepcopy=False)`). The remote method then operates on numpy arrays viewing shared memory directly — they are only valid for the duration of the call. **Do not** store them (`self.foo = arr`), return them, hand them to async/background work, or otherwise retain a reference: the underlying buffer is reused by the queue once the call returns and any retained view will be silently overwritten. If you need to keep the data, call `arr.copy()` first. A `RuntimeWarning` is emitted if a retained reference is detected.
+- **Remote method calls:** Call methods as if the object was local. Exceptions raised by the remote method are raised again in your process, with the same type (and the remote traceback attached).
+- **Remote attribute access:** Get and set attributes of the remote object (`counter.value`, `counter.value = 5`).
+- **Async calls:** `counter.increment_async(5)` returns a `Future` (`.result()` waits for the value). `counter.increment(5, noreply=True)` does not wait at all (the result is discarded).
+- **Timeouts:** `counter.get(timeout=2)` raises `TimeoutError` if there is no result within 2 s. If the actor's process has ended (it crashed or was closed), calls raise `dejaq.remote.RemoteError` instead of waiting.
+- **Threads and worker processes:** An actor can be used from several threads, and passed to other processes (e.g. as an argument of a `Parallel` function).
+- **Zero-copy fast path:** Pass `deepcopy=False` to skip the default copy of numpy array arguments (e.g. `actor.process(arr, deepcopy=False)`). The method then reads the arrays directly in shared memory, which is only valid during the call: copy anything you want to keep (`self.last = arr.copy()`); returning a result computed from them is fine. A `RuntimeWarning` is shown if a method keeps a reference.
 - **Tab completion:** Works in Jupyter and most IDEs.
 
+### Running a function in worker processes: `RemoteFunc`
+
+```python
+from dejaq import RemoteFunc
+
+def square(x):
+    return x * x
+
+with RemoteFunc(square, workers=4) as rf:
+    print(rf(12))               # 144
+    print(rf.map(range(5)))     # [0, 1, 4, 9, 16]
+    print(rf.submit(7).result())  # 49
+```
+
+Notes:
+- Each process that uses an actor (or a `RemoteFunc`) gets a reply queue of `buffer_bytes` (default 10 MB) in shared memory. With many worker processes, choose a smaller `buffer_bytes` if the results are small.
+- Arguments must be importable by the actor's process. In a notebook, a class defined in the notebook cannot be passed to an actor; such a call waits until its `timeout` (an error is logged by the actor).
 
 
 ## dejaq.Parallel
