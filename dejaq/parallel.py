@@ -265,7 +265,8 @@ class lazymap:
         fcn (callable): function that is being mapped. Signature: fcn(item, **kwargs)
         it (iterable): iterable that maps over the function, providing items as arguments (must be picklable)
         n_workers (int): number of workers (default: 1)
-        buffer_bytes (int): size of the queue buffer (default: 10e6 bytes)
+        buffer_bytes (int): size of the queue buffer (default: 10e6 bytes); for large items (e.g. camera frames) about
+            10 times the item size or more
         start_type (str): when the workers start reading input: 'lazy' (default) when iteration starts,
             'eager' at once, 'manual' when start() is called
         ordered (bool): if True (default), results are returned in input order; if False, in the order in which

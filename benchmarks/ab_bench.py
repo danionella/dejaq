@@ -217,6 +217,53 @@ def _pipe_uneven(n=2_000, **opts):
     return _timed(lambda: [_stage(_uneven, range(n), 4, **opts)], n)
 
 
+# camera-like: 4 MB frames from a driver buffer, queues of 100 MB (~25 frames), ending in sink stages that
+# return a small value (as a writer would), so that the main process does not limit the throughput
+_FRAME = None
+_FRAME_BUF = 100e6
+
+
+def _camera(i):
+    global _FRAME
+    if _FRAME is None:
+        import numpy as np
+
+        _FRAME = np.ones(4 * 2**20, np.uint8)
+    return _FRAME
+
+
+def _sink(x):
+    return sum(int(f[-1]) for f in x) if isinstance(x, tuple) else int(x[-1])
+
+
+def _fstage(fcn, it, n=1, zero_copy=False):
+    from dejaq import Parallel
+
+    opts = {"zero_copy": True} if zero_copy else {}  # (older versions have no zero_copy)
+    return Parallel(n_workers=n, buffer_bytes=_FRAME_BUF, **opts)(fcn)(it)
+
+
+def _frames(topology, zero_copy=False, n=1500):
+    from dejaq import parallel
+
+    def make():
+        if topology == "zip":
+            a, b = _fstage(_camera, range(n)), _fstage(_camera, range(n))
+            z = parallel.zip(a, b)
+            return [a, b, z, _fstage(_sink, z, zero_copy=zero_copy)]
+        cam = _fstage(_camera, range(n))
+        if topology == "tee":
+            x, y = cam.tee(2)
+            sx, sy = _fstage(_sink, x, zero_copy=zero_copy), _fstage(_sink, y, zero_copy=zero_copy)
+            return [cam, x, y, sx, sy, zip(sx, sy)]
+        if topology == "4 workers":
+            mid = _fstage(_ident, cam, 4)
+            return [cam, mid, _fstage(_sink, mid, zero_copy=zero_copy)]
+        return [cam, _fstage(_sink, cam, zero_copy=zero_copy)]
+
+    return _timed(make, n)
+
+
 PIPELINE_CASES = [
     ("1 stage, 1 worker, int", "items/s", True, lambda: _pipe_1(1)),
     ("1 stage, 4 workers, int (range input)", "items/s", True, lambda: _pipe_1(4)),
@@ -229,6 +276,12 @@ PIPELINE_CASES = [
     ("parallel.zip of 2 stages, int", "items/s", True, _pipe_zip),
     ("4 workers, uneven task times", "items/s", True, _pipe_uneven),
     ("4 workers, uneven task times, ordered=False", "items/s", True, lambda: _pipe_uneven(ordered=False)),
+    ("4MB frames: camera -> sink", "frames/s", True, lambda: _frames("sink")),
+    ("4MB frames: camera -> zero-copy sink", "frames/s", True, lambda: _frames("sink", True)),
+    ("4MB frames: camera -> 4 workers -> sink", "frames/s", True, lambda: _frames("4 workers")),
+    ("4MB frames: camera.tee(2) -> 2 sinks", "frames/s", True, lambda: _frames("tee")),
+    ("4MB frames: zip(camera, camera) -> sink", "pairs/s", True, lambda: _frames("zip")),
+    ("4MB frames: zip(camera, camera) -> zero-copy sink", "pairs/s", True, lambda: _frames("zip", True)),
 ]
 
 SUITES = {"queue": CASES, "pipeline": PIPELINE_CASES}
@@ -280,6 +333,7 @@ def main():
     ap.add_argument("--rounds", type=int, default=5)
     ap.add_argument("--markdown", help="also write the report to this file")
     ap.add_argument("--suite", choices=sorted(SUITES), default="queue")
+    ap.add_argument("--run-timeout", type=float, default=900, help="seconds per variant and round")
     args = ap.parse_args()
     variants = [tuple(v.split("=", 1)) for v in args.variants]
     results = {label: {} for label, _ in variants}
@@ -287,9 +341,14 @@ def main():
         order = variants if r % 2 == 0 else variants[::-1]
         for label, path in order:
             env = dict(os.environ, PYTHONPATH=os.path.abspath(path))
-            proc = subprocess.run(
-                [sys.executable, os.path.abspath(__file__), "--worker", args.suite], env=env, capture_output=True, text=True
-            )
+            try:
+                proc = subprocess.run(
+                    [sys.executable, os.path.abspath(__file__), "--worker", args.suite], env=env, capture_output=True,
+                    text=True, timeout=args.run_timeout,
+                )
+            except subprocess.TimeoutExpired as e:  # e.g. a hang in an old version: keep what was measured
+                out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+                proc = subprocess.CompletedProcess(e.cmd, -1, out, f"timed out after {args.run_timeout:.0f} s")
             for line in proc.stdout.splitlines():
                 if line.startswith("{"):
                     rec = json.loads(line)
