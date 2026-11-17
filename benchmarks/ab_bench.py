@@ -167,14 +167,14 @@ def _timed(make, n, warmup=2.0):
     return n / t
 
 
-def _stage(fcn, it, n_workers, buffer_bytes=10e6):
+def _stage(fcn, it, n_workers, buffer_bytes=10e6, **opts):
     from dejaq import Parallel
 
-    return Parallel(n_workers=n_workers, buffer_bytes=buffer_bytes)(fcn)(it)
+    return Parallel(n_workers=n_workers, buffer_bytes=buffer_bytes, **opts)(fcn)(it)
 
 
-def _pipe_1(n_workers, n=20_000):
-    return _timed(lambda: [_stage(_ident, range(n), n_workers)], n)
+def _pipe_1(n_workers, n=20_000, as_list=False):
+    return _timed(lambda: [_stage(_ident, list(range(n)) if as_list else range(n), n_workers)], n)
 
 
 def _pipe_chain(n=20_000):
@@ -212,13 +212,14 @@ def _pipe_zip(n=20_000):
     return _timed(make, n)
 
 
-def _pipe_uneven(n=2_000):
-    return _timed(lambda: [_stage(_uneven, range(n), 4)], n)
+def _pipe_uneven(n=2_000, **opts):
+    return _timed(lambda: [_stage(_uneven, range(n), 4, **opts)], n)
 
 
 PIPELINE_CASES = [
     ("1 stage, 1 worker, int", "items/s", True, lambda: _pipe_1(1)),
-    ("1 stage, 4 workers, int", "items/s", True, lambda: _pipe_1(4)),
+    ("1 stage, 4 workers, int (range input)", "items/s", True, lambda: _pipe_1(4)),
+    ("1 stage, 4 workers, int (list input)", "items/s", True, lambda: _pipe_1(4, as_list=True)),
     ("2 stages 1->1, int", "items/s", True, _pipe_chain),
     ("1 stage, 1 worker, 1MB results", "GB/s", True, lambda: _pipe_mb(1)),
     ("1 stage, 4 workers, 1MB results", "GB/s", True, lambda: _pipe_mb(4)),
@@ -226,6 +227,7 @@ PIPELINE_CASES = [
     ("tee(2), int", "items/s", True, _pipe_tee),
     ("parallel.zip of 2 stages, int", "items/s", True, _pipe_zip),
     ("4 workers, uneven task times", "items/s", True, _pipe_uneven),
+    ("4 workers, uneven task times, ordered=False", "items/s", True, lambda: _pipe_uneven(ordered=False)),
 ]
 
 SUITES = {"queue": CASES, "pipeline": PIPELINE_CASES}

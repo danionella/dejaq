@@ -130,7 +130,7 @@ greeter.close()
 ## dejaq.Parallel
 The following examples show how to use `dejaq.Parallel` to parallelize a function or a class, and how to create job pipelines.
 
-Here we execute a function and map iterable inputs across 10 workers. To enable pipelining, the results of each stage are provided as iterable generator. Use `.run()` (or `.compute()`) to get the final result as a list. Results are always ordered.
+Here we execute a function and map iterable inputs across 10 workers. To enable pipelining, the results of each stage are provided as iterable generator. Use `.run()` (or `.compute()`) to get the final result as a list. Results are in input order, unless you pass `ordered=False` (e.g. `Parallel(n_workers=10, ordered=False)`): then each result is returned as soon as it is ready, so that a slow item does not hold up the others.
 
 Workers are started with the `spawn` method, which imports your main script in each worker: in a script (unlike in Jupyter), put the code that starts pipelines under `if __name__ == "__main__":`.
 
@@ -150,7 +150,7 @@ result = stage.run() # or list(stage)
 result = Parallel(n_workers=10)(slow_function)(input_iterable).run()
 ```
 
-If a worker raises an exception, `run()` (or iterating) raises the same exception, with the worker's traceback as its cause; if a worker process dies, it raises `dejaq.parallel.WorkerError`. A stage's workers are stopped when that happens, when the stage is closed (`stage.close()` or a `with` block) or garbage-collected, and at exit. Leaving a loop early (`break`) does not stop them: iterating again continues with the next result.
+If a worker raises an exception, `run()` (or iterating) raises the same exception, with the worker's traceback as its cause; if a worker process dies, it raises `dejaq.parallel.WorkerError`. A stage's workers are stopped when that happens, when the stage is closed (`stage.close()` or a `with` block; this also closes the stages that feed it) or garbage-collected, and at exit. Leaving a loop early (`break`) does not stop them: iterating again continues with the next result.
 
 You can also use `Parallel` as a function decorator:
 ```python
@@ -207,6 +207,8 @@ result = stage3.run()
 # or:
 result = Consumer(1000)(Processor(10.0)(Producer(0.5)(input_iterable))).run()
 ```
+
+A stage's results can be split into several branches with `stage.tee(n)`, and stages can be combined with `dejaq.parallel.zip(stage_a, stage_b)` (which yields tuples). Like the stages themselves, both run in processes of their own, so the data does not pass through your main process. As with `itertools.tee`, consume the branches side by side: a branch that falls behind by more than its buffer holds makes the others wait.
 
 
 # See also

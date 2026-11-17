@@ -249,3 +249,42 @@ def test_workers_are_stopped_if_starting_them_fails(monkeypatch):
         lazymap(add5, upstream, n_workers=2)
     gc.collect()
     assert len(_started) == 1 and _all_gone(_started)
+
+
+# ---------- range inputs read by stride, ordered=False ----------
+
+def slow_every_4th(x):
+    time.sleep(0.2 if x % 4 == 0 else 0.0)
+    return x
+
+
+@pytest.mark.parametrize("n_workers", [2, 3, 4])
+@pytest.mark.parametrize("n_items", [0, 1, 5, 12])
+def test_range_input_split_between_workers(n_workers, n_items):
+    stage = Parallel(n_workers=n_workers)(add5)(range(n_items))
+    assert stage._own_input is None  # each worker reads its share: no extra input stage
+    assert stage.run(progress=False) == [i + 5 for i in range(n_items)]
+
+
+def test_range_input_with_a_step():
+    assert Parallel(n_workers=3)(ident)(range(3, 40, 4)).run(progress=False) == list(range(3, 40, 4))
+
+
+@pytest.mark.parametrize("source", ["range", "list", "stage"])
+def test_unordered_returns_every_result_once(source):
+    data = {"range": range(30), "list": list(range(30)), "stage": Parallel(n_workers=2)(ident)(range(30))}[source]
+    out = Parallel(n_workers=3, ordered=False)(add5)(data).run(progress=False)
+    assert sorted(out) == [i + 5 for i in range(30)]
+
+
+def test_unordered_slow_items_do_not_hold_up_the_others():
+    out = Parallel(n_workers=4, ordered=False)(slow_every_4th)(range(8)).run(progress=False)
+    assert sorted(out) == list(range(8))
+    assert out.index(0) > out.index(1)  # item 0 is slow: later items overtake it
+
+
+def test_unordered_errors_and_downstream_stages():
+    with pytest.raises(ValueError, match="bad item 3"):
+        Parallel(n_workers=3, ordered=False)(fails_at_3)(range(10)).run(progress=False)
+    up = Parallel(n_workers=3, ordered=False)(add5)(range(20))
+    assert sorted(Parallel(n_workers=2)(ident)(up).run(progress=False)) == [i + 5 for i in range(20)]

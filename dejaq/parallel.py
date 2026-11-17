@@ -121,6 +121,13 @@ def _exit_with_parent() -> None:
     threading.Thread(target=watch, name="dejaq-parent-watchdog", daemon=True).start()
 
 
+def _put_stop(q) -> None:
+    try:
+        q.put(_Stop())
+    except ShutDown:
+        pass
+
+
 def _stop_processes(procs, lock=None, timeout=1.0) -> None:
     """Terminate (if still running) and join processes."""
     with lock or threading.Lock():
@@ -192,6 +199,8 @@ class lazymap:
         buffer_bytes (int): size of the queue buffer (default: 10e6 bytes)
         start_type (str): when the workers start reading input: 'lazy' (default) when iteration starts,
             'eager' at once, 'manual' when start() is called
+        ordered (bool): if True (default), results are returned in input order; if False, in the order in which
+            they are ready (a slow item does not hold up the others)
 
         **kwargs: optional, being passed to fcn
 
@@ -199,14 +208,17 @@ class lazymap:
         (iterable): an iterable that returns the results of fcn(item) for each item in it
     '''
 
-    def __init__(self, fcn, it, n_workers=1, buffer_bytes=10e6, start_type='lazy', **kwargs):
+    def __init__(self, fcn, it, n_workers=1, buffer_bytes=10e6, start_type='lazy', ordered=True, **kwargs):
         if not isinstance(n_workers, int) or n_workers < 1:
             raise ValueError(f"n_workers must be a positive integer, not {n_workers!r}")
         if start_type not in ("lazy", "eager", "manual"):
             raise ValueError(f"start_type must be 'lazy', 'eager' or 'manual', not {start_type!r}")
         self._own_input = None
         self._closed = False
-        if n_workers > 1 and not isinstance(it, lazymap):
+        # With several workers, each one reads its own share of a range; any other iterable that is not a stage
+        # is read by an extra stage of one worker, so that it is read only once (e.g. a file reader).
+        stride = n_workers > 1 and isinstance(it, range)
+        if n_workers > 1 and not isinstance(it, lazymap) and not stride:
             # one process reads the input, so that a stateful iterable (e.g. a file reader) is read only once
             it = self._own_input = lazymap(None, it, n_workers=1, buffer_bytes=buffer_bytes)
         self._it = it
@@ -228,7 +240,11 @@ class lazymap:
         self._buffer_bytes = buffer_bytes
         self._done = ctx.RawArray("b", n_workers)  # set by each worker when it finished normally
         pkl = cloudpickle.dumps((fcn, self._it, kwargs))
-        worker_args = (pkl, self._out_queue, n_workers, self._in_sem, self._out_sem, self._done)
+        self._ordered = ordered
+        self._finished = finished = None if ordered else NamedSemaphore(initial=n_workers - 1)
+        read_in_turn = ordered and not stride  # (unordered workers of a stage simply share its queue)
+        worker_args = (pkl, self._out_queue, n_workers, self._in_sem, self._out_sem, self._done, read_in_turn,
+                       ordered, stride, finished)
         self._procs = procs = []
         self._owner = True  # only the creating process stops the workers (not pickled copies in other workers)
         self._closing = False
@@ -289,60 +305,69 @@ class lazymap:
             raise
 
     @staticmethod
-    def _worker_fcn(pid, pkl, _out_queue, _n_workers, in_sem, out_sem, done):
+    def _worker_fcn(pid, pkl, _out_queue, _n_workers, in_sem, out_sem, done, read_in_turn, write_in_turn, stride,
+                    finished):
+        # Workers take turns (round-robin, passing semaphore tokens) to read the input (unless each one reads its
+        # own share of it, stride) and to put results (unless ordered=False). A failure is passed on as a
+        # _WorkerException item, in this worker's turn, after which the worker stops.
         _exit_with_parent()
-        # A failure is passed on as a _WorkerException item, in this worker's turn, after which the worker stops.
         failure = None
         try:
             fcn, it, kwargs = cloudpickle.loads(pkl)
         except BaseException as e:
             failure = _WorkerException(e)
         nxt = (pid + 1) % _n_workers
-        in_sem[pid].acquire()
+        in_sem[pid].acquire()  # the start signal
         if failure is None:
             try:
-                iterator = iter(it)
+                iterator = iter(it[pid::_n_workers] if stride else it)
             except BaseException as e:
                 failure = _WorkerException(e)
-        in_sem[pid].release()
+        if read_in_turn:
+            in_sem[pid].release()
+        else:
+            in_sem[nxt].release()  # pass the start signal on
 
         while True:
-            in_sem[pid].acquire()
+            if read_in_turn:
+                in_sem[pid].acquire()
             if failure is not None:
-                in_sem[nxt].release()
                 res = failure
             else:
                 try:
                     item = next(iterator)
                 except StopIteration:
-                    in_sem[nxt].release()
+                    if read_in_turn:
+                        in_sem[nxt].release()
                     break
                 except BaseException as e:  # the input failed (e.g. an upstream stage's worker raised or died)
-                    in_sem[nxt].release()
                     res = failure = _WorkerException(e)
-                else:
-                    in_sem[nxt].release()
-                    try:
-                        res = item if fcn is None else fcn(item, **kwargs)
-                    except Exception as e:
-                        res = _WorkerException(e)
-                    except BaseException as e:  # e.g. sys.exit() in fcn: pass it on, then stop
-                        res = failure = _WorkerException(e)
-            out_sem[pid].acquire()
+            if read_in_turn:
+                in_sem[nxt].release()
+            if failure is None:
+                try:
+                    res = item if fcn is None else fcn(item, **kwargs)
+                except Exception as e:
+                    res = _WorkerException(e)
+                except BaseException as e:  # e.g. sys.exit() in fcn: pass it on, then stop
+                    res = failure = _WorkerException(e)
+            if write_in_turn:
+                out_sem[pid].acquire()
             try:
                 _out_queue.put(res)
             except Exception as e:  # e.g. the result cannot be pickled
                 _out_queue.put(_WorkerException(e))
-            out_sem[nxt].release()
+            if write_in_turn:
+                out_sem[nxt].release()
             if failure is not None:
                 break
 
-        out_sem[pid].acquire()
-        try:
-            _out_queue.put(_Stop())
-        except ShutDown:
-            pass
-        out_sem[nxt].release()
+        if write_in_turn:
+            out_sem[pid].acquire()
+            _put_stop(_out_queue)
+            out_sem[nxt].release()
+        elif not finished.acquire(timeout=0):  # the last worker to finish (it holds n_workers - 1 counts)
+            _put_stop(_out_queue)
         done[pid] = 1
 
     def _check_workers(self) -> None:
@@ -437,7 +462,7 @@ class lazymap:
         thread.start()
         return future
 
-    def map(self, fcn, n_workers=1, buffer_bytes=10e6, **kwargs):
+    def map(self, fcn, n_workers=1, buffer_bytes=10e6, ordered=True, **kwargs):
         ''' Maps another function over the output of this lazymap, returning a new lazymap.
 
         Args:
@@ -449,7 +474,7 @@ class lazymap:
         Returns:
             (lazymap): a new lazymap that maps fcn over the output of this lazymap
         '''
-        return lazymap(fcn, self, n_workers, buffer_bytes, **kwargs)
+        return lazymap(fcn, self, n_workers, buffer_bytes, ordered=ordered, **kwargs)
 
     def start(self):
         ''' Starts the lazymap if it was created with start_type='manual'.
@@ -462,22 +487,23 @@ class lazymap:
         return tee(self, n, buffer_bytes)
 
 
-def Parallel(n_workers=1, buffer_bytes=10e6):
+def Parallel(n_workers=1, buffer_bytes=10e6, ordered=True):
     ''' A wrapper to make a class or callablle a parallel worker. Can be used as a decorator.
 
     Args:
         n_workers (int): number of workers (default: 1)
         buffer_bytes (int): size of the queue buffer (default: 10e6 bytes)
+        ordered (bool): if True (default), results come in input order; if False, as soon as they are ready
 
     Returns:
 
     '''
     def decorator(cls):
         if isinstance(cls, type):
-            return WorkerWrapper(cls, n_workers, buffer_bytes)
+            return WorkerWrapper(cls, n_workers, buffer_bytes, ordered)
         elif callable(cls):
             def wrapped(iterable, **kwargs):
-                return lazymap(cls, iterable, n_workers, buffer_bytes, **kwargs)
+                return lazymap(cls, iterable, n_workers, buffer_bytes, ordered=ordered, **kwargs)
             return wrapped
         else:
             raise ValueError(f'Invalid type {type(cls)}')
@@ -491,18 +517,20 @@ class WorkerWrapper:
         n_workers (int): number of workers (default: 1)
         buffer_bytes (int): size of the queue buffer (default: 10e6 bytes)
     '''
-    def __init__(self, cls, n_workers=1, buffer_bytes=10e6):
+    def __init__(self, cls, n_workers=1, buffer_bytes=10e6, ordered=True):
         self._instance = None
         self._cls = cls
         self._n_workers = n_workers
         self._buffer_bytes = int(buffer_bytes)
+        self._ordered = ordered
     def __call__(self, *init_args, **init_kwargs):
         def mapper(iterable, **map_kwargs):
             def worker(arg, **kwargs):
                 if self._instance is None:
                     self._instance = self._cls(*init_args, **init_kwargs)
                 return self._instance(arg, **kwargs)
-            return lazymap(worker, iterable, self._n_workers, self._buffer_bytes, **map_kwargs)
+            return lazymap(worker, iterable, self._n_workers, self._buffer_bytes, ordered=self._ordered,
+                           **map_kwargs)
         return mapper
 
 
@@ -577,10 +605,7 @@ def _tee_worker(pkl, queues, done):
             except Exception:
                 pass
     for q in live:
-        try:
-            q.put(_Stop())
-        except ShutDown:
-            pass
+        _put_stop(q)
     done[0] = 1
 
 
