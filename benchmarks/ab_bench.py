@@ -129,7 +129,7 @@ CASES = [
 ]
 
 # ------------------------------------------------------------------------------------------ pipelines
-# Throughput of dejaq.parallel pipelines, measured once the workers have started (spawning them is not timed).
+# Throughput of dejaq.parallel pipelines (see _timed).
 
 
 def _ident(x):
@@ -154,17 +154,20 @@ def _consume(it):
     return n
 
 
-def _timed(make, n, warmup=2.0):
+def _timed(make, n):
+    """Items per second from the first result to the last: once the first result has arrived, all processes have
+    started (spawning them is not timed), and no stage can have run far ahead (only as far as its queue holds)."""
     stages = make()
-    time.sleep(warmup)  # let the workers start (they wait for the first item until iteration starts)
+    it = iter(stages[-1])
+    next(it)
     t0 = time.perf_counter()
-    got = _consume(stages[-1])
+    got = 1 + _consume(it)
     t = time.perf_counter() - t0
     assert got == n, (got, n)
     for s in stages[::-1]:
         if hasattr(s, "close"):
             s.close()
-    return n / t
+    return (n - 1) / t
 
 
 def _stage(fcn, it, n_workers, buffer_bytes=10e6, **opts):
