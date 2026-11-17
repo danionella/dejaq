@@ -234,8 +234,12 @@ def test_threads_share_one_queue():
 
 @pytest.mark.parametrize("length", [8, 27, 28, 29, 40])
 def test_named_queue_resources_are_distinct(length):
-    """User-chosen names: everything must stay distinct and fit macOS's ~30-byte POSIX name limits."""
+    """User-chosen names: everything must stay distinct; on macOS (~30-byte POSIX names) longer ones are refused."""
     name = ("q" + os.urandom(16).hex())[:length]
+    if sys.platform == "darwin" and length > 26:
+        with pytest.raises(ValueError, match="too long for macOS"):
+            DejaQueue(10_000, name=name)
+        return
     q = DejaQueue(10_000, name=name)
     sems = [q._put_lock, q._get_lock, q._state_lock, q._items, q._space_gate]
     assert len({s.name for s in sems}) == len(sems), [s.name for s in sems]
@@ -244,25 +248,18 @@ def test_named_queue_resources_are_distinct(length):
     assert q2.get(timeout=1) == "hello"
 
 
-def test_macos_name_shortening(monkeypatch):
-    """The macOS 31-byte workaround, checked on every platform."""
+def test_macos_name_length_limit(monkeypatch):
+    """macOS limits POSIX names to ~30 bytes: generated names fit, longer explicit names are refused."""
     from dejaq import queues
 
     monkeypatch.setattr(queues.sys, "platform", "darwin")
-    short = "nq1a2b3c4d_Lp"
-    assert queues._posix_name(short) == "/" + short  # names that fit are unchanged
+    assert queues._posix_name("nq1a2b3c4d_Lp") == "/nq1a2b3c4d_Lp"  # names that fit are unchanged
     assert queues._shm_name("nq1a2b3c4d_S") == "nq1a2b3c4d_S"
-    base = "camera_frames_" + "x" * 20
-    names = [queues._posix_name(base + suffix) for suffix in ("_Lp", "_Lg", "_Ls", "_I", "_G")]
-    assert len(set(names)) == len(names), names
-    for nm in names:
-        assert nm.startswith("/") and len(nm.encode()) <= 30  # posix_ipc limit on macOS
-        assert queues._posix_name(nm.lstrip("/")) == nm  # fixed point: re-deriving after unpickling
-    assert queues._posix_name(base + "_Lp") == names[0]  # deterministic
-    shm = [queues._shm_name(base + suffix) for suffix in ("_S", "_B")]
-    assert shm[0] != shm[1] and all(not s.startswith("/") and len(s.encode()) <= 30 for s in shm)
-    long_unicode = "kamera_ä" * 6
-    assert len(queues._posix_name(long_unicode).encode()) <= 30
+    for base in (queues._safe_base("nq"), queues._safe_base("ns")):
+        for nm in queues.NamedByteRing._names(base)[3]:
+            queues._posix_name(nm)  # no error
+    with pytest.raises(ValueError, match="too long for macOS"):
+        queues._posix_name("camera_frames_" + "x" * 20 + "_Lp")
 
 
 def test_resources_are_released_when_creator_is_gone():

@@ -1,6 +1,6 @@
 """Synchronization, naming and lifecycle tests for DejaQueue/NamedSemaphore.
 
-Covers: unique and collision-safe names, get() timeouts with competing consumers, the waiting-producer
+Covers: names that are never shared, get() timeouts with competing consumers, the waiting-producer
 protocol (no unbounded semaphore growth, no lost wake-ups), purge() racing with consumers, 64-bit item
 headers, and the state-layout version check.
 """
@@ -17,6 +17,7 @@ import pytest
 
 from dejaq import queues
 from dejaq.queues import _IS_WIN, DejaQueue, NamedSemaphore
+from _testutil import run_script
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -55,26 +56,16 @@ def test_random_queue_names_are_unique():
     assert len({q._base for q in qs}) == len(qs)
 
 
-def test_semaphore_name_collision_is_retried(monkeypatch):
-    taken = NamedSemaphore()
-    fresh = queues._safe_base("ns")
-    names = iter([taken.name.lstrip("/"), fresh])
-    monkeypatch.setattr(queues, "_safe_base", lambda prefix="ns": next(names))
-    s = NamedSemaphore()
-    assert s.name != taken.name
-    s.release()
-    assert not taken.acquire(timeout=0)  # the two are independent
-
-
-def test_queue_name_collision_is_retried(monkeypatch):
-    taken = DejaQueue(4096)
-    names = iter([taken._base, queues._safe_base("nq")])
-    monkeypatch.setattr(queues, "_safe_base", lambda prefix="nq": next(names))
-    q = DejaQueue(4096)
-    assert q._base != taken._base
-    q.put("new")
-    taken.put("taken")
-    assert q.get(timeout=1) == "new" and taken.get(timeout=1) == "taken"
+def test_generated_name_collision_raises_and_never_shares(monkeypatch):
+    """Generated names are random (pid + 40 bits): a collision is not retried, it fails cleanly."""
+    taken_sem, taken_q = NamedSemaphore(), DejaQueue(4096)
+    monkeypatch.setattr(queues, "_safe_base", lambda prefix: taken_sem.name.lstrip("/") if prefix == "ns" else taken_q._base)
+    with pytest.raises(FileExistsError):
+        NamedSemaphore()
+    with pytest.raises(FileExistsError):
+        DejaQueue(4096)
+    taken_q.put("taken")
+    assert taken_q.get(timeout=1) == "taken"  # unaffected
 
 
 def test_explicit_semaphore_name_that_exists_raises():
@@ -98,47 +89,51 @@ def test_explicit_queue_name_that_exists_raises_and_keeps_the_queue():
 def test_failed_creation_cleans_up(monkeypatch):
     """If creating a queue fails halfway, what was created is removed again and the name is reusable."""
     name = "dq_test_" + os.urandom(5).hex()
-    real = queues.NamedByteRing._create_named
     calls = []
 
-    def flaky(self, cls, nm):
-        calls.append(nm)
-        if len(calls) == 4:
-            raise OSError("simulated failure")
-        return real(self, cls, nm)
+    class Flaky(queues.NamedSemaphore):
+        def __init__(self, *args, **kwargs):
+            calls.append(args)
+            if len(calls) == 2:  # the second of the queue's two plain semaphores
+                raise OSError("simulated failure")
+            super().__init__(*args, **kwargs)
 
-    monkeypatch.setattr(queues.NamedByteRing, "_create_named", flaky)
+    real = queues.NamedSemaphore
+    monkeypatch.setattr(queues, "NamedSemaphore", Flaky)
     with pytest.raises(OSError, match="simulated"):
         DejaQueue(4096, name=name)
-    monkeypatch.setattr(queues.NamedByteRing, "_create_named", real)
+    monkeypatch.setattr(queues, "NamedSemaphore", real)
     q = DejaQueue(4096, name=name)  # FileExistsError if anything was left behind
     q.put(1)
     assert q.get(timeout=1) == 1
 
 
 @pytest.mark.skipif(_IS_WIN, reason="Windows semaphores vanish with their last handle")
-def test_stale_semaphores_from_a_crashed_queue_are_replaced():
-    """POSIX semaphores and lock files can outlive a crashed creator (e.g. when its resource tracker died too)."""
+def test_stale_objects_of_a_crashed_queue():
+    """Lock files left by a crashed creator (macOS keeps them) are reused; semaphores left behind (only if its
+    resource tracker died too) make creating a queue of the same name fail cleanly."""
     import posix_ipc
 
     name = "dq_test_" + os.urandom(5).hex()
     _, _, lock_names, sem_names = queues.NamedByteRing._names(name)
-    stale = [posix_ipc.Semaphore(queues._posix_name(nm), posix_ipc.O_CREX, initial_value=v)
-             for nm, v in zip(sem_names, (0, 3, 7))]  # state lock "held", phantom items and wake-ups
     for nm in lock_names:
         lk = queues._RobustLock(nm, auto_unlink=False)
         lk._finalizer.detach()  # leave the file behind, as a crashed process would
         lk.close()
+    q = DejaQueue(4096, name=name)
+    q.put("fresh")
+    assert q.get(timeout=1) == "fresh"
+    _assert_quiescent(q)
+    del q
+    name2 = "dq_test_" + os.urandom(5).hex()
+    stale = posix_ipc.Semaphore(queues._posix_name(queues.NamedByteRing._names(name2)[3][1]), posix_ipc.O_CREX)
     try:
-        q = DejaQueue(4096, name=name)
-        with pytest.raises(TimeoutError):
-            q.get(timeout=0.1)  # no phantom items
-        q.put("fresh")
-        assert q.get(timeout=1) == "fresh"
-        _assert_quiescent(q)
+        with pytest.raises(FileExistsError):
+            DejaQueue(4096, name=name2)
+        DejaQueue(4096, name=name2 + "b")  # (nothing else was affected)
     finally:
-        for s in stale:
-            s.close()
+        stale.unlink()
+        stale.close()
 
 
 # ---------- get(timeout) with competing consumers ----------
@@ -464,3 +459,32 @@ def test_forked_child_does_not_unlink_the_parents_queue():
 def _run_python(code):
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [REPO_ROOT, os.environ.get("PYTHONPATH")])))
     return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60, env=env)
+
+
+_DIES_HOLDING_THE_STATE_LOCK = """
+import multiprocessing as mp, os, time
+from dejaq import DejaQueue
+
+def die_holding(name):
+    q = DejaQueue(name=name, create=False)
+    q._state_lock.__enter__()
+    os._exit(1)
+
+if __name__ == "__main__":
+    q = DejaQueue(100_000)
+    p = mp.get_context("spawn").Process(target=die_holding, args=(q._base,))
+    p.start()
+    p.join()
+    assert p.exitcode == 1
+    t = time.monotonic()
+    q.put("after")
+    print(round(time.monotonic() - t, 1), q.get(timeout=1), flush=True)
+"""
+
+
+def test_state_lock_of_a_dead_process_is_taken_over(tmp_path):
+    """Formerly a process that died inside a queue operation's short critical section blocked the queue for good."""
+    r = run_script(tmp_path, _DIES_HOLDING_THE_STATE_LOCK, timeout=60)
+    assert r.returncode == 0, r.stderr[-2000:]
+    seconds, item = r.stdout.split()
+    assert item == "after" and float(seconds) < 5

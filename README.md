@@ -30,6 +30,8 @@ Auto-generated (minimal) API documentation: https://danionella.github.io/dejaq
 
 - for development, clone this repository, navigate to the root directory and type `pip install -e .`
 
+dejaq supports Python 3.8 and later on Linux, macOS and Windows. On free-threaded Python builds (e.g. 3.14t), dejaq works, but on Linux and macOS importing it turns the GIL back on, because its dependency `posix_ipc` does not declare free-threading support yet (see #38).
+
 ## Examples
 ### dejaq.DejaQueue
 ```python
@@ -74,6 +76,7 @@ if __name__ == "__main__":
 
 `dejaq.Actor` allows you to run a class instance in a separate process and call its methods or access its attributes remotely, as if it were local. This is useful for isolating heavy computations, stateful services, or legacy code in a separate process, while keeping a simple Pythonic interface.
 
+Actors start their process with the `spawn` method, which imports your main script in it: in a script (unlike in Jupyter), put the code that creates actors under `if __name__ == "__main__":`, as in the DejaQueue example above.
 
 ### Example: Using `Actor` directly
 
@@ -117,20 +120,41 @@ print(greeter.greet())  # "Hello, Alice!"
 greeter.close()
 ```
 
+Use `with Actor(Counter) as counter:` to close it automatically. An actor is also stopped when the `Actor` object is garbage-collected, and when your program exits. On stopping, the remote object's `close()` method is called, if it has one (the process is terminated if it has not ended after 10 s, see `close(timeout=...)`).
+
 ### Features
 
-- **Remote method calls:** Call methods as if the object was local.
-- **Remote attribute access:** Get/set attributes of the remote object.
-- **Async support:** Call `method_async()` to get a `Future` for non-blocking calls.
-- **Zero-copy fast path:** Pass `deepcopy=False` to skip the default deep-copy of numpy array arguments (e.g. `actor.process(arr, deepcopy=False)`). The remote method then operates on numpy arrays viewing shared memory directly — they are only valid for the duration of the call. **Do not** store them (`self.foo = arr`), return them, hand them to async/background work, or otherwise retain a reference: the underlying buffer is reused by the queue once the call returns and any retained view will be silently overwritten. If you need to keep the data, call `arr.copy()` first. A `RuntimeWarning` is emitted if a retained reference is detected.
+- **Remote method calls:** Call methods as if the object was local. Exceptions raised by the remote method are raised again in your process, with the same type (and the remote traceback attached).
+- **Remote attribute access:** Get and set attributes of the remote object (`counter.value`, `counter.value = 5`).
+- **Async calls:** `counter.increment_async(5)` returns a `Future` (`.result()` waits for the value). `counter.increment(5, noreply=True)` does not wait at all (the result is discarded).
+- **Timeouts:** `counter.get(timeout=2)` raises `TimeoutError` if there is no result within 2 s. If the actor's process has ended (it crashed or was closed), calls raise `dejaq.remote.RemoteError` instead of waiting.
+- **Threads and worker processes:** An actor can be used from several threads, and passed to other processes (e.g. as an argument of a `Parallel` function).
+- **Zero-copy fast path:** Pass `deepcopy=False` to skip the default copy of numpy array arguments (e.g. `actor.process(arr, deepcopy=False)`). The method then reads the arrays directly in shared memory, which is only valid during the call: copy anything you want to keep (`self.last = arr.copy()`); returning a result computed from them is fine. A `RuntimeWarning` is shown if a method keeps a reference.
 - **Tab completion:** Works in Jupyter and most IDEs.
 
+### Running a function in worker processes: `RemoteFunc`
+
+```python
+from dejaq import RemoteFunc
+
+def square(x):
+    return x * x
+
+with RemoteFunc(square, workers=4) as rf:
+    print(rf(12))               # 144
+    print(rf.map(range(5)))     # [0, 1, 4, 9, 16]
+    print(rf.submit(7).result())  # 49
+```
+
+Notes:
+- Each process that uses an actor (or a `RemoteFunc`) gets a reply queue of `buffer_bytes` (default 10 MB) in shared memory. With many worker processes, choose a smaller `buffer_bytes` if the results are small.
+- Arguments must be importable by the actor's process. In a notebook, a class defined in the notebook cannot be passed to an actor; such a call waits until its `timeout` (an error is logged by the actor).
 
 
 ## dejaq.Parallel
 The following examples show how to use `dejaq.Parallel` to parallelize a function or a class, and how to create job pipelines.
 
-Here we execute a function and map iterable inputs across 10 workers. To enable pipelining, the results of each stage are provided as iterable generator. Use `.run()` (or `.compute()`) to get the final result as a list. Results are always ordered.
+Here we execute a function and map iterable inputs across 10 workers. To enable pipelining, the results of each stage are provided as iterable generator. Use `.run()` (or `.compute()`) to get the final result as a list. Results are in input order, unless you pass `ordered=False` (e.g. `Parallel(n_workers=10, ordered=False)`): then each result is returned as soon as it is ready, so that a slow item does not hold up the others.
 
 Workers are started with the `spawn` method, which imports your main script in each worker: in a script (unlike in Jupyter), put the code that starts pipelines under `if __name__ == "__main__":`.
 
@@ -150,7 +174,7 @@ result = stage.run() # or list(stage)
 result = Parallel(n_workers=10)(slow_function)(input_iterable).run()
 ```
 
-If a worker raises an exception, `run()` (or iterating) raises the same exception, with the worker's traceback as its cause; if a worker process dies, it raises `dejaq.parallel.WorkerError`. A stage's workers are stopped when that happens, when the stage is closed (`stage.close()` or a `with` block) or garbage-collected, and at exit. Leaving a loop early (`break`) does not stop them: iterating again continues with the next result.
+If a worker raises an exception, `run()` (or iterating) raises the same exception, with the worker's traceback as its cause; if a worker process dies, it raises `dejaq.parallel.WorkerError`. A stage's workers are stopped when that happens, when the stage is closed (`stage.close()` or a `with` block; this also closes the stages that feed it) or garbage-collected, and at exit. Leaving a loop early (`break`) does not stop them: iterating again continues with the next result.
 
 You can also use `Parallel` as a function decorator:
 ```python
@@ -207,6 +231,13 @@ result = stage3.run()
 # or:
 result = Consumer(1000)(Processor(10.0)(Producer(0.5)(input_iterable))).run()
 ```
+
+For large items such as camera frames (several MB each, at kHz rates), a few settings matter:
+- `buffer_bytes`: each stage's output queue. Make it at least about 10 times the item size, so that the stages can absorb each other's hiccups (a larger buffer does not make the steady state faster).
+- `zero_copy=True` (stages with `n_workers=1`, e.g. a writer): the function receives each item from the input stage without a copy, its numpy arrays viewing the queue's memory. They are valid only during the call: copy what you need to keep (e.g. a previous frame), but returning them is fine. Likewise, `for frame in stage.iter(zero_copy=True)` in the main process, where each item is valid until the next one is requested. Zero-copy arrays may be unaligned in memory (e.g. float64 data not at a multiple of 8 bytes), which makes some numpy operations slower; copy them where that matters or a library needs aligned data.
+- Each hop between processes copies an item once into a queue and once out of it, so fewer stages mean less copying; `tee` and `zip` copy each item only once. (Measured with 4 MB frames on CI runners: `zip` is 1.2-1.5x faster than with two copies on Windows and macOS, but 0.7x on Linux, for reasons not yet understood.)
+
+A stage's results can be split into several branches with `stage.tee(n)`, and stages can be combined with `dejaq.parallel.zip(stage_a, stage_b)` (which yields tuples). Like the stages themselves, both run in processes of their own, so the data does not pass through your main process. As with `itertools.tee`, consume the branches side by side: a branch that falls behind by more than its buffer holds makes the others wait.
 
 
 # See also

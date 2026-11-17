@@ -20,41 +20,38 @@ jobs:
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
         platform: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.12"]
-        include:
-          # free-threaded build: guards against Windows dependencies without cp314t wheels (e.g. pywin32)
-          - platform: windows-latest
-            python-version: "3.14t"
+        # oldest supported, 3.10, current, and the free-threaded build (also guards against dependencies
+        # without cp314t wheels, e.g. pywin32 on Windows)
+        python-version: ["3.8", "3.10", "3.12", "3.14t"]
 
     defaults:
       run:
-        shell: bash -l {0}
+        shell: bash  # (not a login shell: on macOS, that would put the system Python before the venv)
     steps:
       - uses: actions/checkout@v4
 
+      # uv provides all versions on all runners (setup-python no longer has 3.8 on current images)
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python-version }}
+          activate-environment: true
 
       # - name: Get cache key for current week and OS
       #   id: cachekey
       #   run: |
       #     echo "cache_key=${{ runner.os }}-${{ matrix.python-version }}-$(date +'%Y-%V')" >> $GITHUB_OUTPUT
 
-      - uses: conda-incubator/setup-miniconda@v4
-        with:
-          environment-name: tests
-      
       - name: Install dependencies
         run: |
-          pip install pytest
+          uv pip install pytest
 
       - name: Install package
         run: |
-          pip install -e .
+          uv pip install -e .
 
       - name: Check interpreter
         run: |
@@ -70,6 +67,9 @@ jobs:
           pytest -vv -s
         env:
           PLATFORM: ${{ matrix.platform }}
+          # free-threaded builds: posix_ipc does not declare free-threading support, so importing it re-enables
+          # the GIL with a warning, which would break the tests that expect a quiet stderr
+          PYTHONWARNINGS: "ignore:The global interpreter lock:RuntimeWarning"
 
       # after pytest has exited, so that cleanup at interpreter exit is included (Windows: objects disappear
       # with the processes holding them; tests/test_teardown.py checks that per object on all platforms)

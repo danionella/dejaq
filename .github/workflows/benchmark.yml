@@ -21,7 +21,7 @@ jobs:
   benchmark:
     name: ${{ matrix.platform }}
     runs-on: ${{ matrix.platform }}
-    timeout-minutes: 45
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -51,6 +51,10 @@ jobs:
       - name: Benchmark base vs head
         run: python head/benchmarks/ab_bench.py --rounds 5 base=base head=head --markdown bench.md
 
+      - name: Benchmark base vs head (dejaq.parallel pipelines)
+        if: always()
+        run: python head/benchmarks/ab_bench.py --suite pipeline --rounds 3 base=base head=head --markdown bench_pipeline.md
+
       - name: Report
         if: always()
         run: |
@@ -59,4 +63,7 @@ jobs:
             python -c "import os, platform; print(f'{platform.platform()}, {platform.machine()}, {os.cpu_count()} CPUs, Python {platform.python_version()}')"
             echo
             cat bench.md 2>/dev/null || echo "no results"
+            echo
+            echo "### dejaq.parallel pipelines"
+            cat bench_pipeline.md 2>/dev/null || echo "no results"
           } >> "$GITHUB_STEP_SUMMARY"
