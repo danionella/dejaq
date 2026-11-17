@@ -78,8 +78,9 @@ def test_an_idle_function_that_raises_does_not_kill_the_actor():
         _idle_timeout = 0.05
 
     with Actor(Idle) as a:
+        n = a.n_ticks()  # (the actor has started)
         time.sleep(0.5)
-        assert a.n_ticks() > 2
+        assert a.n_ticks() > n + 2
 
 
 def test_retention_warning_only_when_a_reference_is_kept():
