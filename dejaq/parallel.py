@@ -26,13 +26,13 @@ class _RemoteTraceback(Exception):
 class _WorkerException:
     """Queue item: an exception raised in a worker (as WorkerError if it cannot be passed on)."""
 
-    def __init__(self, exc: BaseException) -> None:
+    def __init__(self, exc: BaseException, fallback=None) -> None:
         self.tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         try:
             pickle.loads(_pickle_backend.dumps(exc, protocol=5))  # as the queue will pickle it
             self.exc = exc
         except Exception:
-            self.exc = WorkerError(f"{type(exc).__module__}.{type(exc).__qualname__}: {exc}")
+            self.exc = (fallback or WorkerError)(f"{type(exc).__module__}.{type(exc).__qualname__}: {exc}")
 
     def reraise(self):
         raise self.exc from _RemoteTraceback(self.tb)
