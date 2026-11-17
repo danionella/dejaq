@@ -234,10 +234,6 @@ def _gc_paused():
     finally:
         if enabled:
             gc.enable()
-            # A collection that fell due meanwhile would otherwise run at the next allocation, which may be
-            # inside someone else's tracker call (e.g. multiprocessing registering a new Lock): run it here.
-            if gc.get_count()[0] >= gc.get_threshold()[0]:
-                gc.collect(0)
 
 
 def _tracker(action: str, name: str, rtype: str) -> None:
