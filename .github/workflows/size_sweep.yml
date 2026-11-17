@@ -1,0 +1,41 @@
+# Transfer speed vs item size (DejaQueue vs multiprocessing.Queue) on Linux, Windows and macOS runners.
+# Started manually (Actions tab, "Run workflow"); the JSON and PNG of each runner are uploaded as artifacts.
+
+name: size sweep
+
+on:
+  workflow_dispatch:
+
+jobs:
+  sweep:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          activate-environment: true
+
+      - name: Install
+        run: uv pip install -e . matplotlib
+
+      - name: Sweep
+        run: |
+          label="${{ matrix.platform }} runner, $(python -c "import os, platform; print(f'{platform.machine()}, {os.cpu_count()} CPUs, Python {platform.python_version()}')")"
+          python benchmarks/size_sweep.py --out "size_sweep_${{ matrix.platform }}" --label "$label"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: size-sweep-${{ matrix.platform }}
+          path: size_sweep_${{ matrix.platform }}.*
