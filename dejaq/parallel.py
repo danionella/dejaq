@@ -121,6 +121,46 @@ def _exit_with_parent() -> None:
     threading.Thread(target=watch, name="dejaq-parent-watchdog", daemon=True).start()
 
 
+def _forwardable(it) -> bool:
+    """Whether a stage without a function can pass its input on with one copy (see _forward)."""
+    if isinstance(it, _Zipped):
+        return all(isinstance(x, lazymap) for x in it._iterables)
+    return isinstance(it, lazymap)
+
+
+def _forward(it, out_queue) -> None:
+    """Pass on the results of a stage (or tuples of the results of zipped stages) without a private copy: each
+    item is put into out_queue while it still views the source queue's memory (from inside get(callback=...)),
+    so its arrays are copied once, straight from queue to queue. Ends like zip(): at the end of any source."""
+    sources = it._iterables if isinstance(it, _Zipped) else [it]
+    for src in sources:
+        if src._start_type == "lazy":  # (as iterating it would)
+            src._start()
+    queues = [src._out_queue for src in sources]
+    zipped = isinstance(it, _Zipped)
+
+    def take(i, items):
+        def got(item):
+            kind = type(item)
+            if kind is _Stop:
+                return False
+            if kind is _WorkerException or kind is _WorkerDied:
+                out_queue.put(item)  # the consumer raises it
+                return False
+            items.append(item)
+            if i + 1 < len(queues):
+                return take(i + 1, items)
+            out_queue.put(tuple(items) if zipped else items[0])
+            return True
+        try:
+            return queues[i].get(callback=got)
+        except ShutDown:
+            raise RuntimeError("a stage feeding this one was closed") from None
+
+    while take(0, []):
+        pass
+
+
 def _put_stop(q) -> None:
     try:
         q.put(_Stop())
@@ -314,6 +354,17 @@ class lazymap:
             failure = _WorkerException(e)
         nxt = (pid + 1) % _n_workers
         in_sem[pid].acquire()  # the start signal
+        if failure is None and fcn is None and _n_workers == 1 and _forwardable(it):  # e.g. zip()
+            try:
+                _forward(it, _out_queue)
+            except BaseException as e:
+                try:
+                    _out_queue.put(_WorkerException(e))
+                except Exception:
+                    pass
+            _put_stop(_out_queue)
+            done[pid] = 1
+            return
         if failure is None:
             try:
                 iterator = iter(it)

@@ -342,3 +342,30 @@ def test_ticker_as_stage_input():
     assert isinstance(next(it), datetime.datetime)
     t.stop()
     assert list(it) == []
+
+
+# ---------- zip and pass-through stages forward with one copy ----------
+
+def test_zip_ends_with_the_shortest_input():
+    a = Parallel(n_workers=2)(add5)(range(10))
+    b = Parallel(n_workers=1)(ident)(range(4))
+    assert parallel.zip(a, b).run(progress=False) == [(5, 0), (6, 1), (7, 2), (8, 3)]
+
+
+def test_zip_input_error_is_raised():
+    a = Parallel(n_workers=1)(ident)(range(10))
+    b = Parallel(n_workers=2)(fails_at_3)(range(10))
+    with pytest.raises(ValueError, match="bad item 3"):
+        parallel.zip(a, b).run(progress=False)
+
+
+def test_zip_of_tee_branches_with_frames():
+    up = Parallel(n_workers=1, buffer_bytes=50e6)(big)(range(10))
+    a, b = up.tee(2)
+    out = Parallel(n_workers=2)(lambda ab: float(ab[0].sum() + ab[1].sum()))(parallel.zip(a, b)).run(progress=False)
+    assert out == [1_000_000.0] * 10
+
+
+def test_pass_through_stage():
+    up = Parallel(n_workers=2)(add5)(range(10))
+    assert lazymap(None, up).run(progress=False) == [i + 5 for i in range(10)]
