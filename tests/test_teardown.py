@@ -65,8 +65,9 @@ def queue_leftovers(base: str) -> list:
     """Names of all of the queue's OS objects that still exist."""
     st_name, buf_name, lock_names, sem_names = queues.NamedByteRing._names(base)
     left = [nm for nm in (st_name, buf_name) if _shm_exists(nm)]
-    left += [nm for nm in sem_names if _sem_exists(nm)]
-    left += [nm for nm in lock_names if _lock_exists(nm)]
+    left += [nm for nm in sem_names[1:] if _sem_exists(nm)]
+    # the state lock is a semaphore on POSIX, a mutex (like the put/get locks) on Windows
+    left += [nm for nm in lock_names + sem_names[:1] if (_lock_exists if _IS_WIN or nm in lock_names else _sem_exists)(nm)]
     return left
 
 

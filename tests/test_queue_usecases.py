@@ -234,8 +234,12 @@ def test_threads_share_one_queue():
 
 @pytest.mark.parametrize("length", [8, 27, 28, 29, 40])
 def test_named_queue_resources_are_distinct(length):
-    """User-chosen names: everything must stay distinct and fit macOS's ~30-byte POSIX name limits."""
+    """User-chosen names: everything must stay distinct; on macOS (~30-byte POSIX names) longer ones are refused."""
     name = ("q" + os.urandom(16).hex())[:length]
+    if sys.platform == "darwin" and length > 26:
+        with pytest.raises(ValueError, match="too long for macOS"):
+            DejaQueue(10_000, name=name)
+        return
     q = DejaQueue(10_000, name=name)
     sems = [q._put_lock, q._get_lock, q._state_lock, q._items, q._space_gate]
     assert len({s.name for s in sems}) == len(sems), [s.name for s in sems]

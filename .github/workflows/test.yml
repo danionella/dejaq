@@ -45,10 +45,6 @@ jobs:
       #   run: |
       #     echo "cache_key=${{ runner.os }}-${{ matrix.python-version }}-$(date +'%Y-%V')" >> $GITHUB_OUTPUT
 
-      - uses: conda-incubator/setup-miniconda@v4
-        with:
-          environment-name: tests
-      
       - name: Install dependencies
         run: |
           uv pip install pytest
@@ -71,6 +67,9 @@ jobs:
           pytest -vv -s
         env:
           PLATFORM: ${{ matrix.platform }}
+          # free-threaded builds: posix_ipc does not declare free-threading support, so importing it re-enables
+          # the GIL with a warning, which would break the tests that expect a quiet stderr
+          PYTHONWARNINGS: "ignore:The global interpreter lock:RuntimeWarning"
 
       # after pytest has exited, so that cleanup at interpreter exit is included (Windows: objects disappear
       # with the processes holding them; tests/test_teardown.py checks that per object on all platforms)
