@@ -266,7 +266,8 @@ def test_7_worker_process_sends_queued_tracker_calls(tmp_path, start_method):
 # ---------- 8: forked children do not send the parent's queued calls ----------
 
 _FORK_WITH_QUEUED_CALLS = """
-import gc, os
+import gc, os, warnings
+warnings.filterwarnings("ignore", "This process .* is multi-threaded", DeprecationWarning)  # (e.g. numpy's BLAS threads)
 from dejaq.queues import NamedSemaphore
 s = NamedSemaphore()
 s.cycle = s
