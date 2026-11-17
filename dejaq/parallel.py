@@ -94,17 +94,33 @@ _PARENT_CHECK_INTERVAL = 0.5
 _STOP_GRACE = 0.1  # seconds that close() gives workers to end by themselves after their queue was shut down
 
 
-def _exit_with_parent() -> None:
-    """In a worker: exit once the parent process is gone.
+_me = None
+
+
+def _identity():
+    """(pid, start time) of this process, for its workers' watchdog (see _exit_with_parent)."""
+    global _me
+    if _me is None or _me[0] != os.getpid():
+        _me = (os.getpid(), psutil.Process().create_time())
+    return _me
+
+
+def _exit_with_parent(parent) -> None:
+    """In a worker: exit once the parent process (pid, start time) is gone.
 
     Stopping a worker (terminate) skips its cleanup, and a parent that crashes (or a Jupyter kernel that is
     killed) leaves its workers blocked on a queue. Either way, processes would be left running. With this
     watchdog they exit, and in turn their own child processes, e.g. those of a stage created in a worker.
+    The parent is identified by the creating process (not os.getppid() at this point: a worker that is still
+    starting when its parent dies would otherwise watch the process that adopted it).
     """
-    ppid = os.getppid()
+    ppid, started = parent
     try:
-        parent = psutil.Process(ppid)
+        proc = psutil.Process(ppid)
+        alive = proc.create_time() == started and proc.status() != psutil.STATUS_ZOMBIE
     except psutil.Error:
+        alive = False
+    if not alive:
         os._exit(1)
 
     def watch():
@@ -113,7 +129,7 @@ def _exit_with_parent() -> None:
             try:
                 # POSIX: an orphan is adopted by another process (also while its dead parent is a zombie);
                 # Windows: the parent is no longer running (is_running also detects pid reuse)
-                gone = os.getppid() != ppid or not parent.is_running()
+                gone = os.getppid() != ppid or not proc.is_running()
             except Exception:
                 gone = True
             if gone:
@@ -329,7 +345,7 @@ class lazymap:
         # workers blocked on a full queue).
         self._finalizer = _mp_util.Finalize(self, _stop_processes, args=(procs, self._procs_lock), exitpriority=10)
         for pid in range(n_workers):
-            p = ctx.Process(target=self._worker_fcn, args=(pid, *worker_args))
+            p = ctx.Process(target=self._worker_fcn, args=(_identity(), pid, *worker_args))
             p.start()
             procs.append(p)
         self.pids = [p.pid for p in procs]
@@ -427,7 +443,8 @@ class lazymap:
             raise
 
     @staticmethod
-    def _worker_fcn(*args):
+    def _worker_fcn(parent, *args):
+        _exit_with_parent(parent)
         try:
             lazymap._worker_body(*args)
         except ShutDown:  # the stage was closed
@@ -439,7 +456,6 @@ class lazymap:
         # to put results. A failure is passed on as a _WorkerException item, in this worker's turn, after which
         # the worker stops.
         read_in_turn = write_in_turn = ordered
-        _exit_with_parent()
         failure = None
         try:
             fcn, it, kwargs = cloudpickle.loads(pkl)
@@ -766,8 +782,8 @@ class Ticker(Startable):
     def __init__(self, emit_one=False):
         super().__init__(_ticks, emit_one=emit_one)
 
-def _tee_worker(pkl, queues, done):
-    _exit_with_parent()
+def _tee_worker(parent, pkl, queues, done):
+    _exit_with_parent(parent)
     live = list(queues)
 
     def forward(item):
@@ -817,7 +833,7 @@ class _Tee:
         self.buffer_bytes = buffer_bytes
         self.queues = [DejaQueue(buffer_bytes) for _ in range(n)]
         self.done = ctx.RawArray("b", 1)
-        self.proc = ctx.Process(target=_tee_worker, args=(cloudpickle.dumps(lzy), self.queues, self.done))
+        self.proc = ctx.Process(target=_tee_worker, args=(_identity(), cloudpickle.dumps(lzy), self.queues, self.done))
         self.proc.start()
         self.open_branches = set(range(n))
         self.lock = threading.Lock()

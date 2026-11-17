@@ -200,17 +200,20 @@ def big(x):
 
 if __name__ == "__main__":
     stage = Parallel(n_workers=2)(big)(range(100))  # blocks on its full queue
-    next(iter(stage))
+    if sys.argv[1] == "running":
+        next(iter(stage))
+    # else: the workers are probably still starting when this process is killed
     print("workers", *(stage.pids + stage._own_input.pids), flush=True)
     time.sleep(60)
 """
 
 
-def test_workers_exit_when_the_main_process_is_killed(tmp_path):
+@pytest.mark.parametrize("when", ["running", "starting"])
+def test_workers_exit_when_the_main_process_is_killed(tmp_path, when):
     script = tmp_path / "script.py"
     script.write_text(_PARENT_KILLED)
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [REPO_ROOT, os.environ.get("PYTHONPATH")])))
-    proc = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True, env=env)
+    proc = subprocess.Popen([sys.executable, str(script), when], stdout=subprocess.PIPE, text=True, env=env)
     try:
         line = proc.stdout.readline()
         assert line.startswith("workers"), line
