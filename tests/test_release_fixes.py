@@ -195,6 +195,7 @@ def test_unclosed_actors_are_closed_at_exit(tmp_path):
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs fork and the semaphore's value")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
 def test_two_waiters_do_not_both_take_a_dead_holders_state_lock_over():
     for _ in range(3):
         q = DejaQueue(100_000)
