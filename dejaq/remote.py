@@ -19,7 +19,6 @@ import time
 import warnings
 import weakref
 from collections import OrderedDict
-from dataclasses import dataclass
 from multiprocessing import util as _mp_util
 from types import ModuleType
 from typing import Any, Callable, Optional
@@ -45,22 +44,11 @@ class RemoteError(RuntimeError):
     """The remote process died or was closed, or raised an exception that could not be passed on."""
 
 
-@dataclass
-class _Req:
-    call_id: int
-    reply: Optional[str]  # name of the caller's mailbox, or None: no reply wanted
-    kind: str  # call, apply, getattr, setattr, resolve, dir, ping, shutdown
-    name: str
-    args: tuple
-    kwargs: dict
-    deepcopy: bool = True
-
-
-@dataclass
-class _Rep:
-    call_id: int
-    ok: bool
-    payload: Any  # the result, or a _WorkerException
+# Messages are plain tuples (they pickle 3x faster than dataclasses):
+#   request: (call_id, mailbox, kind, name, args, kwargs, deepcopy); mailbox: the caller's mailbox name, or None
+#     if no reply is wanted; kind: call, apply, getattr, setattr, resolve, dir, ping or shutdown
+#   reply: (call_id, ok, payload); payload: the result, or a _WorkerException
+_SHUTDOWN = (-1, None, "shutdown", "", (), {}, True)
 
 
 # ============================== servers ==============================
@@ -72,23 +60,25 @@ class _Replier:
     def __init__(self) -> None:
         self._open: "OrderedDict[str, DejaQueue]" = OrderedDict()
 
-    def __call__(self, msg: _Req, ok: bool, payload: Any) -> None:
-        if msg.reply is None:
+    def __call__(self, cid: int, mailbox: Optional[str], ok: bool, payload: Any) -> None:
+        if mailbox is None:
             return
         try:
-            q = self._open.pop(msg.reply, None) or DejaQueue(name=msg.reply, create=False)
-            self._open[msg.reply] = q
-            while len(self._open) > _KEEP_MAILBOXES:
-                self._open.popitem(last=False)[1].close()
-            rep = _Rep(msg.call_id, ok, payload)
+            q = self._open.get(mailbox)
+            if q is None:
+                q = self._open[mailbox] = DejaQueue(name=mailbox, create=False)
+                if len(self._open) > _KEEP_MAILBOXES:
+                    self._open.popitem(last=False)[1].close()
+            else:
+                self._open.move_to_end(mailbox)
             try:
-                q.put(rep, timeout=_REPLY_WAIT)
+                q.put((cid, ok, payload), timeout=_REPLY_WAIT)
             except (Full, ShutDown):
                 raise
             except Exception as e:  # e.g. the result cannot be pickled: send the error instead
-                q.put(_Rep(msg.call_id, False, _WorkerException(e, RemoteError)), timeout=_REPLY_WAIT)
+                q.put((cid, False, _WorkerException(e, RemoteError)), timeout=_REPLY_WAIT)
         except Exception as e:  # the client is gone, or does not read its mailbox
-            logger.warning(f"reply to call {msg.call_id} dropped: {e!r}")
+            logger.warning(f"reply to call {cid} dropped: {e!r}")
 
 
 def _static(obj, name: str):
@@ -96,6 +86,12 @@ def _static(obj, name: str):
         return inspect.getattr_static(obj, name)
     except AttributeError:
         return None
+
+
+def _own(obj, name: str):
+    """obj.name if set on the instance or its class (fast, and without __getattr__), else None."""
+    d = getattr(obj, "__dict__", None)
+    return d[name] if d is not None and name in d else getattr(type(obj), name, None)
 
 
 def _resolve(obj, name: str) -> dict:
@@ -128,49 +124,49 @@ def _actor_server(parent: int, pkl: bytes) -> None:
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
 
-    def handle(msg: _Req):
+    def handle(kind, name, args, kwargs, deep):
         if failed is not None:
             raise failed.exc
-        if msg.kind == "call":
-            args, kwargs = copy.deepcopy((msg.args, msg.kwargs)) if msg.deepcopy else (msg.args, msg.kwargs)
-            return getattr(obj, msg.name)(*args, **kwargs)
-        if msg.kind == "getattr":
-            return getattr(obj, msg.name)
-        if msg.kind == "setattr":
-            value = msg.kwargs["value"]
-            setattr(obj, msg.name, copy.deepcopy(value) if msg.deepcopy else value)
+        if kind == "call":
+            args, kwargs = copy.deepcopy((args, kwargs)) if deep else (args, kwargs)
+            return getattr(obj, name)(*args, **kwargs)
+        if kind == "getattr":
+            return getattr(obj, name)
+        if kind == "setattr":
+            setattr(obj, name, copy.deepcopy(kwargs["value"]) if deep else kwargs["value"])
             return True
-        if msg.kind == "resolve":
-            return _resolve(obj, msg.name)
-        if msg.kind == "dir":
+        if kind == "resolve":
+            return _resolve(obj, name)
+        if kind == "dir":
             return list(dict.fromkeys(dir(obj)))
-        if msg.kind == "ping":
+        if kind == "ping":
             return time.time()
-        raise ValueError(f"unknown request {msg.kind!r}")
+        raise ValueError(f"unknown request {kind!r}")
 
-    def dispatch(msg: _Req) -> bool:
+    def dispatch(msg) -> bool:
         # Runs inside req.get(callback=...): with deepcopy=False, the arguments' arrays view the request queue,
         # so the reply is sent before that memory is reused (a result that views an argument is then safe).
-        if msg.kind == "shutdown":
+        cid, mailbox, kind, name, args, kwargs, deep = msg
+        if kind == "shutdown":
             return False
-        bases = [] if msg.deepcopy else [a.base for a in (*msg.args, *msg.kwargs.values())
-                                          if isinstance(a, np.ndarray) and a.base is not None]
+        bases = [] if deep else [a.base for a in (*args, *kwargs.values())
+                                 if isinstance(a, np.ndarray) and a.base is not None]
         refs = [sys.getrefcount(b) for b in bases]
         try:
-            reply(msg, True, handle(msg))
+            reply(cid, mailbox, True, handle(kind, name, args, kwargs, deep))
         except BaseException as e:
-            reply(msg, False, _WorkerException(e, RemoteError))
+            reply(cid, mailbox, False, _WorkerException(e, RemoteError))
         if any(sys.getrefcount(b) > n for b, n in zip(bases, refs)):  # (views of an argument count, too)
-            warnings.warn(f"{msg.name!r} kept a reference to an argument passed with deepcopy=False: its "
+            warnings.warn(f"{name!r} kept a reference to an argument passed with deepcopy=False: its "
                           "memory is reused once the call returns (copy what you need to keep)", RuntimeWarning)
         return True
 
     while not stop.is_set():
         try:
-            if not req.get(timeout=_static(obj, "_idle_timeout"), callback=dispatch):
+            if not req.get(timeout=_own(obj, "_idle_timeout"), callback=dispatch):
                 break
         except Empty:
-            if _static(obj, "_idle_function"):
+            if _own(obj, "_idle_function"):
                 getattr(obj, obj._idle_function)()
         except Exception as e:  # a request that cannot be unpickled: its caller is unknown
             if not stop.is_set():  # (else a signal interrupted the wait)
@@ -195,14 +191,15 @@ def _func_worker(parent: int, fn_pkl: bytes, req_name: str) -> None:
         except Exception as e:  # a request that cannot be unpickled: its caller is unknown
             logger.error(f"request dropped: {e!r}")
             continue
-        if msg.kind == "shutdown":
+        cid, mailbox, kind, _, args, kwargs, _ = msg
+        if kind == "shutdown":
             break
         try:
             if failed is not None:
                 raise failed.exc
-            reply(msg, True, fn(*msg.args, **msg.kwargs))
+            reply(cid, mailbox, True, fn(*args, **kwargs))
         except BaseException as e:
-            reply(msg, False, _WorkerException(e, RemoteError))
+            reply(cid, mailbox, False, _WorkerException(e, RemoteError))
 
 
 # ============================== clients ==============================
@@ -236,13 +233,13 @@ class _Mailbox:
             self._cond.notify_all()
         if rep is None:
             return False
-        if rep.call_id in self._dropped:
-            self._dropped.discard(rep.call_id)
+        if rep[0] in self._dropped:
+            self._dropped.discard(rep[0])
         else:
-            self._got[rep.call_id] = rep
+            self._got[rep[0]] = rep
         return True
 
-    def wait(self, cid: int, deadline: Optional[float], alive: Callable[[], bool]) -> _Rep:
+    def wait(self, cid: int, deadline: Optional[float], alive: Callable[[], bool]) -> tuple:
         with self._cond:
             while cid not in self._got:
                 rem = _POLL if deadline is None else min(_POLL, deadline - time.monotonic())
@@ -275,16 +272,17 @@ class Future:
         return _unwrap(self._rep)
 
 
-def _unwrap(rep: _Rep):
-    if rep.ok:
-        return rep.payload
-    rep.payload.reraise()
+def _unwrap(rep: tuple):
+    _, ok, payload = rep
+    if ok:
+        return payload
+    payload.reraise()
 
 
 def _stop_servers(procs, req: DejaQueue, timeout: float = 1.0) -> None:
     for _ in procs:
         try:
-            req.put(_Req(-1, None, "shutdown", "", (), {}), timeout=0)
+            req.put(_SHUTDOWN, timeout=0)
         except Exception:
             break  # (stopped below anyway)
     _stop_processes(procs, grace=timeout)
@@ -334,7 +332,7 @@ class _Client:
         if self._closed:
             raise RemoteError("closed")
         cid = next(_ids)
-        msg = _Req(cid, self._mbox.name if reply else None, kind, name, args, kwargs, deepcopy)
+        msg = (cid, self._mbox.name if reply else None, kind, name, args, kwargs, deepcopy)
         while True:
             rem = 0.05 if deadline is None else min(0.05, deadline - time.monotonic())
             try:
