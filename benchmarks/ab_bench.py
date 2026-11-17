@@ -287,7 +287,91 @@ PIPELINE_CASES = [
     ("4MB frames: zip(camera, camera) -> zero-copy sink", "pairs/s", True, lambda: _frames("zip", True)),
 ]
 
-SUITES = {"queue": CASES, "pipeline": PIPELINE_CASES}
+# ------------------------------------------------------------------------------------------ remote
+# Per-call cost of dejaq.remote (Actor, RemoteFunc): small calls measure the overhead, 1 MB arrays the copies.
+
+
+class _Svc:
+    def __init__(self):
+        self.n = 0
+
+    def inc(self, k=1):
+        self.n += k
+        return self.n
+
+    def total(self, arr):
+        return int(arr[-1])
+
+
+def _square(x):
+    return x * x
+
+
+def _per_call(fn, n):
+    for _ in range(n // 10):
+        fn()
+    t0 = time.perf_counter()
+    for _ in range(n):
+        fn()
+    return (time.perf_counter() - t0) / n * 1e6
+
+
+def _actor_case(kind):
+    import numpy as np
+    from dejaq import Actor
+
+    a = Actor(_Svc)
+    try:
+        a.inc()  # started, method resolved
+        if kind == "call":
+            return _per_call(a.inc, 5_000)
+        if kind == "noreply":
+            n = 20_000
+            t0 = time.perf_counter()
+            for _ in range(n):
+                a.inc(noreply=True)
+            a.inc()  # all processed
+            return n / (time.perf_counter() - t0)
+        if kind == "async":
+            n = 1_000  # (within what the queues hold: dejaq <= 0.8 deadlocks beyond)
+            t0 = time.perf_counter()
+            futs = [a.inc_async() for _ in range(n)]
+            for f in futs:
+                f.result()
+            return n / (time.perf_counter() - t0)
+        arr = np.ones(2**20 // 8)
+        return _per_call(lambda: a.total(arr, deepcopy=(kind == "1MB copy")), 1_000)
+    finally:
+        a.close()
+
+
+def _remotefunc_case(kind):
+    from dejaq import RemoteFunc
+
+    rf = RemoteFunc(_square, workers=2)
+    try:
+        rf(1)
+        if kind == "call":
+            return _per_call(lambda: rf(3), 5_000)
+        n = 1_000  # (dejaq <= 0.8 deadlocks beyond what the queues hold)
+        t0 = time.perf_counter()
+        rf.map(range(n))
+        return n / (time.perf_counter() - t0)
+    finally:
+        rf.close()
+
+
+REMOTE_CASES = [
+    ("actor call, small", "us", False, lambda: _actor_case("call")),
+    ("actor call, noreply", "calls/s", True, lambda: _actor_case("noreply")),
+    ("actor _async calls, pipelined", "calls/s", True, lambda: _actor_case("async")),
+    ("actor call, 1MB array (deepcopy)", "us", False, lambda: _actor_case("1MB copy")),
+    ("actor call, 1MB array (deepcopy=False)", "us", False, lambda: _actor_case("1MB zero-copy")),
+    ("RemoteFunc call, small", "us", False, lambda: _remotefunc_case("call")),
+    ("RemoteFunc map, 2 workers", "items/s", True, lambda: _remotefunc_case("map")),
+]
+
+SUITES = {"queue": CASES, "pipeline": PIPELINE_CASES, "remote": REMOTE_CASES}
 
 # ------------------------------------------------------------------------------------------ reporting
 

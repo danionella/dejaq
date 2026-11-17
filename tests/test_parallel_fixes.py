@@ -12,40 +12,11 @@ import textwrap
 import time
 
 import numpy as np
-import psutil
 import pytest
 
 from dejaq import Parallel, parallel
 from dejaq.parallel import WorkerError, lazymap
-
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def _run_script(tmp_path, code, timeout=60):
-    script = tmp_path / "script.py"
-    script.write_text(code)
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [REPO_ROOT, os.environ.get("PYTHONPATH")])))
-    try:
-        return subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=timeout, env=env)
-    except subprocess.TimeoutExpired:
-        pytest.fail(f"the program did not finish within {timeout} s (hang)")
-
-
-def _all_gone(pids, timeout=10.0):
-    """True once none of the processes is running any more (zombies count as gone)."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        alive = []
-        for pid in pids:
-            try:
-                if psutil.Process(pid).status() != psutil.STATUS_ZOMBIE:
-                    alive.append(pid)
-            except psutil.NoSuchProcess:
-                pass
-        if not alive:
-            return True
-        time.sleep(0.1)
-    return False
+from _testutil import REPO_ROOT, all_gone, run_script
 
 
 def _stage_pids(stage):
@@ -86,7 +57,7 @@ def test_1_readme_examples_run(tmp_path):
         + textwrap.indent(_readme_parallel_code(), "    ")
         + "\n    print('ok')\n"
     )
-    r = _run_script(tmp_path, code, timeout=120)
+    r = run_script(tmp_path, code, timeout=120)
     assert r.returncode == 0 and r.stdout.strip().endswith("ok"), r.stderr[-3000:]
 
 
@@ -99,7 +70,7 @@ def test_2_leaving_a_loop_early_and_iterating_again_continues():
     assert x == 5
     assert list(stage) == [6, 7, 8, 9, 10, 11, 12, 13, 14]
     stage.close()
-    assert _all_gone(_stage_pids(stage))
+    assert all_gone(_stage_pids(stage))
 
 
 def test_2_iterating_a_closed_stage_raises():
@@ -126,7 +97,7 @@ def test_2_garbage_collected_stage_stops_its_workers():
     pids = _stage_pids(stage)
     del stage
     gc.collect()
-    assert _all_gone(pids)
+    assert all_gone(pids)
 
 
 _EARLY_EXIT = """
@@ -152,7 +123,7 @@ if __name__ == "__main__":
 
 def test_2_program_exits_after_leaving_early(tmp_path):
     """Formerly the interpreter waited forever at exit for workers blocked on a full queue."""
-    r = _run_script(tmp_path, _EARLY_EXIT)
+    r = run_script(tmp_path, _EARLY_EXIT)
     assert r.returncode == 0 and "exiting" in r.stdout, r.stderr[-3000:]
 
 
@@ -209,7 +180,7 @@ def test_4_worker_exception_keeps_its_type_and_traceback():
     with pytest.raises(ValueError, match="bad item 3") as info:
         stage.run(progress=False)
     assert "fails_at_3" in str(info.value.__cause__)  # the worker's traceback
-    assert _all_gone(_stage_pids(stage))  # the stage was stopped
+    assert all_gone(_stage_pids(stage))  # the stage was stopped
 
 
 def test_4_exception_from_an_upstream_stage_reaches_the_end():
@@ -269,10 +240,10 @@ def test_5_close_and_context_manager():
     next(iter(stage))
     stage.close()
     stage.close()  # again: no error
-    assert _all_gone(_stage_pids(stage))
+    assert all_gone(_stage_pids(stage))
     with Parallel(n_workers=2)(add5)(range(3)) as stage2:
         assert stage2.run(progress=False) == [5, 6, 7]
-    assert _all_gone(_stage_pids(stage2))
+    assert all_gone(_stage_pids(stage2))
 
 
 def pair_sum(pair):

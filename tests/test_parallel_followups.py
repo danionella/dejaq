@@ -6,43 +6,11 @@ import sys
 import time
 
 import numpy as np
-import psutil
 import pytest
 
 from dejaq import Parallel, parallel
 from dejaq.parallel import lazymap
-
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def _run_script(tmp_path, code, timeout=60):
-    script = tmp_path / "script.py"
-    script.write_text(code)
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [REPO_ROOT, os.environ.get("PYTHONPATH")])))
-    try:
-        return subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=timeout, env=env)
-    except subprocess.TimeoutExpired:
-        pytest.fail(f"the program did not finish within {timeout} s (hang)")
-
-
-def _alive(pids):
-    n = 0
-    for pid in pids:
-        try:
-            if psutil.Process(pid).status() != psutil.STATUS_ZOMBIE:
-                n += 1
-        except psutil.NoSuchProcess:
-            pass
-    return n
-
-
-def _all_gone(pids, timeout=10.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not _alive(pids):
-            return True
-        time.sleep(0.1)
-    return False
+from _testutil import REPO_ROOT, all_gone, run_script
 
 
 def _remove_lock_files_of_killed_creators(output):
@@ -128,7 +96,7 @@ def test_tee_closing_one_branch_keeps_the_others_going():
     a.close()
     assert len(list(b)) == 20  # would block once a's queue is full if a were still served
     b.close()
-    assert _all_gone(up.pids + up._it.pids + a.pids)
+    assert all_gone(up.pids + up._it.pids + a.pids)
 
 
 def test_tee_garbage_collected_branches_stop_the_tee_and_the_stage():
@@ -140,7 +108,7 @@ def test_tee_garbage_collected_branches_stop_the_tee_and_the_stage():
     next(iter(a))
     del up, a, b
     gc.collect()
-    assert _all_gone(pids)
+    assert all_gone(pids)
 
 
 # ---------- closing a pipeline ----------
@@ -151,7 +119,7 @@ def test_closing_the_last_stage_closes_the_stages_that_feed_it():
     stage3 = Parallel(n_workers=1)(ident)(stage2)
     next(iter(stage3))
     stage3.close()
-    assert _all_gone(stage1.pids + stage1._it.pids + stage2.pids + stage3.pids)
+    assert all_gone(stage1.pids + stage1._it.pids + stage2.pids + stage3.pids)
     with pytest.raises(RuntimeError, match="closed"):
         list(stage1)
 
@@ -161,7 +129,7 @@ def test_an_error_closes_the_whole_pipeline():
     stage2 = Parallel(n_workers=2)(ident)(stage1)
     with pytest.raises(ValueError):
         stage2.run(progress=False)
-    assert _all_gone(stage1.pids + stage1._it.pids + stage2.pids)
+    assert all_gone(stage1.pids + stage1._it.pids + stage2.pids)
 
 
 def test_closing_a_zip_closes_its_inputs():
@@ -170,7 +138,7 @@ def test_closing_a_zip_closes_its_inputs():
     z = parallel.zip(a, b)
     next(iter(z))
     z.close()
-    assert _all_gone(a.pids + a._it.pids + b.pids + z.pids)
+    assert all_gone(a.pids + a._it.pids + b.pids + z.pids)
 
 
 # ---------- processes left behind ----------
@@ -201,10 +169,10 @@ if __name__ == "__main__":
 
 def test_closing_a_stage_also_ends_the_processes_its_workers_started(tmp_path):
     code = _NESTED.replace("    it = iter(stage)\n", "    it = iter(stage)\n    time.sleep(5)\n")
-    r = _run_script(tmp_path, code)
+    r = run_script(tmp_path, code)
     line = [ln for ln in r.stdout.splitlines() if ln.startswith("grandchildren")]
     assert line, (r.stdout, r.stderr[-3000:])
-    assert _all_gone([int(p) for p in line[0].split()[1:]], timeout=5)
+    assert all_gone([int(p) for p in line[0].split()[1:]], timeout=5)
     _remove_lock_files_of_killed_creators(r.stdout)
 
 
@@ -240,7 +208,7 @@ def test_workers_exit_when_the_main_process_is_killed(tmp_path, when):
         pids = [int(p) for p in line.split()[1:]]
         proc.kill()  # e.g. a crash, or a Jupyter kernel that is killed
         proc.wait(10)
-        assert _all_gone(pids, timeout=10)
+        assert all_gone(pids, timeout=10)
     finally:
         proc.kill()
         _remove_lock_files_of_killed_creators(names if "names" in locals() else "")
@@ -272,7 +240,7 @@ def test_workers_are_stopped_if_starting_them_fails(monkeypatch):
     with pytest.raises(OSError):
         lazymap(add5, upstream, n_workers=2)
     gc.collect()
-    assert len(_started) == 1 and _all_gone(_started)
+    assert len(_started) == 1 and all_gone(_started)
 
 
 # ---------- ordered=False ----------
@@ -483,6 +451,6 @@ if __name__ == "__main__":
 
 
 def test_closing_busy_pipelines_never_hangs(tmp_path):
-    r = _run_script(tmp_path, _CLOSE_STRESS, timeout=120)
+    r = run_script(tmp_path, _CLOSE_STRESS, timeout=120)
     assert r.returncode == 0 and "ok" in r.stdout, r.stderr[-3000:]
     assert "Traceback" not in r.stderr, r.stderr[-3000:]  # workers end quietly when their stage is closed

@@ -5,8 +5,6 @@
 
 import gc
 import os
-import subprocess
-import sys
 import threading
 import weakref
 
@@ -15,18 +13,9 @@ import pytest
 
 from dejaq import queues
 from dejaq.queues import _IS_WIN, DejaQueue, ShutDown
+from _testutil import run_script
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _POSIX_ONLY = pytest.mark.skipif(_IS_WIN, reason="no resource tracker on Windows")
-
-
-def _run_script(tmp_path, code, *args, timeout=60):
-    """Run code as a script file (needed for the spawn start method), in a fresh interpreter."""
-    script = tmp_path / "script.py"
-    script.write_text(code)
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [REPO_ROOT, os.environ.get("PYTHONPATH")])))
-    return subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True,
-                          timeout=timeout, env=env)
 
 
 # ---------- 1: a put in progress during shutdown() ----------
@@ -91,7 +80,7 @@ print(os.read(r, 1).decode())
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 def test_2_forked_child_never_shares_the_lock_of_an_unlinked_queue(tmp_path):
-    r = _run_script(tmp_path, _FORK_AFTER_UNLINK)
+    r = run_script(tmp_path, _FORK_AFTER_UNLINK)
     assert r.returncode == 0, r.stderr
     result = r.stdout.strip()
     assert result == "E", "the child must refuse, not share the lock its parent holds"
@@ -269,7 +258,7 @@ if __name__ == "__main__":
 def test_7_worker_process_sends_queued_tracker_calls(tmp_path, start_method):
     """Formerly a multiprocessing worker exited (os._exit) with its queued "unregister" unsent: at exit the
     tracker reported a leaked semaphore."""
-    r = _run_script(tmp_path, _WORKER_FINALIZES_IN_GC, start_method)
+    r = run_script(tmp_path, _WORKER_FINALIZES_IN_GC, start_method)
     assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr
     assert r.stderr.strip() == "", r.stderr
 
@@ -298,7 +287,7 @@ print("ok")
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 def test_8_forked_child_does_not_resend_the_parents_queued_calls(tmp_path):
     """Formerly both parent and child sent the same "unregister": the tracker printed a KeyError."""
-    r = _run_script(tmp_path, _FORK_WITH_QUEUED_CALLS)
+    r = run_script(tmp_path, _FORK_WITH_QUEUED_CALLS)
     assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr
     assert r.stderr.strip() == "", r.stderr
 
@@ -326,7 +315,7 @@ def test_9_recreated_queue_is_still_cleaned_up_after_a_crash(tmp_path):
     from test_teardown import _IS_MAC, _wait_for_no_leftovers, queue_leftovers
 
     name = "dq_test_" + os.urandom(5).hex()
-    r = _run_script(tmp_path, _RECREATE_THEN_CRASH, name)
+    r = run_script(tmp_path, _RECREATE_THEN_CRASH, name)
     assert "created" in r.stdout, r.stderr
     _, _, lock_names, _ = queues.NamedByteRing._names(name)
     allowed = set(lock_names) if _IS_MAC else set()  # macOS keeps a crashed creator's lock files
@@ -354,7 +343,7 @@ except ValueError:
 @_POSIX_ONLY
 def test_10_failed_creation_leaves_no_stale_registration(tmp_path):
     """Formerly the cleanup removed the state segment without unregistering it: warnings at exit."""
-    r = _run_script(tmp_path, _FAILED_PERSISTENT_CREATE)
+    r = run_script(tmp_path, _FAILED_PERSISTENT_CREATE)
     assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr
     assert r.stderr.strip() == "", r.stderr
 
