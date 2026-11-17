@@ -45,18 +45,30 @@ def produce(queue):
         print(f'produced {type(arr)} {arr.shape} {arr.dtype}; meta: {i}; hash: {hash(arr.tobytes())}\n', flush=True)
 
 def consume(queue, pid):
-    while True:
-        data = queue.get()
+    for data in queue:  # until the queue is shut down and empty
         array, i = data['array'], data['i']
         print(f'consumer {pid} consumed {type(array)} {array.shape} {array.dtype}; index: {i}; hash: {hash(array.tobytes())}\n', flush=True)
 
-queue = DejaQueue(buffer_bytes=100e6)
-producer = Process(target=produce, args=(queue,))
-consumers = [Process(target=consume, args=(queue, pid)) for pid in range(3)]
-for c in consumers:
-    c.start()
-producer.start()
+if __name__ == "__main__":
+    queue = DejaQueue(buffer_bytes=100e6)
+    producer = Process(target=produce, args=(queue,))
+    consumers = [Process(target=consume, args=(queue, pid)) for pid in range(3)]
+    for c in consumers:
+        c.start()
+    producer.start()
+    producer.join()
+    queue.shutdown()  # consumers finish the remaining items, then stop
+    for c in consumers:
+        c.join()
 ```
+
+`DejaQueue` follows the interface of `queue.Queue` / `multiprocessing.Queue`:
+- `put(obj, block=True, timeout=None)`, `get(block=True, timeout=None)`, `put_nowait(obj)`, `get_nowait()`, `qsize()`, `empty()`, `full()`
+- `shutdown(immediate=False)` (as in Python 3.13): afterwards `put()` raises `ShutDown`, and `get()` returns the remaining items and then raises `ShutDown`; this applies to all processes using the queue, and iterating over a queue ends there. With `immediate=True`, remaining items are dropped.
+- Exceptions: `dejaq.Empty`, `dejaq.Full`, `dejaq.ShutDown`, which are also `queue.Empty`, `queue.Full` (both also `TimeoutError`) and, on Python ≥ 3.13, `queue.ShutDown`
+- Additionally: `get(peek_only=True)` reads an item without removing it, and `get(callback=fn)` calls `fn` on the item while its numpy arrays still view the shared memory (zero-copy; `fn` must not keep references to them)
+- A queue object can be pickled and passed to other processes, including independently started ones (`DejaQueue(name=..., create=False)` attaches by name). It is removed once the creating object is garbage-collected, unless created with `auto_unlink=False`. It can also be used as a context manager.
+- It keeps working when a process using it dies, even while putting or getting an item.
 
 ## dejaq.Actor and ActorDecorator
 

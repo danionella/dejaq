@@ -10,7 +10,6 @@ import multiprocessing as mp
 import numpy as np
 import pytest
 
-from dejaq import queues
 from dejaq.queues import _IS_WIN, DejaQueue
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -211,47 +210,7 @@ def test_auto_unlink_false_outlives_the_creating_process():
         DejaQueue(name=name, create=False)
 
 
-_CRASHING_CHILD = """
-import os, signal
-from dejaq.queues import DejaQueue
-q = DejaQueue(4096, name=NAME)
-q.put("x")
-print("created", flush=True)
-os.kill(os.getpid(), signal.SIGKILL)
-"""
-
-
-@pytest.mark.skipif(_IS_WIN, reason="Windows removes kernel objects with their last handle")
-def test_crashed_creator_leaves_nothing_behind():
-    """The resource tracker removes shared memory, semaphores and (on Linux) lock files of a crashed creator."""
-    import posix_ipc
-
-    name = "dq_test_" + os.urandom(5).hex()
-    r = _run_python(_CRASHING_CHILD.replace("NAME", repr(name)))
-    assert "created" in r.stdout, r.stderr
-    _, _, lock_names, sem_names = queues.NamedByteRing._names(name)
-
-    def leftovers():
-        left = []
-        try:
-            DejaQueue(name=name, create=False)
-            left.append("shared memory")
-        except FileNotFoundError:
-            pass
-        for nm in sem_names:
-            try:
-                posix_ipc.Semaphore(queues._posix_name(nm)).close()
-                left.append(nm)
-            except posix_ipc.ExistentialError:
-                pass
-        if queues._LOCK_FILES_TRACKABLE:
-            left += [nm for nm in lock_names if os.path.exists(queues._RobustLock._path_for(nm))]
-        return left
-
-    deadline = time.monotonic() + 15
-    while leftovers() and time.monotonic() < deadline:
-        time.sleep(0.2)  # the tracker cleans up shortly after noticing the process is gone
-    assert leftovers() == []
+# Crashed creators: see tests/test_teardown.py::test_no_leftovers_after_crash (all platforms).
 
 
 _CLEAN_EXIT_CHILD = """
