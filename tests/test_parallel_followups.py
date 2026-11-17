@@ -45,6 +45,22 @@ def _all_gone(pids, timeout=10.0):
     return False
 
 
+def _remove_lock_files_of_killed_creators(output):
+    """macOS: the lock files of queues whose creating process was killed remain (empty files in /tmp; on Linux
+    the resource tracker removes them). The scripts print these queues' names as 'queues <name> ...'."""
+    if sys.platform != "darwin":
+        return
+    from dejaq import queues
+    for line in output.splitlines():
+        if line.startswith("queues"):
+            for base in line.split()[1:]:
+                for nm in queues.NamedByteRing._names(base)[2]:
+                    try:
+                        os.unlink(queues._RobustLock._path_for(nm))
+                    except FileNotFoundError:
+                        pass
+
+
 def add5(x):
     return x + 5
 
@@ -171,6 +187,7 @@ def outer(x):
     stage = Parallel(n_workers=2)(inner)(range(100))  # a stage created in a worker
     next(iter(stage))
     print("grandchildren", *stage.pids, flush=True)
+    print("queues", stage._out_queue._base, stage._own_input._out_queue._base, flush=True)
     time.sleep(60)
     return x
 
@@ -188,6 +205,7 @@ def test_closing_a_stage_also_ends_the_processes_its_workers_started(tmp_path):
     line = [ln for ln in r.stdout.splitlines() if ln.startswith("grandchildren")]
     assert line, (r.stdout, r.stderr[-3000:])
     assert _all_gone([int(p) for p in line[0].split()[1:]], timeout=5)
+    _remove_lock_files_of_killed_creators(r.stdout)
 
 
 _PARENT_KILLED = """
@@ -203,6 +221,7 @@ if __name__ == "__main__":
     if sys.argv[1] == "running":
         next(iter(stage))
     # else: the workers are probably still starting when this process is killed
+    print("queues", stage._out_queue._base, stage._own_input._out_queue._base, flush=True)
     print("workers", *(stage.pids + stage._own_input.pids), flush=True)
     time.sleep(60)
 """
@@ -215,6 +234,7 @@ def test_workers_exit_when_the_main_process_is_killed(tmp_path, when):
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [REPO_ROOT, os.environ.get("PYTHONPATH")])))
     proc = subprocess.Popen([sys.executable, str(script), when], stdout=subprocess.PIPE, text=True, env=env)
     try:
+        names = proc.stdout.readline()
         line = proc.stdout.readline()
         assert line.startswith("workers"), line
         pids = [int(p) for p in line.split()[1:]]
@@ -223,6 +243,7 @@ def test_workers_exit_when_the_main_process_is_killed(tmp_path, when):
         assert _all_gone(pids, timeout=10)
     finally:
         proc.kill()
+        _remove_lock_files_of_killed_creators(names if "names" in locals() else "")
 
 
 # ---------- small things ----------
