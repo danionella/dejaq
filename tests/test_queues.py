@@ -7,6 +7,9 @@ import time
 
 from dejaq.queues import LegacyDejaQueue, DejaQueue, NamedSemaphore
 
+# LegacyDejaQueue is deprecated, but still tested here until its removal
+pytestmark = pytest.mark.filterwarnings("ignore:LegacyDejaQueue is deprecated:DeprecationWarning")
+
 def sema_acquire(name, result_list):
     sem = NamedSemaphore(name=name, create=False)
     acquired = sem.acquire(timeout=2)
