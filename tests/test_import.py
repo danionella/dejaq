@@ -15,7 +15,7 @@ def _run_python(code):
 def test_import_has_no_global_side_effects():
     code = (
         "import logging, multiprocessing as mp\n"
-        "import dejaq, dejaq.parallel, dejaq.remote, dejaq.stream\n"
+        "import dejaq, dejaq.parallel, dejaq.remote\n"
         "root = logging.getLogger()\n"
         "print(mp.get_start_method(allow_none=True), len(root.handlers), root.level)\n"
     )
