@@ -858,10 +858,6 @@ def _pack_header(lens) -> bytes:
 _ON_FULL = ("block", "drop", "drop_oldest", "flush")
 
 
-def _discard(obj) -> None:
-    pass
-
-
 _MIN_ITEM_BYTES = 16 + len(pickle.dumps(None, protocol=5))  # header with one segment + the smallest pickle
 
 
@@ -1143,9 +1139,11 @@ class DejaQueue(NamedByteRing):
             timeout (float | None): Maximum time to wait for space. Default None (wait indefinitely).
             on_full (str): What to do if there is no space: "block" (default: wait as set by block and
                 timeout), "drop" (discard obj and return False), "drop_oldest" (discard the oldest items until
-                obj fits) or "flush" (discard all items). Discarded items are counted in `self.dropped`. The
-                last two take the consumers' lock, so they wait while a consumer reads an item (e.g. runs a
-                get() callback); a stop item put into the queue may be discarded, too: end with shutdown().
+                obj fits) or "flush" (discard all items). Discarded items are counted in `self.dropped` (of this
+                object only). The last two take the consumers' lock, so they wait while a consumer reads an
+                item (e.g. runs a get() callback; timeout does not limit this wait, and such a put must not
+                be made from a get() callback of the same queue); a stop item put into the queue may be
+                discarded, too: end with shutdown().
 
         Returns:
             True, or False if obj was discarded (on_full="drop").
@@ -1156,7 +1154,7 @@ class DejaQueue(NamedByteRing):
         """
         if block is not True:
             timeout = _wait_time(block, timeout, "put")
-        if on_full != "block" and on_full not in _ON_FULL:
+        if on_full not in _ON_FULL:
             raise ValueError(f"on_full must be one of {_ON_FULL}, not {on_full!r}")
         if self._state[3]:  # _CLOSED: refuse before pickling (checked again under the lock below)
             raise ShutDown("Queue is shut down.")
@@ -1229,12 +1227,10 @@ class DejaQueue(NamedByteRing):
                     head0, n = int(st[_HEAD]), int(st[_NITEMS])
                 if flush:
                     self._purge_locked()
-                else:  # as a get() would (it wakes waiting producers), without copying the item out
+                else:  # as a get() would (it wakes waiting producers), without unpickling the item
                     n = 1
-                    try:
-                        self._get_locked(head0, False, _discard, self._items.acquire(timeout=0))
-                    except Exception:  # (an item that cannot be unpickled is discarded all the same)
-                        pass
+                    self._items.acquire(timeout=0)  # (none if a waiting consumer is handing it back: spare)
+                    self._finish_get(head0, self._item_bytes(head0), True)
                 self.dropped += n
 
     def _cancel_space_wait(self) -> None:
@@ -1333,19 +1329,21 @@ class DejaQueue(NamedByteRing):
         """True if not even the smallest item fits (a larger item may not fit even when this is False)."""
         return self.bytes_free < _MIN_ITEM_BYTES
 
+    def _span(self, start: int, n: int) -> bytes:
+        """A copy of n bytes of the ring from position start (also across its end)."""
+        cap, buf, s = self.cap, self.buf.buf, start % self.cap
+        return bytes(buf[s : s + n]) if s + n <= cap else b"".join((buf[s:cap], buf[0 : n - (cap - s)]))
+
+    def _item_bytes(self, head0: int) -> int:
+        """Size of the item at head0 in the ring: its header (segment count K, K lengths) and segments."""
+        K = struct.unpack("<Q", self._span(head0, 8))[0]
+        return 8 + 8 * K + sum(struct.unpack(f"<{K}Q", self._span(head0 + 8, 8 * K)))
+
     def _get_locked(self, head0: int, peek_only: bool, callback, counted: bool = True):
         """Read the item at head0. Caller holds get_lock, and one count of _items if counted."""
         cap = self.cap
         buf = self.buf.buf
-
-        def _copy_span(start, n):
-            start %= cap
-            end = start + n
-            if end <= cap:
-                return bytes(buf[start:end])
-            first = cap - start
-            out = b"".join((buf[start:cap], buf[0 : n - first]))
-            return out
+        _copy_span = self._span
 
         def _private(start, n):
             """Writable private copy of a span (numpy-allocated: arrays built on it are writable and aligned)."""

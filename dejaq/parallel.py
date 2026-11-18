@@ -300,8 +300,11 @@ class lazymap:
         return len(self._it)
 
     def qsize(self) -> int:
-        """Number of results waiting in this stage's output queue (e.g. to see whether it keeps up)."""
-        return max(0, self._out_queue.qsize() - all(self._done))  # (once done, the queue holds the end marker)
+        """Number of results waiting in this stage's output queue (e.g. to see whether it keeps up; it may be
+        one too high while the stage finishes)."""
+        # without the end markers: one per worker of an ordered stage (or tee branch), one for an unordered stage
+        markers = sum(self._done) if getattr(self, "_finished", None) is None else all(self._done)
+        return max(0, self._out_queue.qsize() - markers)
 
     def __iter__(self):
         """ Returns an iterator over the results of fcn(item) for each item in it """
