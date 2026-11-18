@@ -299,6 +299,10 @@ class lazymap:
     def __len__(self):
         return len(self._it)
 
+    def qsize(self) -> int:
+        """Number of results waiting in this stage's output queue (e.g. to see whether it keeps up)."""
+        return max(0, self._out_queue.qsize() - all(self._done))  # (once done, the queue holds the end marker)
+
     def __iter__(self):
         """ Returns an iterator over the results of fcn(item) for each item in it """
         if self._closed:
