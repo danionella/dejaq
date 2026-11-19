@@ -1,8 +1,10 @@
 """actor.method.stream(queue): a running actor puts the method's results into a queue between calls."""
 
+import threading
 import time
 
 import numpy as np
+import psutil
 import pytest
 
 from dejaq import Actor, DejaQueue, Parallel, ShutDown
@@ -39,6 +41,11 @@ class FakeCamera:
 
     def make_frames(self, size):
         self.size = size
+
+    def grab_unpicklable(self):
+        time.sleep(0.001)
+        self.n += 1
+        return threading.Lock()  # (cannot be pickled)
 
 
 def test_frames_stream_in_order_and_calls_run_in_between():
@@ -165,3 +172,37 @@ def test_stream_is_checked():
         q.shutdown()
         with pytest.raises(ShutDown):
             cam.grab_frame.stream(q)
+
+
+def test_an_unpicklable_result_stops_streaming_but_not_the_actor():
+    q = DejaQueue(10 * 200_100)
+    cam = Actor(FakeCamera)
+    cam.grab_unpicklable.stream(q)
+    n = -1
+    while cam.count() != n:  # streaming stops after the first result
+        n = cam.count()
+        time.sleep(0.2)
+    assert n == 1 and cam.set_exposure(6.0) == 1
+    cam.close()
+
+
+def test_a_failed_stream_keeps_the_current_one():
+    q, closed = DejaQueue(10 * 200_100), DejaQueue(1_000_000)
+    closed.shutdown()
+    with Actor(FakeCamera) as cam:
+        cam.grab_frame.stream(q)
+        with pytest.raises(ShutDown):
+            cam.grab_frame.stream(closed)
+        q.purge()
+        q.get(timeout=30)  # still streaming into q
+    assert q.closed
+
+
+def test_the_stream_queue_is_shut_down_also_when_the_actor_is_killed():
+    q = DejaQueue(10 * 200_100)
+    cam = Actor(FakeCamera)
+    cam.grab_frame.stream(q)
+    q.get(timeout=30)
+    psutil.Process(cam._procs[0].pid).kill()
+    cam.close()
+    assert q.closed  # (by the client: a pipeline reading q finishes)

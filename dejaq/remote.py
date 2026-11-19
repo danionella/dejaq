@@ -13,6 +13,7 @@ import functools
 import inspect
 import itertools
 import logging
+import math
 import multiprocessing as mp
 import os
 import signal
@@ -159,13 +160,15 @@ def _actor_server(parent: int, pkl: bytes) -> None:
             return time.time()
         if kind == "stream":
             out, on_full, a, kw = args
-            stream.clear()
+            new = {}  # (checked before it replaces the current stream)
             if out is not None:
                 if out.is_shutdown:
                     raise ShutDown("stream(): the queue is shut down")
                 a, kw = copy.deepcopy((a, kw))  # (used again and again; arrays may view the request queue)
-                stream.update(call=functools.partial(getattr(obj, name), *a, **kw), name=name, out=out,
-                              on_full=on_full, at=0.0)
+                new = dict(call=functools.partial(getattr(obj, name), *a, **kw), name=name, out=out,
+                           on_full=on_full, at=0.0)
+            stream.clear()
+            stream.update(new)
             return None
         raise ValueError(f"unknown request {kind!r}")
 
@@ -211,11 +214,15 @@ def _actor_server(parent: int, pkl: bytes) -> None:
             stream["at"] = time.monotonic() + 1.0  # (retried, and logged, once a second)
             logger.error(f"streamed {stream['name']}() raised {e!r}")
             continue
+        except BaseException as e:  # e.g. SystemExit: stop streaming, but keep serving calls
+            logger.error(f"streaming {stream['name']}() stopped: {e!r}")
+            stream.clear()
+            continue
         stream["at"] = time.monotonic() + (0.01 if item is None else 0.0)  # (None: nothing now; do not spin)
         try:
             if item is not None:
                 stream["out"].put(item, on_full=stream["on_full"])
-        except (ShutDown, ValueError) as e:  # the queue was shut down, or the item is larger than the queue
+        except Exception as e:  # e.g. the queue was shut down, the item is larger than it, or cannot be pickled
             logger.warning(f"streaming {stream['name']}() stopped: {e!r}")
             stream.clear()
     if stream:  # the stream ends with the actor: its consumers finish
@@ -346,9 +353,10 @@ def _unwrap(rep: _Rep):
     rep.payload.reraise()
 
 
-def _stop_servers(procs, req: DejaQueue, timeout: float = 10.0) -> None:
+def _stop_servers(procs, req: DejaQueue, streams=(), timeout: float = 10.0) -> None:
     """Ask the servers to end (an actor's object is closed) and wait up to `timeout` s; terminate them if the
-    request cannot be sent (e.g. the request queue is full) or they do not end in time."""
+    request cannot be sent (e.g. the request queue is full) or they do not end in time. Then shut the queue of
+    an actor's current stream down (also if the actor had to be terminated), so its consumers finish."""
     for _ in procs:
         try:
             req.put(_Req(-1, None, "shutdown", "", (), {}), timeout=0)
@@ -357,6 +365,9 @@ def _stop_servers(procs, req: DejaQueue, timeout: float = 10.0) -> None:
             break
     _stop_processes(procs, grace=timeout)
     req.close()
+    for q in streams:
+        with contextlib.suppress(Exception):
+            q.shutdown()
 
 
 _mbox_lock = threading.Lock()
@@ -372,7 +383,8 @@ class _Client:
         self._req, self._procs, self._buffer_bytes = req, procs, int(buffer_bytes)
         self._servers = [(p.pid, psutil.Process(p.pid).create_time()) for p in procs]
         self._closed = False
-        self._finalizer = _mp_util.Finalize(self, _stop_servers, args=(procs, req), exitpriority=10)
+        self._streams = []  # the queue of an actor's current stream (see _RemoteMethod.stream)
+        self._finalizer = _mp_util.Finalize(self, _stop_servers, args=(procs, req, self._streams), exitpriority=10)
         atexit.register(self._finalizer)  # at exit before the queues are closed (atexit runs the latest first)
 
     @property
@@ -407,10 +419,14 @@ class _Client:
         cid = next(_ids)
         msg = _Req(cid, self._mbox.name if reply else None, kind, name, args, kwargs, deepcopy)
         if drop:  # (only for calls without a reply: no other request is touched)
+            self._req._drops_logged = (math.inf, 0)  # (dropped calls are expected here: no warning)
             if self._req.put(msg, on_full="drop"):
                 return cid
-            if not self._alive():
-                raise RemoteError("the remote process has exited (it died or was closed)")
+            now = time.monotonic()
+            if now - self.__dict__.get("_alive_at", 0.0) > _POLL:  # (a liveness check costs 0.03-1 ms)
+                self.__dict__["_alive_at"] = now
+                if not self._alive():
+                    raise RemoteError("the remote process has exited (it died or was closed)")
             return None
         while True:
             rem = 0.05 if deadline is None else min(0.05, deadline - time.monotonic())
@@ -437,7 +453,7 @@ class _Client:
             self._closed = True
             self._finalizer.cancel()
             atexit.unregister(self._finalizer)
-            _stop_servers(self._procs, self._req, timeout)
+            _stop_servers(self._procs, self._req, self._streams, timeout)
 
     def __enter__(self):
         return self
@@ -496,12 +512,17 @@ class _RemoteMethod:
         streaming, _idle_function is not called. An error is logged and the method retried once a second;
         streaming stops (with a log message) if the queue is shut down or a result does not fit into it.
         stream(None) stops streaming (on any method), a new stream() replaces the current one; neither shuts the
-        queue down, but stopping the actor does, so the queue's consumers finish. A queue that is shut down
-        already raises ShutDown."""
+        queue down, but stopping the actor does (also when close() has to terminate it; not if its process
+        crashes), so the queue's consumers finish. A queue that is shut down already raises ShutDown.
+
+        Dropped results are counted and logged in the actor's process (the caller's queue.dropped stays 0;
+        configure logging, if needed, in the class's __init__). Do not call the actor from a get() callback of
+        the stream's queue with on_full="drop_oldest" or "flush": the actor would wait for that get to finish."""
         if (queue is not None and not isinstance(queue, DejaQueue)) or on_full not in ("drop", "drop_oldest", "flush"):
             raise ValueError('stream(queue, ...) needs a DejaQueue (or None), and on_full "drop", "drop_oldest" '
                              'or "flush" (the actor must not wait for space: it serves calls between results)')
         self._actor._call("stream", self._name, (queue, on_full, args, kwargs))
+        self._actor._streams[:] = [] if queue is None else [queue]  # (shut down when the actor is stopped)
         return queue
 
     def send(self, *args, **kwargs) -> bool:

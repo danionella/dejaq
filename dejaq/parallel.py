@@ -304,7 +304,8 @@ class lazymap:
         """Number of results waiting in this stage's output queue (e.g. to see whether it keeps up; it may be
         one too high while the stage finishes)."""
         # without the end markers: one per worker of an ordered stage (or tee branch), one for an unordered stage
-        markers = sum(self._done) if getattr(self, "_finished", None) is None else all(self._done)
+        done = self.__dict__.get("_done") or ()  # (not in a pickled copy: then the end markers are counted)
+        markers = sum(done) if getattr(self, "_finished", None) is None else all(done) and bool(done)
         return max(0, self._out_queue.qsize() - markers)
 
     def __iter__(self):

@@ -52,3 +52,11 @@ def test_dropping_calls_to_a_dead_actor_raises():
         for _ in range(10):  # the queue fills up, then a dropped call finds the actor dead
             d.show(FRAME, noreply=True, on_full="drop")
     d.close()
+
+
+def test_dropped_calls_are_not_logged(caplog):
+    with Actor(Display, buffer_bytes=int(3.5 * FRAME.nbytes)) as d:
+        d.count()
+        with caplog.at_level("WARNING", logger="dejaq.queues"):
+            sent = [d.show(FRAME, noreply=True, on_full="drop") for _ in range(50)]
+        assert not all(sent) and "dropped" not in caplog.text
