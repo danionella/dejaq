@@ -127,7 +127,7 @@ Use `with Actor(Counter) as counter:` to close it automatically. An actor is als
 
 - **Remote method calls:** Call methods as if the object was local. Exceptions raised by the remote method are raised again in your process, with the same type (and the remote traceback attached).
 - **Remote attribute access:** Get and set attributes of the remote object (`counter.value`, `counter.value = 5`).
-- **Async calls:** `counter.increment_async(5)` returns a `Future` (`.result()` waits for the value). `counter.increment(5, noreply=True)` does not wait at all (the result is discarded).
+- **Async calls:** `counter.increment_async(5)` returns a `Future` (`.result()` waits for the value). `counter.increment(5, noreply=True)` does not wait at all (the result is discarded). With `noreply=True, on_full="drop"`, the call is skipped (and returns `False`) when the actor is too busy to take it, e.g. to send camera frames to a display actor without slowing the camera down.
 - **Timeouts:** `counter.get(timeout=2)` raises `TimeoutError` if there is no result within 2 s. If the actor's process has ended (it crashed or was closed), calls raise `dejaq.remote.RemoteError` instead of waiting.
 - **Threads and worker processes:** An actor can be used from several threads, and passed to other processes (e.g. as an argument of a `Parallel` function).
 - **Zero-copy fast path:** Pass `deepcopy=False` to skip the default copy of numpy array arguments (e.g. `actor.process(arr, deepcopy=False)`). The method then reads the arrays directly in shared memory, which is only valid during the call: copy anything you want to keep (`self.last = arr.copy()`); returning a result computed from them is fine. A `RuntimeWarning` is shown if a method keeps a reference.
