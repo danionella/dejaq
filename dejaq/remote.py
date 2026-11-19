@@ -355,8 +355,8 @@ def _unwrap(rep: _Rep):
 
 def _stop_servers(procs, req: DejaQueue, streams=(), timeout: float = 10.0) -> None:
     """Ask the servers to end (an actor's object is closed) and wait up to `timeout` s; terminate them if the
-    request cannot be sent (e.g. the request queue is full) or they do not end in time. Then shut the queue of
-    an actor's current stream down (also if the actor had to be terminated), so its consumers finish."""
+    request cannot be sent (e.g. the request queue is full) or they do not end in time. If an actor did not end
+    cleanly (terminated, crashed), shut the queue of its current stream down, so its consumers finish."""
     for _ in procs:
         try:
             req.put(_Req(-1, None, "shutdown", "", (), {}), timeout=0)
@@ -365,9 +365,10 @@ def _stop_servers(procs, req: DejaQueue, streams=(), timeout: float = 10.0) -> N
             break
     _stop_processes(procs, grace=timeout)
     req.close()
-    for q in streams:
-        with contextlib.suppress(Exception):
-            q.shutdown()
+    if any(p.exitcode != 0 for p in procs):  # (terminated or crashed: else the actor shut its stream down)
+        for q in streams:
+            with contextlib.suppress(Exception):
+                q.shutdown()
 
 
 _mbox_lock = threading.Lock()
@@ -463,7 +464,7 @@ class _Client:
 
     def __getstate__(self):
         state = dict(self.__dict__)
-        for k in ("_procs", "_finalizer", "_mb"):  # a copy never stops the servers, and gets its own mailbox
+        for k in ("_procs", "_finalizer", "_mb", "_streams"):  # a copy never stops the servers; own mailbox
             state.pop(k, None)
         return state
 
@@ -510,10 +511,13 @@ class _RemoteMethod:
         item). Calls are served between two results, and before them: so the method should return within a
         short time (e.g. a camera grab with a timeout), and a steady flood of calls holds the stream up. While
         streaming, _idle_function is not called. An error is logged and the method retried once a second;
-        streaming stops (with a log message) if the queue is shut down or a result does not fit into it.
+        streaming stops (with a log message) if a result cannot be put (the queue is shut down, the result does
+        not fit into it or cannot be pickled), or the method raises a BaseException such as SystemExit.
         stream(None) stops streaming (on any method), a new stream() replaces the current one; neither shuts the
-        queue down, but stopping the actor does (also when close() has to terminate it; not if its process
-        crashes), so the queue's consumers finish. A queue that is shut down already raises ShutDown.
+        queue down, but stopping the actor does (also when close() has to terminate it; if the actor's process
+        crashes, when this Actor object is closed or collected), so the queue's consumers finish. (This
+        fallback covers streams started through the Actor object that created the actor, not through copies
+        of it in other processes.) A queue that is shut down already raises ShutDown.
 
         Dropped results are counted and logged in the actor's process (the caller's queue.dropped stays 0;
         configure logging, if needed, in the class's __init__). Do not call the actor from a get() callback of
@@ -522,7 +526,9 @@ class _RemoteMethod:
             raise ValueError('stream(queue, ...) needs a DejaQueue (or None), and on_full "drop", "drop_oldest" '
                              'or "flush" (the actor must not wait for space: it serves calls between results)')
         self._actor._call("stream", self._name, (queue, on_full, args, kwargs))
-        self._actor._streams[:] = [] if queue is None else [queue]  # (shut down when the actor is stopped)
+        streams = self._actor.__dict__.get("_streams")  # (only the creating Actor object stops the actor)
+        if streams is not None:
+            streams[:] = [] if queue is None else [queue]
         return queue
 
     def send(self, *args, **kwargs) -> bool:

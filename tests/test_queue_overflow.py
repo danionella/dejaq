@@ -183,7 +183,6 @@ def test_dropped_items_are_logged_at_most_once_a_second(caplog):
 
 
 def test_stage_qsize_of_tee_branches_zip_and_copies():
-    import pickle
     from dejaq.parallel import zip as dzip
     a, b = Parallel(n_workers=1)(abs)(range(4)).tee(2)
     z = dzip(Parallel(n_workers=1)(abs)(range(4)), Parallel(n_workers=1)(abs)(range(4)))

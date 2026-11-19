@@ -178,11 +178,11 @@ def test_an_unpicklable_result_stops_streaming_but_not_the_actor():
     q = DejaQueue(10 * 200_100)
     cam = Actor(FakeCamera)
     cam.grab_unpicklable.stream(q)
-    n = -1
-    while cam.count() != n:  # streaming stops after the first result
-        n = cam.count()
-        time.sleep(0.2)
-    assert n == 1 and cam.set_exposure(6.0) == 1
+    deadline = time.monotonic() + 30
+    while cam.count() < 1 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.3)
+    assert cam.count() == 1 and cam.set_exposure(6.0) == 1  # (streaming stopped after the first result)
     cam.close()
 
 
@@ -206,3 +206,23 @@ def test_the_stream_queue_is_shut_down_also_when_the_actor_is_killed():
     psutil.Process(cam._procs[0].pid).kill()
     cam.close()
     assert q.closed  # (by the client: a pipeline reading q finishes)
+
+
+def test_an_actor_streaming_into_a_closed_queue_can_still_be_passed_on():
+    import pickle
+    with Actor(FakeCamera) as cam:
+        with DejaQueue(10 * 200_100) as q:
+            cam.grab_frame.stream(q)
+            q.get(timeout=30)
+        copy = pickle.loads(pickle.dumps(cam))  # (as when passed to a worker process)
+        assert copy.count() >= 1
+
+
+def test_a_stream_replaced_by_a_copy_is_not_shut_down_by_close():
+    import pickle
+    q1, q2 = DejaQueue(10 * 200_100), DejaQueue(10 * 200_100)
+    cam = Actor(FakeCamera)
+    cam.grab_frame.stream(q1)
+    pickle.loads(pickle.dumps(cam)).grab_frame.stream(q2)  # (e.g. from a worker process)
+    cam.close()
+    assert q2.closed and not q1.closed  # (the actor shut its current stream down)
