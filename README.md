@@ -73,11 +73,20 @@ if __name__ == "__main__":
 - A queue object can be pickled and passed to other processes, including independently started ones (`DejaQueue(name=..., create=False)` attaches by name). It is removed once the creating object is garbage-collected, unless created with `auto_unlink=False`. It can also be used as a context manager.
 - It keeps working when a process using it dies, even while putting or getting an item.
 
+> [!TIP]
+> **Large items, such as camera frames of several MB, especially on Windows:** read them into one preallocated array instead of calling `get()`, which creates a new array for every item. On Windows, each new large array is fresh memory from the operating system, and every page of it costs a page fault on first write. On a GitHub Windows runner, frames of 2 MB and more were transferred at 2.3–2.6 GiB/s with `get()`, at 5.7–6.7 GiB/s into a preallocated array, and at 10–17 GiB/s zero-copy (Linux and macOS reuse freed memory, so `get()` loses less there):
+> ```python
+> frame = np.empty((2048, 1024), np.uint16)        # once
+> q.get(callback=lambda a: np.copyto(frame, a))    # one copy, straight from shared memory into frame
+> ```
+> If the frame is only needed briefly, process it zero-copy in the callback instead (`q.get(callback=fn)`; the arrays are valid only during the call). And size the queue for at least about 10 frames (`buffer_bytes`), so that producer and consumer can absorb each other's hiccups.
+
 ## dejaq.Actor and ActorDecorator
 
 `dejaq.Actor` allows you to run a class instance in a separate process and call its methods or access its attributes remotely, as if it were local. This is useful for isolating heavy computations, stateful services, or legacy code in a separate process, while keeping a simple Pythonic interface.
 
-Actors start their process with the `spawn` method, which imports your main script in it: in a script (unlike in Jupyter), put the code that creates actors under `if __name__ == "__main__":`, as in the DejaQueue example above.
+> [!IMPORTANT]
+> Actors start their process with the `spawn` method, which imports your main script in it: in a script (unlike in Jupyter), put the code that creates actors under `if __name__ == "__main__":`, as in the DejaQueue example above.
 
 ### Example: Using `Actor` directly
 
@@ -158,7 +167,8 @@ The following examples show how to use `dejaq.Parallel` to parallelize a functio
 
 Here we execute a function and map iterable inputs across 10 workers. To enable pipelining, the results of each stage are provided as iterable generator. Use `.run()` (or `.compute()`) to get the final result as a list. Results are in input order, unless you pass `ordered=False` (e.g. `Parallel(n_workers=10, ordered=False)`): then each result is returned as soon as it is ready, so that a slow item does not hold up the others.
 
-Workers are started with the `spawn` method, which imports your main script in each worker: in a script (unlike in Jupyter), put the code that starts pipelines under `if __name__ == "__main__":`.
+> [!IMPORTANT]
+> Workers are started with the `spawn` method, which imports your main script in each worker: in a script (unlike in Jupyter), put the code that starts pipelines under `if __name__ == "__main__":`.
 
 ```python
 from time import sleep
