@@ -454,3 +454,21 @@ def test_closing_busy_pipelines_never_hangs(tmp_path):
     r = run_script(tmp_path, _CLOSE_STRESS, timeout=120)
     assert r.returncode == 0 and "ok" in r.stdout, r.stderr[-3000:]
     assert "Traceback" not in r.stderr, r.stderr[-3000:]  # workers end quietly when their stage is closed
+
+
+TEE_AT_EXIT = """
+from dejaq import Parallel
+
+def inc(x):
+    return x + 1
+
+if __name__ == "__main__":
+    a, b = Parallel(n_workers=1)(inc)(range(5)).tee(2)
+    assert list(zip(a, b)) == [(i, i) for i in range(1, 6)]
+"""
+
+
+def test_tee_left_open_at_exit_prints_no_error(tmp_path):
+    r = run_script(tmp_path, TEE_AT_EXIT)
+    assert r.returncode == 0, r.stderr
+    assert "Traceback" not in r.stderr, r.stderr
