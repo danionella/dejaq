@@ -1141,10 +1141,11 @@ class DejaQueue(NamedByteRing):
             on_full (str): What to do if there is no space: "block" (default: wait as set by block and
                 timeout), "drop" (discard obj and return False), "drop_oldest" (discard the oldest items until
                 obj fits) or "flush" (discard all items). Discarded items are counted in `self.dropped` (of this
-                object only), and logged as a warning at most once a second (logger "dejaq.queues"). The last two take the consumers' lock, so they wait while a consumer reads an
-                item (e.g. runs a get() callback; timeout does not limit this wait, and such a put must not
-                be made from a get() callback of the same queue); a stop item put into the queue may be
-                discarded, too: end with shutdown().
+                object only; exact), and logged as a warning at most once a second (logger "dejaq.queues"; the
+                last drops are reported with the next one). "drop_oldest" and "flush" take the consumers'
+                lock, so they wait while a consumer reads an item (e.g. runs a get() callback; timeout does not
+                limit this wait, and such a put must not be made from a get() callback of the same queue). A
+                stop item put into the queue may be discarded, too: end with shutdown().
 
         Returns:
             True, or False if obj was discarded (on_full="drop").

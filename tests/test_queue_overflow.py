@@ -1,6 +1,7 @@
 """put(on_full=...): what to do when the queue is full, and stage.qsize()."""
 
 import multiprocessing as mp
+import os
 import threading
 import time
 
@@ -170,11 +171,27 @@ def test_shutdown_right_after_the_last_put_does_not_lose_it():
 
 
 def test_dropped_items_are_logged_at_most_once_a_second(caplog):
-    q = DejaQueue(1_000_000, name="frames")
+    name = f"frames{os.getpid()}"  # (unique: a fixed name could be in use)
+    q = DejaQueue(1_000_000, name=name)
     with caplog.at_level("WARNING", logger="dejaq.queues"):
         _fill(q, 30, on_full="drop_oldest")  # 21 drops within well under a second
         assert len(caplog.records) == 1 and "dropped 1 items" in caplog.text
         time.sleep(1.1)
         _fill(q, 1, on_full="drop")
     assert len(caplog.records) == 2 and "dropped 21 items (22 by this queue object in all)" in caplog.text
-    assert "queue 'frames'" in caplog.text
+    assert f"queue {name!r}" in caplog.text
+
+
+def test_stage_qsize_of_tee_branches_zip_and_copies():
+    from dejaq.parallel import zip as dzip
+    a, b = Parallel(n_workers=1)(abs)(range(4)).tee(2)
+    z = dzip(Parallel(n_workers=1)(abs)(range(4)), Parallel(n_workers=1)(abs)(range(4)))
+    for stage in (a, b, z):
+        stage.start()
+        deadline = time.monotonic() + 30
+        while not all(stage._done) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert stage.qsize() == 4
+    import cloudpickle
+    assert cloudpickle.loads(cloudpickle.dumps(z)).qsize() >= 4  # (a copy counts the end marker, too)
+    assert list(z) == [(i, i) for i in range(4)] and sorted(a) == sorted(b) == list(range(4))
