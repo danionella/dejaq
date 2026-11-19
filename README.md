@@ -17,8 +17,9 @@ The speed advantage of `DejaQueue` becomes substantial for items of > 1 MB size.
 - Supports any picklable Python object, including numpy arrays and nested dictionaries
 - Zero-copy data transfer with pickle protocol 5 out-of-band data
 - Picklable queue instances (queue object itself can be passed between processes)
-- Peekable (non-destructive read)
 - Actor class for remote method calls and attribute access in a separate process (see [dejaq.Actor](#dejaqactor-and-actordecorator))
+- Parallel pipelines: map functions or classes over iterables in pools of worker processes, stage after stage, with the data passed between the stages' processes directly (see [dejaq.Parallel](#dejaqparallel))
+- Processing DAGs: split (`tee`) and join (`zip`) pipeline stages, and feed them as data arrives, e.g. camera frames from a `DejaQueue` or a streaming actor (see [Processing DAGs](#processing-dags-pipelines-with-branches-fed-as-data-arrives))
 
 Auto-generated (minimal) API documentation: https://danionella.github.io/dejaq
 
