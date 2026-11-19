@@ -7,7 +7,9 @@ with its original type (the remote traceback as its cause), or as RemoteError if
 from __future__ import annotations
 
 import atexit
+import contextlib
 import copy
+import functools
 import inspect
 import itertools
 import logging
@@ -29,7 +31,7 @@ import cloudpickle
 import numpy as np
 import psutil
 
-from .queues import DejaQueue, Empty, Full, ShutDown, _ON_FULL
+from .queues import DejaQueue, Empty, Full, ShutDown
 from .parallel import _WorkerException, _exit_with_parent, _stop_processes
 
 logger = logging.getLogger(__name__)
@@ -136,7 +138,7 @@ def _actor_server(parent: int, pkl: bytes) -> None:
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
-    streaming = {}  # set by method.stream(queue, ...): the method, its arguments, the queue, on_full
+    stream = {}  # set by method.stream(queue, ...): the call, the queue, on_full, when to call next
 
     def handle(kind, name, args, kwargs, deep):
         if failed is not None:
@@ -157,11 +159,13 @@ def _actor_server(parent: int, pkl: bytes) -> None:
             return time.time()
         if kind == "stream":
             out, on_full, a, kw = args
-            streaming.clear()
+            stream.clear()
             if out is not None:
-                getattr(obj, name)  # (raises AttributeError now)
-                a, kw = copy.deepcopy((a, kw))  # (used again and again)
-                streaming.update(name=name, args=a, kwargs=kw, out=out, on_full=on_full, wait=0.0)
+                if out.is_shutdown:
+                    raise ShutDown("stream(): the queue is shut down")
+                a, kw = copy.deepcopy((a, kw))  # (used again and again; arrays may view the request queue)
+                stream.update(call=functools.partial(getattr(obj, name), *a, **kw), name=name, out=out,
+                              on_full=on_full, at=0.0)
             return None
         raise ValueError(f"unknown request {kind!r}")
 
@@ -183,33 +187,40 @@ def _actor_server(parent: int, pkl: bytes) -> None:
         return True
 
     while not stop.is_set():
-        s = streaming  # (between calls, put the streamed method's results into its queue)
-        try:
-            if not req.get(timeout=s["wait"] if s else _own(obj, "_idle_timeout"), callback=dispatch):
+        try:  # (while streaming: serve the calls waiting, then stream one item when its time has come)
+            if not req.get(timeout=max(0.0, stream["at"] - time.monotonic()) if stream else
+                           _own(obj, "_idle_timeout"), callback=dispatch):
                 break
+            continue
         except Empty:
-            try:
-                if s:
-                    item = getattr(obj, s["name"])(*s["args"], **s["kwargs"])
-                    s["wait"] = 0.01 if item is None else 0.0  # (None: nothing to stream now; do not spin)
-                    if item is not None:
-                        s["out"].put(item, on_full=s["on_full"])
-                elif _own(obj, "_idle_function"):
-                    getattr(obj, obj._idle_function)()
-            except ShutDown:  # the stream's queue was shut down: stop streaming
-                streaming.clear()
-            except Exception as e:
-                if s:
-                    s["wait"] = 1.0  # (a failing streamed method is retried, and logged, once a second)
-                logger.error(f"{s.get('name', '_idle_function')} raised {e!r}")
+            pass
         except Exception as e:  # a request that cannot be unpickled: its caller is unknown
             if not stop.is_set():  # (else a signal interrupted the wait)
                 logger.error(f"request dropped: {e!r}")
-    if streaming:  # the stream ends with the actor: its consumers finish
+            continue
+        if not stream:
+            try:
+                if _own(obj, "_idle_function"):
+                    getattr(obj, obj._idle_function)()
+            except Exception as e:
+                logger.error(f"_idle_function raised {e!r}")
+            continue
         try:
-            streaming["out"].shutdown()
-        except Exception:
-            pass
+            item = stream["call"]()
+        except Exception as e:
+            stream["at"] = time.monotonic() + 1.0  # (retried, and logged, once a second)
+            logger.error(f"streamed {stream['name']}() raised {e!r}")
+            continue
+        stream["at"] = time.monotonic() + (0.01 if item is None else 0.0)  # (None: nothing now; do not spin)
+        try:
+            if item is not None:
+                stream["out"].put(item, on_full=stream["on_full"])
+        except (ShutDown, ValueError) as e:  # the queue was shut down, or the item is larger than the queue
+            logger.warning(f"streaming {stream['name']}() stopped: {e!r}")
+            stream.clear()
+    if stream:  # the stream ends with the actor: its consumers finish
+        with contextlib.suppress(Exception):
+            stream["out"].shutdown()
     if obj is not None and hasattr(obj, "close"):
         try:
             obj.close()
@@ -474,15 +485,24 @@ class _RemoteMethod:
         """Call the remote method without waiting: returns a Future."""
         return Future(self._actor, self._actor._request("call", self._name, args, kwargs, deepcopy=deepcopy))
 
-    def stream(self, queue, *args, on_full="drop", **kwargs) -> None:
+    def stream(self, queue, *args, on_full="drop", **kwargs):
         """From now on, call this method (with args and kwargs) in the actor whenever no call is waiting, and
-        put each result into queue (a DejaQueue, e.g. the input of a pipeline), as with queue.put(on_full=...);
-        a result of None puts nothing. Calls are served between two results, so the method should return within
-        a short time (e.g. a camera grab with a timeout). stream(None) stops streaming, a new stream() replaces
-        the current one; the queue is shut down when the actor stops."""
-        if (queue is not None and not isinstance(queue, DejaQueue)) or on_full not in _ON_FULL:
-            raise ValueError(f"stream(queue, ...) needs a DejaQueue (or None), and on_full in {_ON_FULL}")
+        put each result into queue (a DejaQueue, e.g. the input of a pipeline; returned). Returns the queue.
+
+        A result of None puts nothing. When the queue is full, on_full="drop" (default) discards the new result,
+        "drop_oldest" or "flush" queued ones (as DejaQueue.put; these wait while a zero-copy consumer reads an
+        item). Calls are served between two results, and before them: so the method should return within a
+        short time (e.g. a camera grab with a timeout), and a steady flood of calls holds the stream up. While
+        streaming, _idle_function is not called. An error is logged and the method retried once a second;
+        streaming stops (with a log message) if the queue is shut down or a result does not fit into it.
+        stream(None) stops streaming (on any method), a new stream() replaces the current one; neither shuts the
+        queue down, but stopping the actor does, so the queue's consumers finish. A queue that is shut down
+        already raises ShutDown."""
+        if (queue is not None and not isinstance(queue, DejaQueue)) or on_full not in ("drop", "drop_oldest", "flush"):
+            raise ValueError('stream(queue, ...) needs a DejaQueue (or None), and on_full "drop", "drop_oldest" '
+                             'or "flush" (the actor must not wait for space: it serves calls between results)')
         self._actor._call("stream", self._name, (queue, on_full, args, kwargs))
+        return queue
 
     def send(self, *args, **kwargs) -> bool:
         """Call without waiting for (or receiving) the result (noreply=True; see __call__ for on_full)."""

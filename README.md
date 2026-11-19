@@ -131,7 +131,7 @@ Use `with Actor(Counter) as counter:` to close it automatically. An actor is als
 - **Timeouts:** `counter.get(timeout=2)` raises `TimeoutError` if there is no result within 2 s. If the actor's process has ended (it crashed or was closed), calls raise `dejaq.remote.RemoteError` instead of waiting.
 - **Threads and worker processes:** An actor can be used from several threads, and passed to other processes (e.g. as an argument of a `Parallel` function).
 - **Zero-copy fast path:** Pass `deepcopy=False` to skip the default copy of numpy array arguments (e.g. `actor.process(arr, deepcopy=False)`). The method then reads the arrays directly in shared memory, which is only valid during the call: copy anything you want to keep (`self.last = arr.copy()`); returning a result computed from them is fine. A `RuntimeWarning` is shown if a method keeps a reference.
-- **Streaming:** `cam.grab_frame.stream(queue)` switches a running actor to streaming: from then on, it calls `grab_frame()` whenever no call is waiting and puts each result into `queue` (a `DejaQueue`; when full, the newest result is dropped by default, or pass e.g. `on_full="drop_oldest"`; arguments for `grab_frame` can be passed too). Calls such as `cam.set_exposure(2.0)` run between two frames, so `grab_frame` should return within a short time (e.g. use the camera's grab timeout); returning `None` streams nothing. The queue can feed a pipeline (`Parallel(...)(process)(queue)`). `cam.grab_frame.stream(None)` stops streaming; when the actor stops, the queue is shut down.
+- **Streaming:** `cam.grab_frame.stream(queue)` switches a running actor to streaming (any method, with arguments if needed): from then on, it calls `grab_frame()` whenever no call is waiting and puts each result into `queue`, which it returns. Calls such as `cam.set_exposure(2.0)` run between two results. See [Processing DAGs](#processing-dags-pipelines-with-branches-fed-as-data-arrives) below.
 - **Tab completion:** Works in Jupyter and most IDEs.
 
 ### Running a function in worker processes: `RemoteFunc`
@@ -242,6 +242,98 @@ For large items such as camera frames (several MB each, at kHz rates), a few set
 
 A stage's results can be split into several branches with `stage.tee(n)`, and stages can be combined with `dejaq.parallel.zip(stage_a, stage_b)` (which yields tuples). Like the stages themselves, both run in processes of their own, so the data does not pass through your main process. As with `itertools.tee`, consume the branches side by side: a branch that falls behind by more than its buffer holds makes the others wait.
 
+
+## Processing DAGs: pipelines with branches, fed as data arrives
+
+Stages can be connected into a directed acyclic graph (DAG). Every node is a stage with worker processes of its own, `stage.tee(n)` splits a stage's results into branches, and `dejaq.parallel.zip(...)` joins branches into tuples. The data moves between the stages' processes directly; your main process only feeds the input and reads the end results.
+
+### Feeding a DAG through a DejaQueue
+
+A `DejaQueue` as the input lets you feed items as they arrive, e.g. camera frames from a thread or a callback. The DAG starts processing at once, and finishes when the queue is shut down:
+
+```python
+import threading
+import numpy as np
+from dejaq import DejaQueue, Parallel
+from dejaq.parallel import zip as dzip
+
+def subtract_background(frame):
+    return frame.astype(np.float32) - 100
+
+def find_cells(frame):
+    return int((frame > 50).sum())
+
+def mean_intensity(frame):
+    return float(frame.mean())
+
+def combine(pair):
+    n_cells, intensity = pair
+    return {"cells": n_cells, "intensity": intensity}
+
+if __name__ == "__main__":
+    frames = DejaQueue(buffer_bytes=10 * 8e6)                           # the DAG's input: room for ~10 frames
+
+    corrected = Parallel(n_workers=2, buffer_bytes=10 * 8e6)(subtract_background)(frames)
+    for_cells, for_intensity = corrected.tee(2)                         # fan-out: both branches get every frame
+    cells = Parallel(n_workers=4)(find_cells)(for_cells)
+    intensity = Parallel(n_workers=1)(mean_intensity)(for_intensity)
+    results = Parallel(n_workers=1)(combine)(dzip(cells, intensity))   # fan-in: one pair per frame
+
+    def acquire():                                                      # e.g. a camera thread or callback
+        for i in range(100):
+            frame = np.random.randint(0, 255, (1024, 2048), np.uint16)
+            frames.put(frame, on_full="drop_oldest")                    # never blocks the camera
+        frames.shutdown()                                               # end of input: the DAG finishes
+
+    threading.Thread(target=acquire).start()
+    for r in results:                                                   # results arrive as frames are processed
+        print(r)
+    print("frames dropped:", frames.dropped)
+```
+
+- `put(frame, on_full="drop_oldest")` keeps the acquisition running when the DAG falls behind: the oldest waiting frames are dropped, and `frames.dropped` counts them. With the default `on_full="block"`, the acquisition waits instead, and no frame is lost.
+- `zip` pairs results one to one, in order. So each branch must yield exactly one result per input (return `None` rather than skipping an item), and stages before a `zip` must be ordered (the default).
+- Consume the branches of a `tee` side by side (as `zip` does): a branch that falls behind by more than its buffer holds up the others.
+- `stage.qsize()` shows how many results wait in a stage's output queue: a stage that stays near full is followed by one that doesn't keep up.
+- Size each stage's `buffer_bytes` for its results (about 10 times the result size, see above).
+
+### A streaming actor as the source
+
+To run the acquisition in a process of its own, and still control it while it runs, use an actor and switch it to streaming. `cam.grab_frame.stream(frames)` makes the actor call `grab_frame()` whenever no call is waiting, and put each frame into `frames`, the DAG's input. Calls such as `cam.set_exposure(2.0)` run between two frames:
+
+```python
+from dejaq import Actor, DejaQueue, Parallel
+
+class Camera:                                           # your camera class: any class works
+    def __init__(self, serial):
+        ...                                             # open the camera (runs in the actor's process)
+    def grab_frame(self, timeout_ms=10):
+        ...                                             # the next frame, or None if none came in time
+    def set_exposure(self, ms):
+        ...
+
+def process(frame):
+    ...
+
+if __name__ == "__main__":
+    frames = DejaQueue(buffer_bytes=10 * 4.2e6)
+    with Actor(Camera, "A123") as cam:
+        results = Parallel(n_workers=4)(process)(frames)  # or a whole DAG, as above
+        cam.grab_frame.stream(frames, timeout_ms=10)      # start streaming (arguments for grab_frame)
+        for i, r in enumerate(results):
+            if i == 100:
+                cam.set_exposure(2.0)                     # runs between two frames
+            if i == 1000:
+                cam.grab_frame.stream(None)               # stop streaming
+                break
+        results.close()
+```
+
+- Any method can be streamed, with arguments: `cam.grab_frame.stream(frames, timeout_ms=10)`. A new `stream(...)` replaces the current one, and `stream(None)` stops it. `stream()` returns the queue, so `Parallel(...)(process)(cam.grab_frame.stream(DejaQueue(10 * 4.2e6)))` works too.
+- When `frames` is full, the newest frame is dropped by default, so the camera is never slowed down; `on_full="drop_oldest"` keeps the newest frames instead. (The actor never waits for space, since it serves calls between frames.)
+- Calls run between two frames, so the streamed method should return within a short time: use the camera's grab timeout, and return `None` if no frame came (nothing is put then). A steady flood of calls holds the stream up, and the actor's `_idle_function` does not run while it streams.
+- An error in the streamed method is logged, and the method is retried once a second; the actor stays controllable. Streaming stops, with a log message, if the queue is shut down or a frame does not fit into it.
+- When the actor stops (end of the `with` block, `close()`, or program exit), it shuts `frames` down, so a DAG reading it finishes. `stream(None)` or a new `stream(...)` leave the queue open; a queue that was shut down already cannot be streamed into (`ShutDown`).
 
 # See also
 - [ArrayQueues](https://github.com/portugueslab/arrayqueues) 
