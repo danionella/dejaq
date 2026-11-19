@@ -168,14 +168,15 @@ def _stop_processes(procs, lock=None, timeout=1.0, grace=0.0, done=None) -> None
     """Wait up to `grace` s for the processes to end (those with done[i] set: up to _EXIT_GRACE s), terminate those
     left, and kill those alive after `timeout` s."""
     with lock or threading.Lock():
-        end = time.monotonic() + _EXIT_GRACE
-        for p, d in builtins.zip(procs, done or ()):
-            if d:
-                p.join(max(0.0, end - time.monotonic()))
         for wait, stop in ((grace, "terminate"), (timeout, "kill"), (1.0, None)):
             end = time.monotonic() + wait
             for p in procs:
                 p.join(max(0.0, end - time.monotonic()))
+            if done and stop == "terminate":  # (read after the grace: a worker sets done just after its end marker)
+                end = time.monotonic() + _EXIT_GRACE
+                for p, d in builtins.zip(procs, done):
+                    if d:
+                        p.join(max(0.0, end - time.monotonic()))
             for p in procs:
                 if stop and p.is_alive():
                     getattr(p, stop)()
