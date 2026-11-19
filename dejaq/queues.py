@@ -855,6 +855,9 @@ def _pack_header(lens) -> bytes:
     return struct.pack(f"<Q{len(lens)}Q", len(lens), *lens)
 
 
+_ON_FULL = ("block", "drop", "drop_oldest", "flush")
+
+
 _MIN_ITEM_BYTES = 16 + len(pickle.dumps(None, protocol=5))  # header with one segment + the smallest pickle
 
 
@@ -1125,20 +1128,34 @@ class DejaQueue(NamedByteRing):
         {'a': 1, 'b': [1, 2, 3]}
     """
 
-    def put(self, obj, block: bool = True, timeout: float | None = None) -> bool:
+    dropped = 0  # items that put() of this object discarded with on_full="drop", "drop_oldest" or "flush"
+
+    def put(self, obj, block: bool = True, timeout: float | None = None, *, on_full: str = "block") -> bool:
         """Put an object into the queue.
 
         Args:
             obj: Any picklable object (numpy arrays are copied in without an intermediate copy).
             block (bool): If False, raise Full at once if there is no space (timeout is ignored).
             timeout (float | None): Maximum time to wait for space. Default None (wait indefinitely).
+            on_full (str): What to do if there is no space: "block" (default: wait as set by block and
+                timeout), "drop" (discard obj and return False), "drop_oldest" (discard the oldest items until
+                obj fits) or "flush" (discard all items). Discarded items are counted in `self.dropped` (of this
+                object only). The last two take the consumers' lock, so they wait while a consumer reads an
+                item (e.g. runs a get() callback; timeout does not limit this wait, and such a put must not
+                be made from a get() callback of the same queue); a stop item put into the queue may be
+                discarded, too: end with shutdown().
+
+        Returns:
+            True, or False if obj was discarded (on_full="drop").
 
         Raises:
             Full: No space in time. ShutDown: The queue was shut down. ValueError: The object is larger than
-                the queue's buffer.
+                the queue's buffer, or on_full is not one of the above.
         """
         if block is not True:
             timeout = _wait_time(block, timeout, "put")
+        if on_full not in _ON_FULL:
+            raise ValueError(f"on_full must be one of {_ON_FULL}, not {on_full!r}")
         if self._state[3]:  # _CLOSED: refuse before pickling (checked again under the lock below)
             raise ShutDown("Queue is shut down.")
         bufs = []
@@ -1163,10 +1180,15 @@ class DejaQueue(NamedByteRing):
                     head = st[0]  # _HEAD
                     tail = st[1]  # _TAIL
                     fits = (head - tail - 1) % self.cap >= need
-                    if not fits:
+                    if not fits and on_full == "block":
                         # Register as waiting while still holding the state lock: any consumer that frees space
                         # after the check above sees the registration and wakes us (no lost wake-up).
                         st[5] += 1  # _WAITERS
+                if not fits and on_full != "block":
+                    if on_full == "drop":
+                        self.dropped += 1
+                        return False
+                    tail, fits = self._make_room(need, on_full == "flush"), True
                 if fits:
                     new_tail = self._write_bytes(hdr, tail)
                     for s in segs:
@@ -1191,6 +1213,25 @@ class DejaQueue(NamedByteRing):
             if not woken:
                 self._cancel_space_wait()
                 raise Full("Timeout waiting for space in queue.")
+
+    def _make_room(self, need: int, flush: bool) -> int:
+        """Discard the oldest items (flush: all) until need bytes fit; return the tail. Caller holds put_lock."""
+        with self._get_lock:
+            while True:
+                with self._state_lock:
+                    st = self._state
+                    if st[_CLOSED]:
+                        raise ShutDown("Queue is shut down.")
+                    if (st[_HEAD] - st[_TAIL] - 1) % self.cap >= need:
+                        return int(st[_TAIL])
+                    head0, n = int(st[_HEAD]), int(st[_NITEMS])
+                if flush:
+                    self._purge_locked()
+                else:  # as a get() would (it wakes waiting producers), without unpickling the item
+                    n = 1
+                    self._items.acquire(timeout=0)  # (none if a waiting consumer is handing it back: spare)
+                    self._finish_get(head0, self._item_bytes(head0), True)
+                self.dropped += n
 
     def _cancel_space_wait(self) -> None:
         """Deregister a producer that stops waiting for space without having been woken."""
@@ -1250,10 +1291,11 @@ class DejaQueue(NamedByteRing):
                 with self._state_lock:
                     nitems = st[2]  # _NITEMS
                     head0 = st[0]  # _HEAD
+                    closed = st[3]  # _CLOSED: read with the count (puts are refused under this lock once it is set)
                 if nitems > 0:  # (without a count if it was lost, or is being handed back by a waiting consumer)
                     out = self._get_locked(head0, peek_only, callback, counted)
                     break
-                if st[3]:  # _CLOSED (puts are refused under the state lock once it is set)
+                if closed:
                     if counted:
                         items.release(1)  # pass shutdown()'s wake-up on to the next waiting consumer
                     raise ShutDown("Queue is shut down and empty.")
@@ -1288,19 +1330,21 @@ class DejaQueue(NamedByteRing):
         """True if not even the smallest item fits (a larger item may not fit even when this is False)."""
         return self.bytes_free < _MIN_ITEM_BYTES
 
+    def _span(self, start: int, n: int) -> bytes:
+        """A copy of n bytes of the ring from position start (also across its end)."""
+        cap, buf, s = self.cap, self.buf.buf, start % self.cap
+        return bytes(buf[s : s + n]) if s + n <= cap else b"".join((buf[s:cap], buf[0 : n - (cap - s)]))
+
+    def _item_bytes(self, head0: int) -> int:
+        """Size of the item at head0 in the ring: its header (segment count K, K lengths) and segments."""
+        K = struct.unpack("<Q", self._span(head0, 8))[0]
+        return 8 + 8 * K + sum(struct.unpack(f"<{K}Q", self._span(head0 + 8, 8 * K)))
+
     def _get_locked(self, head0: int, peek_only: bool, callback, counted: bool = True):
         """Read the item at head0. Caller holds get_lock, and one count of _items if counted."""
         cap = self.cap
         buf = self.buf.buf
-
-        def _copy_span(start, n):
-            start %= cap
-            end = start + n
-            if end <= cap:
-                return bytes(buf[start:end])
-            first = cap - start
-            out = b"".join((buf[start:cap], buf[0 : n - first]))
-            return out
+        _copy_span = self._span
 
         def _private(start, n):
             """Writable private copy of a span (numpy-allocated: arrays built on it are writable and aligned)."""
