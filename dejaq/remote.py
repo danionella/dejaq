@@ -365,11 +365,18 @@ class _Client:
                 return False
         return True
 
-    def _request(self, kind, name, args, kwargs, *, reply=True, deepcopy=True, deadline=None) -> int:
+    def _request(self, kind, name, args, kwargs, *, reply=True, deepcopy=True, deadline=None, drop=False):
+        """Send a request; return its call id (None if dropped: drop=True and the request queue is full)."""
         if self._closed:
             raise RemoteError("closed")
         cid = next(_ids)
         msg = _Req(cid, self._mbox.name if reply else None, kind, name, args, kwargs, deepcopy)
+        if drop:  # (only for calls without a reply: no other request is touched)
+            if self._req.put(msg, on_full="drop"):
+                return cid
+            if not self._alive():
+                raise RemoteError("the remote process has exited (it died or was closed)")
+            return None
         while True:
             rem = 0.05 if deadline is None else min(0.05, deadline - time.monotonic())
             try:
@@ -421,27 +428,31 @@ class _RemoteMethod:
         if signature is not None:
             self.__signature__ = signature
 
-    def __call__(self, *args, timeout=None, noreply=False, deepcopy=True, **kwargs):
+    def __call__(self, *args, timeout=None, noreply=False, deepcopy=True, on_full="block", **kwargs):
         """Call the remote method and return its result.
 
         Args:
           timeout: seconds to wait for the result (TimeoutError); default: no limit.
-          noreply: if True, return None at once: the result and any exception are discarded.
+          noreply: if True, return True at once (the call is queued): the result and any exception are discarded.
           deepcopy: if False, numpy array arguments view shared memory instead of being copied (zero-copy): they
             are valid only during the call (copy what you need to keep; returning them is fine).
+          on_full: with noreply=True, "drop" skips the call (and returns False) if the actor's request queue is
+            full, e.g. to send frames to a display actor without waiting for it; default "block" (wait for space).
         """
+        if on_full not in ("block", "drop") or (on_full == "drop" and not noreply):
+            raise ValueError('on_full must be "block", or "drop" together with noreply=True')
         if noreply:
-            self._actor._request("call", self._name, args, kwargs, reply=False, deepcopy=deepcopy)
-            return None
+            return self._actor._request("call", self._name, args, kwargs, reply=False, deepcopy=deepcopy,
+                                        drop=on_full == "drop") is not None
         return self._actor._call("call", self._name, args, kwargs, timeout=timeout, deepcopy=deepcopy)
 
     def submit(self, *args, deepcopy=True, **kwargs) -> Future:
         """Call the remote method without waiting: returns a Future."""
         return Future(self._actor, self._actor._request("call", self._name, args, kwargs, deepcopy=deepcopy))
 
-    def send(self, *args, **kwargs) -> None:
-        """Call without waiting for (or receiving) the result (noreply=True)."""
-        self(*args, noreply=True, **kwargs)
+    def send(self, *args, **kwargs) -> bool:
+        """Call without waiting for (or receiving) the result (noreply=True; see __call__ for on_full)."""
+        return self(*args, noreply=True, **kwargs)
 
     def __repr__(self) -> str:
         return f"<remote method {self._name} of {self._actor!r}>"

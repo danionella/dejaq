@@ -727,7 +727,10 @@ class _Tee:
         self.finalizer = _mp_util.Finalize(self, _stop_processes, args=([self.proc],), exitpriority=10)
 
     def branch_closed(self, i):
-        self.queues[i].shutdown()  # the tee process drops this branch (also if it was not closed, but collected)
+        try:
+            self.queues[i].shutdown()  # the tee process drops this branch (also if it was not closed, but collected)
+        except Exception:  # (at exit, the queue may have been closed already)
+            pass
         with self.lock:
             self.open_branches.discard(i)
             last = not self.open_branches
