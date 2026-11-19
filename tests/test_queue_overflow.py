@@ -167,3 +167,14 @@ def test_shutdown_right_after_the_last_put_does_not_lose_it():
 
     q._state_lock = _AfterFirstExit(lock, put_and_shut_down)
     assert q.get(timeout=5) == "last"
+
+
+def test_dropped_items_are_logged_at_most_once_a_second(caplog):
+    q = DejaQueue(1_000_000, name="frames")
+    with caplog.at_level("WARNING", logger="dejaq.queues"):
+        _fill(q, 30, on_full="drop_oldest")  # 21 drops within well under a second
+        assert len(caplog.records) == 1 and "dropped 1 items" in caplog.text
+        time.sleep(1.1)
+        _fill(q, 1, on_full="drop")
+    assert len(caplog.records) == 2 and "dropped 21 items (22 by this queue object in all)" in caplog.text
+    assert "queue 'frames'" in caplog.text

@@ -1129,6 +1129,7 @@ class DejaQueue(NamedByteRing):
     """
 
     dropped = 0  # items that put() of this object discarded with on_full="drop", "drop_oldest" or "flush"
+    _drops_logged = (-1.0, 0)  # (time, dropped) of the last warning about dropped items
 
     def put(self, obj, block: bool = True, timeout: float | None = None, *, on_full: str = "block") -> bool:
         """Put an object into the queue.
@@ -1140,7 +1141,7 @@ class DejaQueue(NamedByteRing):
             on_full (str): What to do if there is no space: "block" (default: wait as set by block and
                 timeout), "drop" (discard obj and return False), "drop_oldest" (discard the oldest items until
                 obj fits) or "flush" (discard all items). Discarded items are counted in `self.dropped` (of this
-                object only). The last two take the consumers' lock, so they wait while a consumer reads an
+                object only), and logged as a warning at most once a second (logger "dejaq.queues"). The last two take the consumers' lock, so they wait while a consumer reads an
                 item (e.g. runs a get() callback; timeout does not limit this wait, and such a put must not
                 be made from a get() callback of the same queue); a stop item put into the queue may be
                 discarded, too: end with shutdown().
@@ -1186,9 +1187,9 @@ class DejaQueue(NamedByteRing):
                         st[5] += 1  # _WAITERS
                 if not fits and on_full != "block":
                     if on_full == "drop":
-                        self.dropped += 1
+                        self._count_dropped(1, on_full)
                         return False
-                    tail, fits = self._make_room(need, on_full == "flush"), True
+                    tail, fits = self._make_room(need, on_full), True
                 if fits:
                     new_tail = self._write_bytes(hdr, tail)
                     for s in segs:
@@ -1214,8 +1215,17 @@ class DejaQueue(NamedByteRing):
                 self._cancel_space_wait()
                 raise Full("Timeout waiting for space in queue.")
 
-    def _make_room(self, need: int, flush: bool) -> int:
-        """Discard the oldest items (flush: all) until need bytes fit; return the tail. Caller holds put_lock."""
+    def _count_dropped(self, n: int, on_full: str) -> None:
+        self.dropped += n
+        t, logged = self._drops_logged
+        now = time.monotonic()
+        if now - t >= 1.0:  # (at most once a second; later drops are reported with the next one)
+            self._drops_logged = (now, self.dropped)
+            logger.warning(f"queue {self._base!r}: put(on_full={on_full!r}) dropped {self.dropped - logged} items "
+                           f"({self.dropped} by this queue object in all)")
+
+    def _make_room(self, need: int, on_full: str) -> int:
+        """Discard the oldest items ("flush": all) until need bytes fit; return the tail. Caller holds put_lock."""
         with self._get_lock:
             while True:
                 with self._state_lock:
@@ -1225,13 +1235,13 @@ class DejaQueue(NamedByteRing):
                     if (st[_HEAD] - st[_TAIL] - 1) % self.cap >= need:
                         return int(st[_TAIL])
                     head0, n = int(st[_HEAD]), int(st[_NITEMS])
-                if flush:
+                if on_full == "flush":
                     self._purge_locked()
                 else:  # as a get() would (it wakes waiting producers), without unpickling the item
                     n = 1
                     self._items.acquire(timeout=0)  # (none if a waiting consumer is handing it back: spare)
                     self._finish_get(head0, self._item_bytes(head0), True)
-                self.dropped += n
+                self._count_dropped(n, on_full)
 
     def _cancel_space_wait(self) -> None:
         """Deregister a producer that stops waiting for space without having been woken."""
