@@ -1107,16 +1107,22 @@ class DejaQueue(NamedByteRing):
     """Pickleable queue for arbitrary Python objects. Uses a ring buffer of shared memory and named semaphores.
 
     Args:
-        buffer_bytes (int): Size of the ring buffer in bytes. Default 10_000_000 (10 MB).
-        name (str | None): Base name for shared memory and semaphores. If None (default), a random unique name is generated.
+        buffer_bytes (int): Size of the ring buffer in bytes. Default 10_000_000 (10 MB). Each item must fit; for
+            large items (e.g. camera frames), about 10 times the item size or more.
+        name (str | None): Base name for shared memory and semaphores, also shown in log messages. If None
+            (default), a random unique name is generated.
         create (bool): If True (default), create a new queue; raises FileExistsError if a queue with this name
             exists. If False, open an existing queue.
-        auto_unlink (bool): If True (default), the creating process unlinks the shared memory and semaphores once
-            its queue object is gone. Other processes must not attach after that.
+        auto_unlink (bool): If True (default), the queue is removed once the creating process's queue object is
+            gone (or that process ends): processes already using it can continue, but no new process can attach.
+            If False, the queue persists until ``unlink()`` is called (POSIX; on Windows a queue always exists
+            exactly as long as some process has it open).
 
     The interface follows queue.Queue / multiprocessing.Queue: put(), get(), put_nowait(), get_nowait(),
     qsize(), empty(), full() and shutdown(), raising Empty, Full and ShutDown (which are also queue.Empty,
-    queue.Full, TimeoutError and, on Python >= 3.13, queue.ShutDown).
+    queue.Full, TimeoutError and, on Python >= 3.13, queue.ShutDown). Iterating a queue yields its items until it
+    is shut down and empty. For large items, `get(callback=...)` avoids allocating a new array for each item (see
+    get()).
 
     Example:
         >>> import pickle
@@ -1124,6 +1130,7 @@ class DejaQueue(NamedByteRing):
         >>> pkl = pickle.dumps(q)
         >>> q2 = pickle.loads(pkl)
         >>> q.put({"a": 1, "b": [1,2,3]})
+        True
         >>> q2.get()
         {'a': 1, 'b': [1, 2, 3]}
     """
@@ -1267,7 +1274,8 @@ class DejaQueue(NamedByteRing):
                 value is returned. If None (default), the returned object owns all its memory (its numpy arrays are
                 copied out of the queue and writable).
                 Make sure the callback is fast, since it runs while holding the get_lock, and that it does not keep references
-                to the object (or its buffers), since the underlying memory may be overwritten.
+                to the object (or its buffers), since the underlying memory may be overwritten. E.g. to read
+                into a preallocated array: ``q.get(callback=lambda a: np.copyto(out, a))``.
 
         Raises:
             Empty: No item in time. ShutDown: The queue was shut down and is empty.

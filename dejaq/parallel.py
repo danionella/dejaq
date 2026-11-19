@@ -218,17 +218,20 @@ def _watch(lzy) -> None:
 
 
 class lazymap:
-    ''' Returns an Iterable, functionally related to map (except that outputs are calculated by a pool of processes).
+    ''' A pipeline stage: an iterable over fcn(item) for each item in it, computed by a pool of worker processes
+    (like map). Usually created with Parallel or stage.map(); a stage can be the input of further stages.
 
-    Results are returned in input order. If a worker raises an exception, iterating raises it (with the worker's
-    traceback as its cause); if a worker dies, iterating raises WorkerError. In both cases the stage's workers
-    are stopped. They are also stopped when the lazymap is closed (close(), or the end of a ``with`` block),
-    garbage-collected, or at interpreter exit. Leaving a loop early does not stop them: iterating again
-    continues with the next result. Iterating a closed lazymap raises RuntimeError.
+    Results are returned in input order (with ordered=False, as soon as they are ready). If a worker raises an
+    exception, iterating raises it (with the worker's traceback as its cause); if a worker dies, iterating raises
+    WorkerError. In both cases the stage's workers are stopped. They are also stopped when the lazymap is closed
+    (close(), or the end of a ``with`` block), garbage-collected, or at interpreter exit. Leaving a loop early
+    does not stop them: iterating again continues with the next result. Iterating a closed lazymap raises RuntimeError.
 
     Args:
         fcn (callable): function that is being mapped. Signature: fcn(item, **kwargs)
-        it (iterable): iterable that maps over the function, providing items as arguments (must be picklable)
+        it (iterable): the input items. It is passed to a worker process, so it must be picklable: e.g. a list,
+            range, numpy array, another stage, a DejaQueue (read until it is shut down) or a Startable; not a
+            generator (feed its items into a DejaQueue from a thread instead)
         n_workers (int): number of workers (default: 1)
         buffer_bytes (int): size of the queue buffer (default: 10e6 bytes); for large items (e.g. camera frames) about
             10 times the item size or more
@@ -240,11 +243,7 @@ class lazymap:
             a copy, its numpy arrays viewing the input queue's memory. They are valid only during the call: do not
             keep them (e.g. as the previous frame) or hand them to another thread; copy what you need to keep.
             Returning them (or views of them) is fine. Default False.
-
         **kwargs: optional, being passed to fcn
-
-    Returns:
-        (iterable): an iterable that returns the results of fcn(item) for each item in it
     '''
 
     def __init__(self, fcn, it, n_workers=1, buffer_bytes=10e6, start_type='lazy', ordered=True, zero_copy=False,
@@ -590,17 +589,31 @@ class lazymap:
 
 
 def Parallel(n_workers=1, buffer_bytes=10e6, ordered=True, zero_copy=False):
-    ''' A wrapper to make a class or callable a parallel worker. Can be used as a decorator.
+    ''' Makes a function or class a pipeline stage that runs in worker processes. Can be used as a decorator.
+
+    - A function: `Parallel(...)(fcn)(iterable, **kwargs)` returns a lazymap of fcn(item, **kwargs).
+    - A class: `Parallel(...)(cls)(*init_args, **init_kwargs)(iterable, **kwargs)` creates one instance in each
+      worker (on its first item, e.g. to open a file or a device there) and returns a lazymap of
+      instance(item, **kwargs) (the class defines __call__).
+
+    The stage starts when it is first iterated; its results can be iterated, fed into the next stage, or collected
+    with `.run()`. See lazymap for the stage's methods, errors and lifetime.
+
+    Example:
+        >>> stage1 = Parallel(n_workers=4)(np.sqrt)(range(10))
+        >>> stage2 = Parallel(n_workers=1)(Writer)("out.h5")(stage1)   # Writer: a class with __call__(item)
+        >>> stage2.run()
 
     Args:
         n_workers (int): number of workers (default: 1)
-        buffer_bytes (int): size of the queue buffer (default: 10e6 bytes)
+        buffer_bytes (int): size of the stage's output queue (default: 10e6 bytes); for large results (e.g. camera
+            frames) about 10 times the result size or more
         ordered (bool): if True (default), results come in input order; if False, as soon as they are ready
         zero_copy (bool): n_workers=1 only: the function receives its input without a copy, valid only during the
             call (see lazymap)
 
     Returns:
-
+        (callable): the decorator, which takes the function or class
     '''
     def decorator(cls):
         if isinstance(cls, type):
@@ -614,12 +627,12 @@ def Parallel(n_workers=1, buffer_bytes=10e6, ordered=True, zero_copy=False):
     return decorator
 
 class WorkerWrapper:
-    ''' A helper class used by the Parallel decorator to wrap a class to make it a parallel worker.
+    ''' Used by Parallel for a class: calling it with the class's constructor arguments returns a function that
+    maps an iterable to a lazymap; each worker creates one instance (on its first item) and calls it per item.
 
     Args:
-        cls (class): the class to be wrapped
-        n_workers (int): number of workers (default: 1)
-        buffer_bytes (int): size of the queue buffer (default: 10e6 bytes)
+        cls (class): the class to be wrapped (it defines __call__(item, **kwargs))
+        n_workers, buffer_bytes, ordered, zero_copy: as for Parallel
     '''
     def __init__(self, cls, n_workers=1, buffer_bytes=10e6, ordered=True, zero_copy=False):
         self._instance = None
@@ -665,12 +678,14 @@ class Startable:
         self._it = None
 
     def start(self):
+        """Let items through (emit_one=True: one more item)."""
         if self._emit_one or not self._running:
             self._gate.release()
             self._running = not self._emit_one
         return self
 
     def pause(self):
+        """Hold items back until the next start() (emit_one=True: withdraw items not yet emitted)."""
         if self._emit_one:
             while self._gate.acquire(timeout=0):  # withdraw items not yet emitted
                 pass
@@ -680,6 +695,7 @@ class Startable:
         return self
 
     def stop(self):
+        """End the iteration (for good), so that the stages it feeds finish."""
         self._stopped.release()
         self._gate.release()  # wake a waiting consumer
         return self
@@ -775,6 +791,9 @@ def tee(lzy, n, buffer_bytes=None):
         lzy (lazymap): the lazymap to split
         n (int): number of branches
         buffer_bytes (int): queue size of each branch (default: that of lzy)
+
+    Returns:
+        (list): n lazymaps
     """
     if buffer_bytes is None:
         buffer_bytes = getattr(lzy, "_buffer_bytes", None) or 10e6
@@ -791,6 +810,9 @@ def zip(*lazys, buffer_bytes=None):
     Args:
         *lazys (lazymap): the lazymap iterables to zip (each one once: to use a stage twice, tee() it)
         buffer_bytes (int): size of the zipped stage's queue (default: the sum of the inputs' buffers)
+
+    Returns:
+        (lazymap): a stage that yields one tuple per item, ending with the shortest input (like the builtin zip)
     """
     if len({id(x) for x in lazys}) < len(lazys):
         raise ValueError("zip() got the same stage twice: use stage.tee() to read it twice")

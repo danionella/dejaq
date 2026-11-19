@@ -334,6 +334,8 @@ class Future:
         self._client, self._id, self._rep = client, cid, None
 
     def result(self, timeout: Optional[float] = None):
+        """Wait for the call's result and return it (or raise its exception); TimeoutError after `timeout` s
+        (the result can still be waited for again)."""
         if self._rep is None:
             deadline = None if timeout is None else time.monotonic() + timeout
             self._rep = self._client._mbox.wait(self._id, deadline, self._client._alive, drop=False)
@@ -546,7 +548,8 @@ class Actor(_Client):
     """Run an instance of `cls` in a process of its own; its methods and attributes are used remotely.
 
       • calls: `a.method(x)`; without waiting: `a.method_async(x)` or `a.method.submit(x)` (Future), or
-        `a.method(x, noreply=True)`; with `timeout=...`; zero-copy array arguments with `deepcopy=False`
+        `a.method(x, noreply=True)` (add `on_full="drop"` to skip the call while the actor is busy); with
+        `timeout=...`; zero-copy array arguments with `deepcopy=False`
       • attributes: `a.value`, `a.value = 1` (properties run remotely)
       • the actor stops at `close()`, at the end of a `with` block, when the Actor is garbage-collected, or
         at exit. An Actor can be passed to other processes (each gets a mailbox of its own); a copy never
@@ -616,9 +619,12 @@ class RemoteFunc(_Client):
 
     Example:
         >>> rf = RemoteFunc(square, workers=4)
-        >>> rf(12)                            # 144
-        >>> rf.map(range(5))                  # [0, 1, 4, 9, 16]
-        >>> rf.submit(7).result()             # 49
+        >>> rf(12)
+        144
+        >>> rf.map(range(5))
+        [0, 1, 4, 9, 16]
+        >>> rf.submit(7).result()
+        49
         >>> rf.close()
 
     Args:
