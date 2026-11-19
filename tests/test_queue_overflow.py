@@ -137,3 +137,33 @@ def test_stage_qsize(n_workers, ordered):
         time.sleep(0.05)
     assert s.qsize() == 5
     assert sorted(s) == list(range(5)) and s.qsize() == 0
+
+
+class _AfterFirstExit:
+    """Wraps a lock: after its first release, runs fn (once)."""
+
+    def __init__(self, lock, fn):
+        self.lock, self.fn = lock, fn
+
+    def __enter__(self):
+        return self.lock.__enter__()
+
+    def __exit__(self, *exc):
+        self.lock.__exit__(*exc)
+        fn, self.fn = self.fn, None
+        if fn is not None:
+            fn()
+
+
+def test_shutdown_right_after_the_last_put_does_not_lose_it():
+    # get() finds the queue empty; before it decides, the last item arrives and the queue is shut down
+    q = DejaQueue(100_000)
+    lock = q._state_lock
+
+    def put_and_shut_down():
+        q._state_lock = lock
+        q.put("last")
+        q.shutdown()
+
+    q._state_lock = _AfterFirstExit(lock, put_and_shut_down)
+    assert q.get(timeout=5) == "last"

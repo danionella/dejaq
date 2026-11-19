@@ -1291,10 +1291,11 @@ class DejaQueue(NamedByteRing):
                 with self._state_lock:
                     nitems = st[2]  # _NITEMS
                     head0 = st[0]  # _HEAD
+                    closed = st[3]  # _CLOSED: read with the count (puts are refused under this lock once it is set)
                 if nitems > 0:  # (without a count if it was lost, or is being handed back by a waiting consumer)
                     out = self._get_locked(head0, peek_only, callback, counted)
                     break
-                if st[3]:  # _CLOSED (puts are refused under the state lock once it is set)
+                if closed:
                     if counted:
                         items.release(1)  # pass shutdown()'s wake-up on to the next waiting consumer
                     raise ShutDown("Queue is shut down and empty.")
