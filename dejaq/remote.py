@@ -127,7 +127,7 @@ def _resolve(obj, name: str) -> dict:
 
 def _actor_server(parent: int, pkl: bytes) -> None:
     _exit_with_parent(parent)
-    cls, args, kwargs, req_name, stream = cloudpickle.loads(pkl)
+    cls, args, kwargs, req_name = cloudpickle.loads(pkl)
     req, reply = DejaQueue(name=req_name, create=False), _Replier()
     try:
         obj, failed = (cls if isinstance(cls, ModuleType) else cls(*args, **kwargs)), None
@@ -136,6 +136,7 @@ def _actor_server(parent: int, pkl: bytes) -> None:
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
+    streaming = {}  # set by method.stream(queue, ...): the method, its arguments, the queue, on_full
 
     def handle(kind, name, args, kwargs, deep):
         if failed is not None:
@@ -154,6 +155,14 @@ def _actor_server(parent: int, pkl: bytes) -> None:
             return list(dict.fromkeys(dir(obj)))
         if kind == "ping":
             return time.time()
+        if kind == "stream":
+            out, on_full, a, kw = args
+            streaming.clear()
+            if out is not None:
+                getattr(obj, name)  # (raises AttributeError now)
+                a, kw = copy.deepcopy((a, kw))  # (used again and again)
+                streaming.update(name=name, args=a, kwargs=kw, out=out, on_full=on_full, wait=0.0)
+            return None
         raise ValueError(f"unknown request {kind!r}")
 
     def dispatch(msg: _Req) -> bool:
@@ -173,33 +182,32 @@ def _actor_server(parent: int, pkl: bytes) -> None:
                           "memory is reused once the call returns (copy what you need to keep)", RuntimeWarning)
         return True
 
-    # stream=(method, queue[, on_full]): between calls, put the method's results into the queue
-    method, out, on_full = (*stream, "drop")[:3] if stream and obj is not None else (None, None, None)
-    wait = 0.0
     while not stop.is_set():
+        s = streaming  # (between calls, put the streamed method's results into its queue)
         try:
-            if not req.get(timeout=wait if method else _own(obj, "_idle_timeout"), callback=dispatch):
+            if not req.get(timeout=s["wait"] if s else _own(obj, "_idle_timeout"), callback=dispatch):
                 break
         except Empty:
             try:
-                if method:
-                    item = getattr(obj, method)()
-                    wait = 0.01 if item is None else 0.0  # (None: nothing to stream now; do not spin)
+                if s:
+                    item = getattr(obj, s["name"])(*s["args"], **s["kwargs"])
+                    s["wait"] = 0.01 if item is None else 0.0  # (None: nothing to stream now; do not spin)
                     if item is not None:
-                        out.put(item, on_full=on_full)
+                        s["out"].put(item, on_full=s["on_full"])
                 elif _own(obj, "_idle_function"):
                     getattr(obj, obj._idle_function)()
             except ShutDown:  # the stream's queue was shut down: stop streaming
-                method = None
+                streaming.clear()
             except Exception as e:
-                wait = 1.0  # (a failing stream method is retried, and logged, once a second)
-                logger.error(f"{method or '_idle_function'} raised {e!r}")
+                if s:
+                    s["wait"] = 1.0  # (a failing streamed method is retried, and logged, once a second)
+                logger.error(f"{s.get('name', '_idle_function')} raised {e!r}")
         except Exception as e:  # a request that cannot be unpickled: its caller is unknown
             if not stop.is_set():  # (else a signal interrupted the wait)
                 logger.error(f"request dropped: {e!r}")
-    if stream:  # the stream ends with the actor: its consumers finish
+    if streaming:  # the stream ends with the actor: its consumers finish
         try:
-            stream[1].shutdown()
+            streaming["out"].shutdown()
         except Exception:
             pass
     if obj is not None and hasattr(obj, "close"):
@@ -466,6 +474,16 @@ class _RemoteMethod:
         """Call the remote method without waiting: returns a Future."""
         return Future(self._actor, self._actor._request("call", self._name, args, kwargs, deepcopy=deepcopy))
 
+    def stream(self, queue, *args, on_full="drop", **kwargs) -> None:
+        """From now on, call this method (with args and kwargs) in the actor whenever no call is waiting, and
+        put each result into queue (a DejaQueue, e.g. the input of a pipeline), as with queue.put(on_full=...);
+        a result of None puts nothing. Calls are served between two results, so the method should return within
+        a short time (e.g. a camera grab with a timeout). stream(None) stops streaming, a new stream() replaces
+        the current one; the queue is shut down when the actor stops."""
+        if (queue is not None and not isinstance(queue, DejaQueue)) or on_full not in _ON_FULL:
+            raise ValueError(f"stream(queue, ...) needs a DejaQueue (or None), and on_full in {_ON_FULL}")
+        self._actor._call("stream", self._name, (queue, on_full, args, kwargs))
+
     def send(self, *args, **kwargs) -> bool:
         """Call without waiting for (or receiving) the result (noreply=True; see __call__ for on_full)."""
         return self(*args, noreply=True, **kwargs)
@@ -486,11 +504,8 @@ class Actor(_Client):
       • the actor stops at `close()`, at the end of a `with` block, when the Actor is garbage-collected, or
         at exit. An Actor can be passed to other processes (each gets a mailbox of its own); a copy never
         stops the actor.
-      • streaming: with `stream=("grab_frame", queue)`, the actor calls `grab_frame()` whenever no call is
-        waiting and puts each result into the queue (`on_full="drop"`; a third element sets another mode, see
-        DejaQueue.put). Calls are served between two results, so the method should return within a short time
-        (e.g. a camera grab with a timeout); a result of None puts nothing. When the actor stops, the queue is
-        shut down, so its consumers finish.
+      • streaming: `a.grab_frame.stream(queue)` makes the actor call `grab_frame()` whenever no call is waiting,
+        and put the results into the queue; `a.grab_frame.stream(None)` stops (see _RemoteMethod.stream)
       • the remote object may define `_idle_timeout` (seconds) and `_idle_function` (name of a method that is
         called when no request came within that time)
       • a request the actor cannot unpickle (e.g. an argument of a class defined only in a notebook) is
@@ -501,16 +516,11 @@ class Actor(_Client):
       *args, **kwargs: constructor arguments
       buffer_bytes: size of the request queue and of each mailbox (default 10 MB)
       start_method: multiprocessing start method (default 'spawn')
-      stream: (method name, DejaQueue) or (method name, DejaQueue, on_full): stream the method's results (above)
     """
 
-    def __init__(self, cls, *args, buffer_bytes: int = int(10e6), start_method: str = "spawn", stream=None,
-                 **kwargs) -> None:
-        if stream is not None and not (isinstance(stream, tuple) and len(stream) in (2, 3) and isinstance(
-                stream[0], str) and isinstance(stream[1], DejaQueue) and stream[2:] in ((), *((m,) for m in _ON_FULL))):
-            raise ValueError("stream must be (method name, DejaQueue) or (method name, DejaQueue, on_full)")
+    def __init__(self, cls, *args, buffer_bytes: int = int(10e6), start_method: str = "spawn", **kwargs) -> None:
         req = DejaQueue(buffer_bytes)
-        pkl = cloudpickle.dumps((cls, args, kwargs, req._base, stream))
+        pkl = cloudpickle.dumps((cls, args, kwargs, req._base))
         self._start([mp.get_context(start_method).Process(target=_actor_server, args=(os.getpid(), pkl))],
                     req, buffer_bytes)
         self._cls_name = getattr(getattr(cls, "__wrapped__", cls), "__name__", repr(cls))
